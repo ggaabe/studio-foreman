@@ -740,7 +740,10 @@ class M5SupervisorFeatures(TmpCase):
     def test_idle_media_models_are_released_after_the_queue_stays_empty(self):
         # Live Studio: after the scenarios gpud sat idle with ACE-Step resident next to the brain
         # and the user's model, i.e. all three of mlx-serve's model slots, indefinitely.
-        sim = self.sim(idle_media_unload_s=120.0)
+        sim = self.sim(idle_media_unload_s=120.0, unload_foreign=False)
+        foreign = "someone-elses-model"
+        sim.mlx.catalog = {**CATALOG, foreign: ModelSpec(foreign, "mlx-serve", 16, 10, "llm")}
+        sim.mlx._models.add(foreign)
         sim.run_until_quiet(600)
         job = sim.sup.submit("compose", "ace-step", {"goal": "tune", "expected_s": 20},
                              {"kind": "review"}, {"kind": "recover"})
@@ -751,6 +754,9 @@ class M5SupervisorFeatures(TmpCase):
         self.assertIn("ace-step", sim.mlx.resident_models(), "not before the idle limit")
         self.assertTrue(sim.run_until(lambda: "ace-step" not in sim.mlx.resident_models(), 120))
         self.assertTrue(sim.brain_resident(), "the brain stays home")
+        self.assertIn(foreign, sim.mlx.resident_models(), "the user's model is never released")
+        sim.run_until(lambda: False, 5)
+        self.assertEqual(sim.store.state()["mode"], "brain", "a foreign model is not gpud's media")
         unloads = [e for e in sim.store.events("model_unloaded") if e["data"]["model"] == "ace-step"]
         self.assertTrue(unloads and unloads[-1]["data"]["reason"].startswith("idle"), unloads)
         before = len(sim.store.events())

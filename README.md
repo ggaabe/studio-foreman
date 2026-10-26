@@ -407,6 +407,31 @@ aborts at its next step boundary. gpud then unloads the model, records `failed(t
 fires `on_failure`, so the brain comes back with the brief. The engine is never harmed: it only
 sees a client that went quiet and then hung up. Do not leave the variables set in a LaunchAgent.
 
+### Live on the Studio (2026-10-26)
+
+Every scenario below ran against the real mlx-serve 26.10.3 on the M5 Ultra, with
+`video_exclusive` on, the user's own model resident and pinned, and Darkbloom serving on the
+same GPU. Times are request to artifact on disk; brain absence is `brain_departed` to
+`brain_returned`.
+
+| Scenario | What happened |
+|---|---|
+| Speech (Kokoro) | Load 1 s, render 3 s, WAV validated (4.8 s, 27 % silence). The vision brain reviewed the waveform PNG and accepted |
+| Music (ACE-Step, 12 and 15 s) | Load 1 to 2 s, render 2 to 4 s, duration and silence validated, accepted |
+| Video, brain unloaded | 2 s 512x320: 12 s. 5 s 1280x704: 70 to 82 s. 10 s 1280x704 (the 768 MB raw cap): 177 s, an ~870 MB `complete` event streamed to disk. Brain away 20 s, 80 to 90 s and 186 s. The brain reviewed 3 sampled frames |
+| Rejected request (`steps` 500) | HTTP 400 from mlx-serve. `on_failure` fired once, the brain read the brief and retried with `steps` 50 (attempt 2, rendered). Its review saw a motorboat where the prompt asked for a paper boat and asked for a human (page). No loop |
+| Dead-man lease (fault injection) | The run stopped reporting after 2 events; the lease expired 60 s later (FOREMAN_PROGRESS_TIMEOUT_S=60); gpud closed the stream; mlx-serve logged `generation cancelled — client disconnected`; the unload drained in 5 to 12 s; `on_failure` fired once; the brain was back 2 to 3 s later. The brain retried twice, then the task was quarantined at 3/3 and a human paged |
+| gpud SIGTERM mid-render | Both by hand and under the LaunchAgent (launchd restarted gpud in 0.2 s): the next gpud recorded the run `failed(interrupted)` once, fired `on_failure` once and had the brain back 3 to 8 s after starting. The retry rendered and was accepted |
+
+Loads measured: 27B brain 2 to 9 s, LTX 3 to 4.5 s, ACE-Step 1 to 2 s, Kokoro 1 s. Idle gpud
+uses about 90 MB of RAM and well under 1 % of a core, and records nothing while idle.
+
+The live runs found and fixed: a pack still downloading must not be loaded; a slow but real
+shot was flagged 100 % frozen (threshold recalibrated, motion stats added); a draining unload
+marked the engine down every tick; the video time and decode budgets were 4 to 20 times too
+loose; idle media models held mlx-serve's slots forever; reinstalling the LaunchAgent could
+leave gpud stopped.
+
 ### Known gaps of the mlx-serve adapter
 
 - A run lives only as long as the gpud process that started it. Any gpud restart, including

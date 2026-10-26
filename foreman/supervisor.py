@@ -880,7 +880,7 @@ class Supervisor:
             updates["brainless_since"] = None
             events.append(("brain_returned", {"away_s": now - st["brainless_since"],
                                               "brains": sorted(self._usable_brains())}))
-        media = any(not self._is_brain(m) for m in current)
+        media = any(m in self.catalog and not self._is_brain(m) for m in current)  # gpud's own media models
         mode = ("safe" if st["safe"] else "media+brain" if brain and media else "brain" if brain
                 else "brainless" if media else "empty")
         if mode != st["mode"]:
