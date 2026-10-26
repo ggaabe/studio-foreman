@@ -91,6 +91,16 @@ class M1Media(TmpCase):
         write_wav(silent, bytes(16000))
         self.assertEqual(media.wav_stats(silent)["silence_ratio"], 1.0)
 
+    def test_speech_without_a_requested_length_still_needs_a_real_duration(self):
+        art = {"path": "/x/output.wav", "exists": True, "duration_s": 0.0, "silence_ratio": 0.0}
+        res = validators.check("tts", {"input": "hi"}, art)
+        self.assertFalse(validators.passed(res))
+        self.assertIn("duration", validators.failures(res))
+        self.assertTrue(validators.passed(validators.check("tts", {"input": "hi"}, dict(art, duration_s=1.2))))
+        # simulated artifacts without a measurement are judged as before
+        self.assertTrue(validators.passed(validators.check("tts", {}, {"path": "/x", "exists": True,
+                                                                       "silence_ratio": 0.0})))
+
     def test_wav_stats_other_sample_formats(self):
         import struct
         loud = [int(20000 * ((-1) ** (i // 20))) for i in range(8000)]
@@ -308,6 +318,28 @@ class M3Engine(EngineCase):
         self.assertEqual(self.engine.poll_load(t).state, "failed")
         self.assertIn("max-resident-models", self.engine.poll_load(t).error)
         self.assertEqual(len(self.fake.bodies("/v1/load-model")), 2, "refused loads never reach the server")
+
+    def test_a_pack_still_downloading_is_never_loaded(self):
+        # Live Studio: MLX-Serve.app was still writing Flash-Next's ngram_table.bin.partial (and
+        # its .partial.parts) into --model-dir while gpud ran. Loading it then would fail at best.
+        models = os.path.join(self.tmp, "models")
+        pack = os.path.join(models, *FALLBACK.split("/"))
+        os.makedirs(pack)
+        for name in ("config.json", "model-00001.safetensors", "ngram_table.bin.partial",
+                     "ngram_table.bin.partial.parts"):
+            open(os.path.join(pack, name), "w").close()
+        eng = make_engine(self.fake, self.tmp, model_dir=models)
+        t = eng.load(FALLBACK)
+        self.assertEqual(eng.poll_load(t).state, "failed")
+        self.assertIn("still downloading", eng.poll_load(t).error)
+        self.assertEqual(self.fake.bodies("/v1/load-model"), [], "an incomplete pack never reaches the server")
+        for name in ("ngram_table.bin.partial", "ngram_table.bin.partial.parts"):
+            os.remove(os.path.join(pack, name))
+        self.assertIsNone(eng.incomplete_pack(FALLBACK))
+        t = eng.load(FALLBACK)
+        self.assertEqual(wait_for(lambda: eng.poll_load(t).state != "loading"), True)
+        self.assertEqual(eng.poll_load(t).state, "ready", eng.poll_load(t).error)
+        eng.close()
 
     def test_load_failure_and_unknown_ticket(self):
         self.fake.load_error = (503, "Not enough memory")

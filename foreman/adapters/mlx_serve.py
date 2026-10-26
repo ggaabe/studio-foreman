@@ -71,6 +71,7 @@ VIDEO_FPS = 24                 # LTX's frame rate in mlx-serve v26.10.3 (fixed s
 EVENT_CAP = 0.95               # progress reported for events stays below this
 DECODE_TOP = 0.99              # the decode heartbeat climbs from EVENT_CAP to this
 FORBIDDEN_PATTERNS = ("FastH3", "MiniMax-H3")  # license excludes US users: never load or run
+PARTIAL_SUFFIXES = (".partial", ".parts", ".incomplete", ".download", ".crdownload")  # download in progress
 
 
 class RunFailed(Exception):
@@ -380,7 +381,26 @@ class MlxServeEngine:
         threading.Thread(target=self._load_main, args=(op,), name=f"foreman-load-{model}", daemon=True).start()
         return ticket
 
+    def incomplete_pack(self, model: str) -> str | None:
+        """A reason to refuse loading `model` when its pack directory (on this machine) still
+        holds partial download files, else None. MLX-Serve.app downloads in place
+        (`<file>.partial` plus `<file>.partial.parts`), so a pack can sit in --model-dir for
+        hours before it is complete. A directory that is not here (a remote server, a test
+        double) is not checked."""
+        try:
+            names = os.listdir(self.model_path(model))
+        except OSError:
+            return None
+        partial = sorted(n for n in names if n.endswith(PARTIAL_SUFFIXES) or ".partial." in n)
+        if not partial:
+            return None
+        return (f"{model} is still downloading ({len(partial)} partial file(s) in {self.model_path(model)}, "
+                f"e.g. {partial[0]}); refusing to load an incomplete pack")
+
     def _preload_problem(self, model: str, spec: ModelSpec, resident: set) -> str | None:
+        partial = self.incomplete_pack(model)
+        if partial:
+            return partial
         cap = self.max_resident_models
         if cap and len(resident) >= cap:
             return (f"mlx-serve already holds {len(resident)} models (--max-resident-models {cap}); loading "

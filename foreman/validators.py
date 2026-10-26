@@ -39,6 +39,11 @@ def check(family: str, payload: dict, artifact) -> list[dict]:
             tol = max(0.5, 0.1 * want)
             add("duration", got is not None and abs(got - want) <= tol,
                 f"got {art.get('duration_s')!r}s, want {want:g}s +/- {tol:g}s")
+    elif family in ("video", "music", "tts") and "duration_s" in art:
+        # No length was asked for (speech), but a measured duration still has to be real: an
+        # empty WAV is a valid file with zero samples.
+        got = number(art.get("duration_s"))
+        add("duration", got is not None and got > 0, f"got {art.get('duration_s')!r}s, want > 0s")
     if family == "video":
         ratio = number(art.get("black_frame_ratio"))
         add("black_frames", ratio is not None and ratio <= MAX_BLACK_FRAME_RATIO,
