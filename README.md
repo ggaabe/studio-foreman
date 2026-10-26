@@ -17,7 +17,7 @@ test suite makes no network calls outside 127.0.0.1 and starts no real model ser
 
 ```bash
 cd foreman
-python3 -m unittest discover -s tests -v     # 155 tests (plus subtests), about 30 seconds
+python3 -m unittest discover -s tests -v     # 159 tests (plus subtests), about 30 seconds
 python3 -m foreman.demo                       # narrated timeline: render hangs, brain recovers
 python3 -m foreman.demo --fault crash         # also: garbage, wedged, none
 ```
@@ -249,11 +249,13 @@ mlx-serve, and a 40 GB margin), so 160 GB are planned. Models in mlx-serve that 
 catalog (anything the user loaded) are **pinned**: they count against memory and model slots and
 are never unloaded (`Policy.unload_foreign=False`).
 
-`video_exclusive` (default **on** for this deployment) unloads the brain while LTX renders, so
-every render exercises the brain-return path: the review job reloads the vision brain, which
-then looks at the frames. The production-friendlier setting is `"video_exclusive": false`: the
-27B vision brain fits beside LTX, a review needs no reload, and mlx-serve's GenYield lets a
-co-resident brain answer chat between denoise steps (at some cost in render speed).
+By default the 27B vision brain stays resident while LTX renders: it fits beside LTX (about
+18 + 36 GB), a review starts with no reload, and mlx-serve's GenYield lets it answer chat
+between denoise steps. Measured on the Studio, a 5 s 1280x704 render took 76 s with the brain
+resident against 68-82 s with it unloaded, and the review started 0 s after the render.
+`"video_exclusive": true` unloads the brain for every render instead, which exercises the
+brain-return path each time (that is how the live scenarios below were run) or frees memory on
+a smaller machine.
 
 Six small supervisor features back this deployment. None changes the simulation (its 104
 original tests are untouched): the policy and adapter ones are off by default, and no scripted
@@ -298,8 +300,8 @@ State lives in `~/.foreman/`: `foreman.db` (plus `foreman.db.lock`), `logs/gpud.
 rotated; every supervisor event is mirrored there), `pages.jsonl` (one line per page to a human)
 and `artifacts/<run id>-<process>/`. Audio runs leave `output.wav` and `waveform.png`. Video runs
 leave `frames.rgb` (raw rgb8), `video.json` (width, height, fps, frame count, measured stats),
-`frame_NNNN.png` samples, `audio.wav`, and `output.mp4` only when `ffmpeg` is on the PATH (the
-Studio has none). Artifacts are never deleted automatically; a 5 s 720p clip is about 330 MB raw.
+`frame_NNNN.png` samples, `audio.wav`, and `output.mp4` when ffmpeg is found (see Known gaps for
+the `ffmpeg` setting). Artifacts are never deleted automatically; a 5 s 720p clip is about 330 MB raw.
 
 Configuration, later sources winning: defaults, `~/.foreman/config.json` (keys are the `Config`
 fields in `foreman/studio.py`, for example `{"video_exclusive": false}`), environment variables
@@ -467,7 +469,11 @@ leave gpud stopped.
 - mlx-serve writes a media stream's headers only when the job reaches its inference thread. A
   request queued behind another client's long generation shows no progress, so it can hit the
   no-progress timeout (at least 120 s) before it starts.
-- No MP4 without ffmpeg: the artifacts are raw frames, PNG samples and a WAV.
+- Without ffmpeg there is no MP4, only raw frames, PNG samples and a WAV. `ffmpeg` in the config
+  (or `FOREMAN_FFMPEG`) sets the binary; `auto` checks the PATH, `$FOREMAN_HOME/bin` and Homebrew,
+  because launchd gives gpud a minimal PATH. A no-sudo install: `pip3 install --user
+  imageio-ffmpeg` and link its binary to `~/.foreman/bin/ffmpeg`. Muxing uses Apple's
+  `h264_videotoolbox` encoder and falls back to `libx264`.
 
 ## Known gaps
 

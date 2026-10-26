@@ -16,6 +16,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import shutil
 from dataclasses import dataclass
 
 from .policy import ModelSpec, Policy
@@ -35,11 +36,11 @@ OS_RESERVE_GB = 16.0
 HEADROOM_GB = 40.0    # kept free on top of everything planned
 
 
-def catalog(video_exclusive: bool = True) -> dict:
-    """video_exclusive=True unloads the brain while LTX renders, so every render exercises the
-    brain-return path. A co-resident small brain (False) is the production-friendlier choice:
-    the 27B vision brain fits beside LTX here, reviews need no reload, and mlx-serve's GenYield
-    lets it answer between denoise steps."""
+def catalog(video_exclusive: bool = False) -> dict:
+    """By default the 27B vision brain stays resident beside LTX (it fits here: about 18 + 36 GB),
+    so reviews need no reload and mlx-serve's GenYield lets it answer between denoise steps.
+    video_exclusive=True unloads the brain while LTX renders instead, which makes every render
+    exercise the brain-return path (or frees memory on a smaller machine)."""
     specs = (
         ModelSpec(BRAIN_PRIMARY, ENGINE, 24, 25, "brain", vision=True),
         ModelSpec(BRAIN_FALLBACK, ENGINE, 74, 70, "brain"),
@@ -76,7 +77,8 @@ class Config:
     artifacts_dir: str = ""
     base_url: str = "http://127.0.0.1:11234"
     model_dir: str = "~/.mlx-serve/models"
-    video_exclusive: bool = True
+    video_exclusive: bool = False
+    ffmpeg: str = "auto"              # path, "auto" (PATH, $FOREMAN_HOME/bin, Homebrew), or "" for none
     min_headroom_gb: float = HEADROOM_GB
     max_resident_models: int = 3      # mlx-serve's --max-resident-models (default 3)
     tick_s: float = 1.0
@@ -109,7 +111,7 @@ _ENV = {
     "FOREMAN_MAX_RESIDENT_MODELS": ("max_resident_models", int), "FOREMAN_TICK_S": ("tick_s", float),
     "FOREMAN_WATCHDOG_S": ("watchdog_s", float), "FOREMAN_FAULT_STALL_AFTER": ("stall_after", int),
     "FOREMAN_PROGRESS_TIMEOUT_S": ("progress_timeout_s", float),
-    "FOREMAN_LOG_LEVEL": ("log_level", str),
+    "FOREMAN_LOG_LEVEL": ("log_level", str), "FOREMAN_FFMPEG": ("ffmpeg", str),
 }
 
 
@@ -145,8 +147,21 @@ def load_config(path: str | None = None, env=None, **overrides) -> Config:
     return cfg.finish()
 
 
+def find_ffmpeg(setting: str, home: str) -> str | None:
+    """launchd gives gpud a minimal PATH, so "auto" also looks where per-user and Homebrew
+    installs put ffmpeg."""
+    if setting != "auto":
+        return setting or None
+    for cand in (shutil.which("ffmpeg"), os.path.join(home, "bin", "ffmpeg"),
+                 "/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
+        if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
 def build_engine(cfg: Config, brain=None, **kw):
     from .adapters.mlx_serve import MlxServeEngine
+    kw.setdefault("ffmpeg", find_ffmpeg(cfg.ffmpeg, cfg.home))
     return MlxServeEngine(cfg.base_url, catalog(cfg.video_exclusive), name=ENGINE, model_dir=cfg.model_dir,
                           artifacts_dir=cfg.artifacts_dir, brain=brain, min_headroom_gb=cfg.min_headroom_gb,
                           max_resident_models=cfg.max_resident_models or None, stall_after=cfg.stall_after,

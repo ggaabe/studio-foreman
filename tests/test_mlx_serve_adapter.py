@@ -1064,8 +1064,8 @@ class M7Process(TmpCase):
         self.assertEqual((cfg.base_url, cfg.video_exclusive, cfg.stall_after, cfg.stall_kinds),
                          ("http://studio:11234", False, 3, ("render_video",)))
         self.assertEqual(cfg.db_path, os.path.join(self.tmp, "foreman.db"))
-        self.assertFalse(studio.catalog(False)[LTX].evicts_brain)
-        self.assertTrue(studio.catalog()[LTX].evicts_brain)
+        self.assertTrue(studio.catalog(True)[LTX].evicts_brain)
+        self.assertFalse(studio.catalog()[LTX].evicts_brain, "the brain stays resident by default")
         self.assertNotIn("ddalcu/FastH3-Omni-MLX-Serve-8bit", studio.catalog())
         self.assertEqual(cfg.policy().progress_timeout_s, 120.0)
         tight = studio.load_config(path, env={"FOREMAN_HOME": self.tmp, "FOREMAN_PROGRESS_TIMEOUT_S": "45"})
@@ -1094,6 +1094,75 @@ class M7Process(TmpCase):
                 text = f.read()
             self.assertNotIn("sudo ", text.replace("no sudo", ""))
             self.assertIn("gui/$(id -u)", text)
+
+
+class M9Mux(TmpCase):
+    """MP4 output: hardware encoder first, libx264 fallback, and finding ffmpeg under launchd."""
+
+    def _run(self):
+        notes = []
+        run = type("R", (), {"dir": self.tmp, "note": lambda self_, line, progress=False: notes.append(line)})()
+        return run, notes
+
+    def _frames(self, w=64, h=48, n=6):
+        path = os.path.join(self.tmp, "frames.rgb")
+        with open(path, "wb") as f:
+            for i in range(n):
+                f.write(bytes([(i * 40) % 256, 80, 160]) * (w * h))
+        return path
+
+    def test_falls_back_to_libx264_when_videotoolbox_refuses(self):
+        stub = os.path.join(self.tmp, "ffmpeg")
+        with open(stub, "w") as f:
+            f.write('#!/bin/sh\nfor a in "$@"; do last="$a"; done\n'
+                    'case "$*" in *h264_videotoolbox*) echo "no VT session" >&2; exit 1;; esac\n'
+                    'echo "$*" > "$last.args"; printf mp4 > "$last"\n')
+        os.chmod(stub, 0o755)
+        eng = MlxServeEngine("http://127.0.0.1:9", catalog=studio.catalog(), ffmpeg=stub)
+        run, notes = self._run()
+        out = eng._mux(run, self._frames(), 64, 48, 24, None)
+        self.assertEqual(out, os.path.join(self.tmp, "output.mp4"))
+        with open(out + ".args") as f:
+            self.assertIn("libx264", f.read())
+        self.assertTrue(any("h264_videotoolbox failed" in n for n in notes), notes)
+        self.assertIn("muxed output.mp4 with libx264", notes)
+
+    def test_all_encoders_failing_returns_none_without_raising(self):
+        stub = os.path.join(self.tmp, "ffmpeg")
+        with open(stub, "w") as f:
+            f.write("#!/bin/sh\necho broken >&2\nexit 1\n")
+        os.chmod(stub, 0o755)
+        eng = MlxServeEngine("http://127.0.0.1:9", catalog=studio.catalog(), ffmpeg=stub)
+        run, notes = self._run()
+        self.assertIsNone(eng._mux(run, self._frames(), 64, 48, 24, None))
+        self.assertEqual(len([n for n in notes if "failed" in n]), 2)
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "no ffmpeg on PATH")
+    def test_real_ffmpeg_writes_a_playable_mp4(self):
+        eng = MlxServeEngine("http://127.0.0.1:9", catalog=studio.catalog(), ffmpeg=shutil.which("ffmpeg"))
+        run, notes = self._run()
+        out = eng._mux(run, self._frames(), 64, 48, 24, None)
+        self.assertIsNotNone(out, notes)
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(12)[4:8], b"ftyp")
+
+    def test_find_ffmpeg_looks_beyond_launchds_minimal_path(self):
+        home = os.path.join(self.tmp, "home")
+        os.makedirs(os.path.join(home, "bin"))
+        binary = os.path.join(home, "bin", "ffmpeg")
+        with open(binary, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(binary, 0o755)
+        old = os.environ.get("PATH")
+        os.environ["PATH"] = "/usr/bin:/bin"
+        try:
+            found = studio.find_ffmpeg("auto", home)
+        finally:
+            os.environ["PATH"] = old
+        self.assertIn(found, (binary, "/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"))
+        self.assertEqual(studio.find_ffmpeg("/x/ffmpeg", home), "/x/ffmpeg")
+        self.assertIsNone(studio.find_ffmpeg("", home))
+        self.assertFalse(studio.Config().video_exclusive, "the brain stays resident by default")
 
 
 if __name__ == "__main__":

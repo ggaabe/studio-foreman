@@ -973,18 +973,25 @@ class MlxServeEngine:
         return art
 
     def _mux(self, run: _Run, frames_path: str, width: int, height: int, fps: float, wav: str | None) -> str | None:
+        """MP4 from the raw frames (+ audio). Apple's hardware encoder first, libx264 if the build
+        lacks it or it refuses the job."""
         out = os.path.join(run.dir, "output.mp4")
-        cmd = [self.ffmpeg, "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
-               "-s", f"{width}x{height}", "-r", f"{fps:g}", "-i", frames_path]
+        head = [self.ffmpeg, "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
+                "-s", f"{width}x{height}", "-r", f"{fps:g}", "-i", frames_path]
         if wav:
-            cmd += ["-i", wav, "-c:a", "aac", "-shortest"]
-        cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", out]
-        try:
-            res = subprocess.run(cmd, capture_output=True, timeout=600, check=False)
-        except (OSError, subprocess.SubprocessError) as e:
-            run.note(f"ffmpeg mux failed: {e}")
-            return None
-        if res.returncode != 0 or not os.path.exists(out):
-            run.note(f"ffmpeg mux failed: {res.stderr[-300:].decode('utf-8', 'replace')}")
-            return None
-        return out
+            head += ["-i", wav, "-c:a", "aac", "-shortest"]
+        bitrate = max(1_000_000, int(width * height * fps * 0.12))
+        encoders = (["-c:v", "h264_videotoolbox", "-b:v", str(bitrate), "-allow_sw", "1"],
+                    ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"])
+        tail = ["-pix_fmt", "yuv420p", "-movflags", "+faststart", out]
+        for enc in encoders:
+            try:
+                res = subprocess.run(head + enc + tail, capture_output=True, timeout=600, check=False)
+            except (OSError, subprocess.SubprocessError) as e:
+                run.note(f"ffmpeg mux failed: {e}")
+                return None
+            if res.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
+                run.note(f"muxed {os.path.basename(out)} with {enc[1]}")
+                return out
+            run.note(f"ffmpeg {enc[1]} failed: {res.stderr[-300:].decode('utf-8', 'replace')}")
+        return None
