@@ -40,8 +40,29 @@ mv "$DEST.tmp" "$DEST"
 
 DOMAIN="gui/$(id -u)"
 # Replace a running instance (SIGTERM; gpud finishes its tick and exits well inside ExitTimeOut).
-launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
-launchctl bootstrap "$DOMAIN" "$DEST"
+# bootout returns before launchd has finished removing the service, and a bootstrap sent in
+# that window fails with "Bad request" (seen on the Studio, macOS 27), leaving gpud stopped.
+# So wait for the old service to be gone, and retry the bootstrap a few times.
+if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+  launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+  for _ in $(seq 1 60); do
+    launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 || break
+    sleep 0.5
+  done
+fi
+ok=""
+for attempt in 1 2 3 4 5; do
+  if launchctl bootstrap "$DOMAIN" "$DEST"; then
+    ok=1
+    break
+  fi
+  echo "bootstrap attempt $attempt failed; retrying" >&2
+  sleep 2
+done
+if [ -z "$ok" ]; then
+  echo "could not bootstrap $LABEL; the plist is at $DEST (try: launchctl bootstrap $DOMAIN $DEST)" >&2
+  exit 1
+fi
 echo "installed $DEST"
 launchctl print "$DOMAIN/$LABEL" | sed -n '1,25p'
 echo "logs: $HOME/.foreman/logs/gpud.log (JSON lines); state: python3 -m foreman.cli status"

@@ -14,6 +14,10 @@ if [ "$(id -u)" -eq 0 ]; then
 fi
 if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
   launchctl bootout "$DOMAIN/$LABEL"
+  for _ in $(seq 1 60); do  # bootout returns before launchd has removed the service
+    launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 || break
+    sleep 0.5
+  done
   echo "stopped $LABEL"
 else
   echo "$LABEL is not loaded"
