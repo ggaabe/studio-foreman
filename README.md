@@ -19,7 +19,7 @@ test suite makes no network calls outside 127.0.0.1 and starts no real model ser
 
 ```bash
 cd foreman
-python3 -m unittest discover -s tests -v     # 270 tests (plus subtests), about 45 to 60 seconds
+python3 -m unittest discover -s tests -v     # 271 tests (plus subtests), about 45 to 60 seconds
 python3 -m foreman.demo                       # narrated timeline: render hangs, brain recovers
 python3 -m foreman.demo --fault crash         # also: garbage, wedged, none
 ```
@@ -63,7 +63,7 @@ pager outage; they now assert the opposite. See [Inverted red-team tests](#inver
 | `tests/test_planner.py` | P1 to P14: templates, parser, every validator reason, EV ordering, budgets across many ticks, no model loads, backoff, suspension, tokens, idempotency, verdicts and kills, retention, untrusted inbound text, CLI and wiring |
 | `tests/test_planner_adversarial.py` | The planner red team's 46 attacks (A to U), all passing unchanged |
 | `tests/test_planner_fixes.py` | X1 to X12: regression tests for the design concerns the planner red team raised |
-| `tests/test_live_fixes.py` | LV1 to LV4: regressions from the planner's first live run (deferred media loads) |
+| `tests/test_live_fixes.py` | LV1 to LV5: regressions from the planner's first live run (deferred media loads, retracting a verdict) |
 
 ## How the brain comes back
 
@@ -625,6 +625,7 @@ gives a verdict, which is the only thing that teaches the planner anything:
 ```bash
 python3 -m foreman.cli review [--all]                     # items awaiting a verdict: brief, brain note, MP4/WAV/PNG paths
 python3 -m foreman.cli verdict 41 accept --minutes 3      # or reject; --note TEXT; minutes default to the template's estimate
+python3 -m foreman.cli verdict 41 retract                 # undo a mistaken verdict (not after ship or pruning)
 python3 -m foreman.cli ship 41 --usd 60                   # you used it (usd defaults to the template's value_usd)
 python3 -m foreman.cli resolve                            # list open pages; resolve 12 13 --note "old scenario tests"
 python3 -m foreman.cli templates                          # stats, caps, stock, P(ship), paused; templates pause|unpause ID
@@ -639,7 +640,10 @@ escapes, so a brief carrying an OSC 52 clipboard write, a carriage return or a c
 overwrite or forge what the owner reads before a verdict. The report escapes the same way.
 `--minutes` and `--usd` refuse NaN and infinity.
 
-A verdict on an item the brain flagged `human_review` also resolves that page. The scoreboard
+A verdict on an item the brain flagged `human_review` also resolves that page. `verdict JOB
+retract` puts an accepted (not yet shipped) or rejected (not yet pruned) item back in the review
+queue; P(ship) and the kill criteria are computed from the items, so they forget the verdict, and
+a `verdict_retracted` event follows the original one in the log. The scoreboard
 lists, per template, what was admitted, produced, passed by the brain, accepted, rejected and
 shipped, with dollars, review minutes, GPU-hours and P(ship); then GPU-hours and the idle share,
 the five biggest GPU sinks nobody used, rejections by reason code, paused templates and the

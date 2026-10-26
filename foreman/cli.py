@@ -13,6 +13,7 @@ The planner's loop (see README "Planner"):
 
     python3 -m foreman.cli review [--all]                 items awaiting your verdict, with their files
     python3 -m foreman.cli verdict JOB accept|reject [--minutes M] [--note TEXT]
+    python3 -m foreman.cli verdict JOB retract [--note TEXT]   undo a verdict given by mistake
     python3 -m foreman.cli ship JOB [--usd X]             you used it (and what it earned)
     python3 -m foreman.cli resolve [PAGE ...] [--note TEXT]   close pages (no id: list open pages)
     python3 -m foreman.cli templates [list | pause ID | unpause ID]
@@ -203,6 +204,16 @@ def cmd_review(cfg, show_all: bool) -> None:
 def cmd_verdict(cfg, job_id: int, verdict: str, minutes, note) -> None:
     templates, _ = _templates(cfg)
     sup = _client(cfg)
+    if verdict == "retract":
+        try:
+            it = ledger.retract_verdict(sup.store, job_id, note, sup._now())
+            t = templates.get(it["template_id"])
+            p = ledger.posterior(t, ledger.items(sup.store, template=t.id))[2] if t else None
+        finally:
+            sup.close()
+        print(f"job {job_id}: verdict retracted; {_p(it['template_id'], 80)} item back in the review queue"
+              + (f"; P(ship) is now {p:.2f}" if p is not None else ""))
+        return
     try:
         now = sup._now()
         it = ledger.record_verdict(sup.store, job_id, verdict, minutes, note, now)
@@ -377,9 +388,9 @@ def main(argv=None) -> int:
     sub.add_parser("clear-safe", help="leave SAFE mode (a human decision)")
     r = sub.add_parser("review", help="items awaiting your verdict")
     r.add_argument("--all", action="store_true", help="also show recently decided items")
-    vd = sub.add_parser("verdict", help="accept or reject a reviewed item (updates P(ship))")
+    vd = sub.add_parser("verdict", help="accept or reject a reviewed item (updates P(ship)); retract undoes one")
     vd.add_argument("job_id", type=int)
-    vd.add_argument("verdict", choices=("accept", "reject"))
+    vd.add_argument("verdict", choices=("accept", "reject", "retract"))
     vd.add_argument("--minutes", type=float, help="review minutes you spent (default: the template's estimate)")
     vd.add_argument("--note")
     sh = sub.add_parser("ship", help="record that an accepted item was used")

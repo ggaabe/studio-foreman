@@ -297,6 +297,27 @@ def record_verdict(store, job_id: int, verdict: str, minutes: float | None, note
     return item(store, it["id"])
 
 
+def retract_verdict(store, job_id: int, note: str | None, now: float) -> dict:
+    """Undo a verdict given by mistake: the item goes back to the review queue and P(ship) and the
+    kill criteria forget the verdict (both are computed from the items). Only an accepted item
+    that was not shipped, or a rejected item whose files were not pruned yet, can be retracted.
+    The verdict_recorded event stays in the log; a verdict_retracted event follows it."""
+    it = _item_or_raise(store, job_id)
+    if it["state"] not in ("accepted", "rejected"):
+        hint = " (a shipment is not undone)" if it["state"] == "shipped" else ""
+        raise LedgerError(f"item {it['id']} (job {it['job_id']}) is {it['state']}: only an accepted (not shipped) or "
+                          f"rejected item's verdict can be retracted{hint}")
+    if it["state"] == "rejected" and it.get("pruned_at") is not None:
+        raise LedgerError(f"item {it['id']} (job {it['job_id']}) was rejected and its files are already pruned")
+    with store.tx():
+        if not update_item(store, it["id"], expect_state=it["state"], state="review", verdict=None, verdict_at=None,
+                           verdict_minutes=None, verdict_note=None):
+            raise LedgerError(f"item {it['id']} changed while retracting the verdict; try again")
+        store.event(now, "verdict_retracted", it["job_id"], item=it["id"], template=it["template_id"],
+                    retracted=it.get("verdict"), note=note)
+    return item(store, it["id"])
+
+
 def record_ship(store, job_id: int, usd: float | None, now: float) -> dict:
     if usd is not None and (number(usd) is None or usd < 0 or usd > MAX_USD):
         raise LedgerError(f"--usd must be a finite number in 0..{MAX_USD:g}")

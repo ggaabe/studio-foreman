@@ -14,23 +14,31 @@ failed in turn, seconds apart, before memory could come back.
   LV3  a brain whose load is deferred still moves down the ladder (deferral is for media only)
   LV4  the mlx-serve adapter marks memory-headroom and model-slot refusals deferred, and an
        incomplete pack or an unmeasurable memory reading not
+  LV5  `verdict JOB retract` undoes a verdict given by mistake (it happened live): the item is back
+       in the review queue and P(ship) is what it was; a shipped or pruned item refuses
 
 Everything except LV4 runs on the virtual clock against the fake engines.
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import io
+import os
 import unittest
 
+from foreman import ledger
 from foreman.policy import Policy
-from foreman.sim import ScriptedBrain
+from foreman.sim import ScriptedBrain, ScriptedPlanner, Sim
 
 try:  # discovered with -s tests (tests/ on sys.path) or run from the project root
     from test_brain_return import SimCase, calls, submit_render
     from test_mlx_serve_adapter import ACE, BRAIN, FALLBACK, KOKORO, EngineCase, make_engine, wait_for
+    from test_planner import SPEECH, PlannerCase, prop
 except ImportError:  # pragma: no cover
     from tests.test_brain_return import SimCase, calls, submit_render
     from tests.test_mlx_serve_adapter import ACE, BRAIN, FALLBACK, KOKORO, EngineCase, make_engine, wait_for
+    from tests.test_planner import SPEECH, PlannerCase, prop
 
 PRIMARY, FALLBACK_SIM, VISION, VIDEO = "qwen38-flash-next", "qwen36-35b-a3b", "qwen38-27b", "ltx-2.5"
 # The small vision brain is the only one, so it stays resident beside the video model (as the 27B
@@ -159,7 +167,6 @@ class LV4AdapterMarksDeferrals(EngineCase):
         self.assertEqual((ok.state, ok.deferred), ("ready", False))
 
     def test_an_incomplete_pack_is_refused_not_deferred(self):
-        import os
         models = os.path.join(self.tmp, "models")
         pack = os.path.join(models, *FALLBACK.split("/"))
         os.makedirs(pack)
@@ -172,6 +179,64 @@ class LV4AdapterMarksDeferrals(EngineCase):
             self.assertIn("still downloading", st.error)
         finally:
             eng.close()
+
+
+class LV5RetractAVerdict(PlannerCase):
+    def cli(self, *args):
+        from foreman import cli
+        out = io.StringIO()
+        old = os.environ.get("FOREMAN_HOME")
+        os.environ["FOREMAN_HOME"] = self.home
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                code = cli.main(list(args))
+        finally:
+            if old is None:
+                os.environ.pop("FOREMAN_HOME", None)
+            else:
+                os.environ["FOREMAN_HOME"] = old
+        return code, out.getvalue()
+
+    def test_a_mistaken_verdict_can_be_retracted_until_it_shipped(self):
+        self.write(SPEECH)
+        brain = ScriptedPlanner({"proposals": [prop("t.speech", brief="first script"),
+                                               prop("t.speech", brief="second script"),
+                                               prop("t.speech", brief="third script")]})
+        sim = Sim(os.path.join(self.home, "foreman.db"), brain=brain,
+                  planner=self.planner(interval_s=1e6, min_gap_s=1e9), artifacts_dir=os.path.join(self.home, "artifacts"))
+        self.addCleanup(lambda: sim.sup.close())
+        self.assertTrue(sim.run_until(lambda: len(ledger.review_queue(sim.store)) == 2, 3600))
+        a, b = ledger.review_queue(sim.store)
+        code, out = self.cli("verdict", str(a["job_id"]), "accept", "--minutes", "3")
+        self.assertIn("P(ship) is now 0.82", out)
+        code, out = self.cli("verdict", str(a["job_id"]), "retract", "--note", "meant the other one")
+        self.assertEqual(code, 0, out)
+        self.assertIn("P(ship) is now 0.80", out, "the prior again: the verdict is forgotten")
+        it = ledger.item_for_job(sim.store, a["job_id"])
+        self.assertEqual((it["state"], it["verdict"], it["verdict_at"], it["verdict_minutes"]), ("review", None, None, None))
+        ev = sim.store.events("verdict_retracted")
+        self.assertEqual([(e["job_id"], e["data"]["retracted"], e["data"]["note"]) for e in ev],
+                         [(a["job_id"], "accept", "meant the other one")])
+        code, out = self.cli("verdict", str(a["job_id"]), "retract")
+        self.assertEqual(code, 2, "nothing to retract on an item awaiting a verdict")
+        self.assertIn("only an accepted", out)
+        code, out = self.cli("verdict", str(b["job_id"]), "reject")
+        code, out = self.cli("verdict", str(b["job_id"]), "retract")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(ledger.item_for_job(sim.store, b["job_id"])["state"], "review")
+        code, out = self.cli("verdict", str(b["job_id"]), "accept")
+        code, out = self.cli("ship", str(b["job_id"]))
+        code, out = self.cli("verdict", str(b["job_id"]), "retract")
+        self.assertEqual(code, 2, "a shipped item keeps its verdict")
+        self.assertIn("shipped", out)
+        self.assertEqual(sorted(i["job_id"] for i in ledger.review_queue(sim.store)), [a["job_id"]])
+        code, out = self.cli("verdict", str(a["job_id"]), "reject")
+        self.assertEqual(code, 0, out)
+        with sim.store.tx():
+            ledger.update_item(sim.store, ledger.item_for_job(sim.store, a["job_id"])["id"], pruned_at=sim.sup._now())
+        code, out = self.cli("verdict", str(a["job_id"]), "retract")
+        self.assertEqual(code, 2)
+        self.assertIn("pruned", out)
 
 
 if __name__ == "__main__":
