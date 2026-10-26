@@ -219,7 +219,8 @@ class MlxServeEngine:
                  unload_timeout_s: float = 600.0, load_timeout_factor: float = 4.0,
                  max_silence_s: float = 1800.0, decode_s_per_mpf: float = 0.6, min_decode_grace_s: float = 60.0,
                  sample_frames: int = 4, sample_max_side: int = 512, stall_after: int | None = None,
-                 stall_kinds=None, forbidden=FORBIDDEN_PATTERNS, ffmpeg: str | None = "auto"):
+                 stall_kinds=None, forbidden=FORBIDDEN_PATTERNS, ffmpeg: str | None = "auto",
+                 preserve_default: bool = True):
         split_url(base_url)  # validate early
         self.name = name
         self.base_url = base_url.rstrip("/")
@@ -241,7 +242,8 @@ class MlxServeEngine:
         self.stall_kinds = tuple(stall_kinds) if stall_kinds else None
         self.forbidden = tuple(forbidden or ())
         self.ffmpeg = shutil.which("ffmpeg") if ffmpeg == "auto" else ffmpeg
-        self._mine = {m for m, s in self.catalog.items() if s.engine == name}
+        self.preserve_default = preserve_default
+        self._mine ={m for m, s in self.catalog.items() if s.engine == name}
         self._boot = secrets.token_hex(4)
         self._seq = itertools.count(1)
         self._lock = threading.RLock()
@@ -439,9 +441,38 @@ class MlxServeEngine:
                 return cand
         return self.model_path(model)
 
+    def _server_default(self) -> str | None:
+        """mlx-serve's default model. /v1/models has no explicit field: it lists the default first,
+        and with no default the most recently used model comes first instead. Only a chat-capable
+        model can be the default, so anything else in first place means there is none."""
+        data = (self._get("/v1/models") or {}).get("data") or []
+        first = data[0] if data and isinstance(data[0], dict) else {}
+        sid, caps = first.get("id"), first.get("capabilities") or ()
+        return sid if isinstance(sid, str) and sid and "chat" in caps else None
+
+    def _restore_default(self, prior: str | None, loaded: str) -> None:
+        """A server started without --model promotes the latest chat-capable load to its default
+        model, so loading the brain would silently take over every request that names no model.
+        If that happened to someone else's model, point the default back at it. "default": true
+        pins it explicitly, so later loads no longer steal it."""
+        if not self.preserve_default or not prior or prior == loaded or self.catalog_name(prior) in self._mine:
+            return
+        try:
+            if self._server_default() != loaded or prior not in self._ps():
+                return
+            json_call(self.base_url, "POST", "/v1/load-model", {"model": prior, "default": True},
+                      timeout=max(self.call_timeout_s, 10.0))
+            log.info("restored mlx-serve's default model to %r (loading %r had taken it over)", prior, loaded)
+        except Exception as e:
+            log.warning("could not restore mlx-serve's default model to %r: %s", prior, e)
+
     def _load_main(self, op: _Load) -> None:
         conn = None
         try:
+            try:
+                prior_default = self._server_default() if self.preserve_default else None
+            except Exception:
+                prior_default = None
             target = self._load_target(op.model)
             conn = StreamConn(self.base_url, self.connect_timeout_s, poll_s=self.read_poll_s)
             with self._lock:
@@ -468,6 +499,7 @@ class MlxServeEngine:
                     op.state = "ready"
                     self._resident.add(op.model)
             log.info("loaded %s as %r in %.1fs", op.model, sid, time.monotonic() - op.started)
+            self._restore_default(prior_default, sid)
         except Cancelled:
             self._fail_load(op, "load aborted (connection closed by gpud)")
         except Silence:

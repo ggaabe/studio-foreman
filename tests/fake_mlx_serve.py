@@ -60,6 +60,11 @@ class FakeMlxServe:
         self.sizes = dict(sizes or {})          # server id (or basename) -> bytes
         self.ready = collections.OrderedDict()  # server id -> bytes (what /api/ps shows)
         self.discovered = set()                 # ids /v1/models lists (discovery)
+        # mlx-serve v26.10.3 started without --model: the latest chat-capable load is promoted to
+        # the default (default_promoted), unless a load said "default": true (setDefault).
+        self.default_id = ""
+        self.default_promoted = False
+        self.media_markers = ("kokoro", "ace-step", "ltx", "flux", "tts")
         self.free_mib = 200000
         self.health_ok = True
         self.load_delay = 0.0
@@ -177,8 +182,13 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/models":
             with s.lock:
                 ids = sorted(set(s.ready) | s.discovered)
+                if s.default_id in ids:  # mlx-serve lists its default first
+                    ids.remove(s.default_id)
+                    ids.insert(0, s.default_id)
                 data = [{"id": i, "object": "model", "loaded": i in s.ready,
-                         "state": "ready" if i in s.ready else "unloaded"} for i in ids]
+                         "state": "ready" if i in s.ready else "unloaded",
+                         "capabilities": (["audio"] if any(m in i.lower() for m in s.media_markers)
+                                          else ["chat", "streaming", "vision"])} for i in ids]
             return self._json(200, {"object": "list", "data": data,
                                     "machine": {"os": "macos", "free_mib": s.free_mib, "total_mib": 262144}})
         return self._error(404, "Unknown endpoint", "not_found")
@@ -216,6 +226,11 @@ class _Handler(BaseHTTPRequestHandler):
         size = s.sizes.get(mid) or s.sizes.get(target) or int(1e9)
         with s.lock:
             s.ready[mid] = size
+            chat = not any(m in mid.lower() for m in s.media_markers)
+            if body.get("default") is True:
+                s.default_id, s.default_promoted = mid, False
+            elif chat and (not s.default_id or s.default_promoted) and s.default_id != mid:
+                s.default_id, s.default_promoted = mid, True
         return self._json(200, {"model": {"id": mid, "object": "model", "loaded": True, "state": "ready",
                                           "bytes_resident": size, "bytes_on_disk": size}})
 

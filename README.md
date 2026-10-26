@@ -17,7 +17,7 @@ test suite makes no network calls outside 127.0.0.1 and starts no real model ser
 
 ```bash
 cd foreman
-python3 -m unittest discover -s tests -v     # 147 tests (plus subtests), about 30 seconds
+python3 -m unittest discover -s tests -v     # 155 tests (plus subtests), about 30 seconds
 python3 -m foreman.demo                       # narrated timeline: render hangs, brain recovers
 python3 -m foreman.demo --fault crash         # also: garbage, wedged, none
 ```
@@ -341,6 +341,13 @@ Checked against the v26.10.3 source and, read-only, against the live server:
 - `resident_models()`: `GET /api/ps` lists READY models (names end in `:latest`; `expires_at`
   is ignored). Sizes come from `size_vram` and feed `model_size_gb()`. Read every tick, because
   mlx-serve evicts on its own.
+- **Your default model stays yours.** An mlx-serve started without `--model` promotes the latest
+  chat-capable load to its default, so loading the brain would silently capture every request
+  that names no model (your apps, the "mlx-serve" alias). Before each load the adapter notes the
+  default (the first entry of `/v1/models`, if it is chat-capable). If the load took it over
+  from a model Foreman does not own, and that model is still resident, the adapter puts it back
+  with `POST /v1/load-model {"model": <yours>, "default": true}`. That pins it, so later loads
+  cannot take it again. Turn this off with `preserve_default=False`.
 - `load()`: `POST /v1/load-model` blocks until the model is ready, so it runs on a thread
   behind a ticket. Before sending it, the adapter refuses the load (a failed ticket, which moves
   the brain ladder or fails the media job) when free memory minus the model's size would drop

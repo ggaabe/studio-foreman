@@ -268,6 +268,7 @@ def make_fake(**sizes) -> FakeMlxServe:
                                "Kokoro-82M-MLX-Serve": int(0.36e9), "ACE-Step-1.5-XL-Turbo-MLX-Serve-4bit": int(4e9),
                                "LTX-2.5-MLX-Serve-4bit": int(36e9), **sizes}).start()
     fake.ready[FOREIGN] = int(16.3e9)          # the user's own model, loaded before gpud
+    fake.default_id, fake.default_promoted = FOREIGN, True  # ...and promoted to the server default
     fake.discovered |= {BRAIN, FALLBACK}       # discovered ids; media packs need load-by-path
     return fake
 
@@ -308,12 +309,42 @@ class EngineCase(TmpCase):
 
 class M3Engine(EngineCase):
 
+    def test_brain_load_does_not_take_over_the_users_default_model(self):
+        # mlx-serve started without --model: the user's chat model is the promoted default, and
+        # the next chat-capable load (the brain) would silently become the default.
+        self.load(KOKORO)  # media loads never qualify for promotion
+        self.assertEqual(self.fake.default_id, FOREIGN)
+        self.load(BRAIN)
+        self.assertEqual(self.fake.default_id, FOREIGN, "the brain load must not keep the default")
+        self.assertFalse(self.fake.default_promoted, "the restore pins the default explicitly")
+        self.assertEqual([b for b in self.fake.bodies("/v1/load-model") if b.get("default")],
+                         [{"model": FOREIGN, "default": True}])
+        self.engine.unload(BRAIN)
+        wait_for(lambda: BRAIN not in self.engine.resident_models())
+        self.load(BRAIN)  # pinned now: no second restore is needed
+        self.assertEqual(self.fake.default_id, FOREIGN)
+        self.assertEqual(len([b for b in self.fake.bodies("/v1/load-model") if b.get("default")]), 1)
+
+    def test_default_is_left_alone_when_the_users_model_is_gone_or_preservation_is_off(self):
+        self.fake.ready.pop(FOREIGN)  # the user's model is no longer resident: do not reload it
+        self.load(BRAIN)
+        self.assertFalse([b for b in self.fake.bodies("/v1/load-model") if b.get("default")])
+        fake2 = make_fake()
+        try:
+            eng = make_engine(fake2, self.tmp, preserve_default=False)
+            t = eng.load(BRAIN)
+            wait_for(lambda: eng.poll_load(t).state != "loading")
+            self.assertEqual(fake2.default_id, BRAIN)
+            eng.close()
+        finally:
+            fake2.stop()
+
     def test_residency_maps_catalog_names_and_reports_foreign_models(self):
         self.assertEqual(self.engine.resident_models(), {FOREIGN})
         self.assertAlmostEqual(self.engine.model_size_gb(FOREIGN), 16.3)
         self.load(KOKORO)   # not discovered: loaded by absolute path, registered under the basename
         self.load(BRAIN)    # discovered: loaded by id
-        loads = [b["model"] for b in self.fake.bodies("/v1/load-model")]
+        loads = [b["model"] for b in self.fake.bodies("/v1/load-model") if not b.get("default")]
         self.assertEqual(loads, ["/fake/models/ddalcu/Kokoro-82M-MLX-Serve", BRAIN])
         self.assertIn("Kokoro-82M-MLX-Serve", self.fake.ready)
         self.assertEqual(self.engine.resident_models(), {FOREIGN, KOKORO, BRAIN})
@@ -341,7 +372,8 @@ class M3Engine(EngineCase):
         t = self.engine.load(ACE)
         self.assertEqual(self.engine.poll_load(t).state, "failed")
         self.assertIn("max-resident-models", self.engine.poll_load(t).error)
-        self.assertEqual(len(self.fake.bodies("/v1/load-model")), 2, "refused loads never reach the server")
+        self.assertEqual(len([b for b in self.fake.bodies("/v1/load-model") if not b.get("default")]), 2,
+                         "refused loads never reach the server")
 
     def test_a_pack_still_downloading_is_never_loaded(self):
         # Live Studio: MLX-Serve.app was still writing Flash-Next's ngram_table.bin.partial (and
