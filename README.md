@@ -255,9 +255,9 @@ then looks at the frames. The production-friendlier setting is `"video_exclusive
 27B vision brain fits beside LTX, a review needs no reload, and mlx-serve's GenYield lets a
 co-resident brain answer chat between denoise steps (at some cost in render speed).
 
-Four small supervisor features back this deployment. None changes the simulation (its 104
-original tests are untouched): the first three are off by default, and no scripted brain returns
-`human_review`.
+Six small supervisor features back this deployment. None changes the simulation (its 104
+original tests are untouched): the policy and adapter ones are off by default, and no scripted
+brain returns `human_review`.
 
 - `Policy.unload_foreign=False` pins every resident model outside the catalog.
 - `ModelSpec.evicts_brain` (set on LTX by `video_exclusive`) makes the planner unload a brain
@@ -265,6 +265,11 @@ original tests are untouched): the first three are off by default, and no script
 - An adapter may expose `max_resident_models`. The planner then unloads gpud's own idle models
   (media first, biggest first) until the target fits under that count.
 - A brain decision with `verdict: "human_review"` pages a person (`kind: human_review`).
+- `Policy.idle_media_unload_s` (300 s here): once the queue has been empty that long, gpud
+  unloads its own idle media models one per tick, so only the brain (and the user's models) stay
+  in mlx-serve's slots and memory.
+- An adapter exception with `pending = True` (the mlx-serve adapter's `UnloadPending`) means
+  "still working on it": the caller retries next tick and the engine stays healthy.
 
 ### Run it
 

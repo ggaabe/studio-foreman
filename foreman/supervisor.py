@@ -228,6 +228,7 @@ class Supervisor:
         self._safe_engine: str | None = None
         self._sizes: dict[str, float] = {}    # adapter-reported sizes of non-catalog models
         self._noted: dict[str, object] = {}   # de-duplication of repetitive events
+        self._idle_since: float | None = None  # queue empty and nothing running since (in-process)
         self._phase_errors: dict[str, int] = {}
         self._recovered = False
         self._superseded = False
@@ -1634,11 +1635,14 @@ class Supervisor:
         pinned) does not block the jobs behind it."""
         st = self.store.state()
         if st["loading"] or self.store.jobs(*ACTIVE):
+            self._idle_since = None
             return
         if st["safe"] and not st["safe_engine"]:
             return
         degraded = bool(st["safe"])
         queued = self.store.queued_jobs()
+        if queued:
+            self._idle_since = None
         for job in queued:
             if degraded and job.requires != "brain":
                 continue  # degraded SAFE: only the brain may come back; media waits for a human
@@ -1649,6 +1653,30 @@ class Supervisor:
                 return
         if not queued or not self._usable_brains():
             self._go_home(now, st)
+        if not queued and not degraded:
+            self._release_idle_media(now)
+
+    def _release_idle_media(self, now: float) -> None:
+        """Policy.idle_media_unload_s: once the queue has been empty that long (and a brain is
+        home), unload gpud's own idle media models, one per tick, so their memory and engine
+        model slots go back to the host and its other users. Off (None) by default."""
+        limit = self.p.idle_media_unload_s
+        if limit is None or not self._usable_brains():
+            return
+        if self._idle_since is None:
+            self._idle_since = now
+            return
+        idle = now - self._idle_since
+        if idle < limit:
+            return
+        pinned = self._pinned()
+        for m in sorted(self._resident):
+            if m in self.catalog and not self._is_brain(m) and m not in pinned and self._avail(self._resident[m]):
+                try:
+                    self._unload(m, now, reason=f"idle: nothing queued for {idle:.0f}s")
+                except EngineUnavailable:
+                    pass
+                return
 
     def _dispatch(self, job: Job, now: float, st: dict) -> bool:
         """Try to move one queued job forward. True if something happened (a load started, the

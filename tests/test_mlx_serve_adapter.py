@@ -737,6 +737,33 @@ class M5SupervisorFeatures(TmpCase):
         self.assertLessEqual(max(counts), 3, f"never more than 3 models in the engine: {counts}")
         self.assertIn(foreign, sim.mlx.resident_models())
 
+    def test_idle_media_models_are_released_after_the_queue_stays_empty(self):
+        # Live Studio: after the scenarios gpud sat idle with ACE-Step resident next to the brain
+        # and the user's model, i.e. all three of mlx-serve's model slots, indefinitely.
+        sim = self.sim(idle_media_unload_s=120.0)
+        sim.run_until_quiet(600)
+        job = sim.sup.submit("compose", "ace-step", {"goal": "tune", "expected_s": 20},
+                             {"kind": "review"}, {"kind": "recover"})
+        self.assertTrue(sim.run_until_quiet(3600))
+        self.assertEqual(sim.store.job(job).state, "succeeded")
+        self.assertIn("ace-step", sim.mlx.resident_models(), "kept while the queue was just emptied")
+        sim.run_until(lambda: False, 60)
+        self.assertIn("ace-step", sim.mlx.resident_models(), "not before the idle limit")
+        self.assertTrue(sim.run_until(lambda: "ace-step" not in sim.mlx.resident_models(), 120))
+        self.assertTrue(sim.brain_resident(), "the brain stays home")
+        unloads = [e for e in sim.store.events("model_unloaded") if e["data"]["model"] == "ace-step"]
+        self.assertTrue(unloads and unloads[-1]["data"]["reason"].startswith("idle"), unloads)
+        before = len(sim.store.events())
+        sim.run_until(lambda: False, 600)
+        self.assertEqual(len(sim.store.events()), before, "idle means idle: nothing thrashes")
+        off = Sim(os.path.join(self.tmp, "g.db"))
+        off.run_until_quiet(600)
+        off.sup.submit("compose", "ace-step", {"goal": "tune", "expected_s": 20}, {"kind": "review"},
+                       {"kind": "recover"})
+        off.run_until_quiet(3600)
+        off.run_until(lambda: False, 900)
+        self.assertIn("ace-step", off.mlx.resident_models(), "off by default (the simulation is unchanged)")
+
     def test_an_unload_still_draining_is_busy_not_an_engine_outage(self):
         # Live Studio, S5: after the lease closed a stalled LTX stream, mlx-serve's unload waited
         # ~12 s for the render to reach its next step boundary. The adapter's UnloadPending was

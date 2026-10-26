@@ -59,6 +59,7 @@ def policy(**overrides) -> Policy:
         co_resident_brain=BRAIN_PRIMARY,
         brain_job_expected_s=60.0,   # hard timeout 150 s for one brain decision
         unload_foreign=False,        # the user's own models in mlx-serve are never unloaded
+        idle_media_unload_s=300.0,   # idle 5 min: give media models' memory and slots back to the host
     )
     return dataclasses.replace(base, **overrides)
 

@@ -82,6 +82,7 @@ class Policy:
     max_clock_step_s: float = 30.0         # wall-clock jump treated as a step (no monotonic source)
     page_backoff_max_s: float = 60.0       # pager retry backoff ceiling
     unload_foreign: bool = True            # False: models outside the catalog are pinned, never unloaded
+    idle_media_unload_s: float | None = None  # unload gpud's idle media models after the queue is empty this long
 
     @property
     def usable_gb(self) -> float:
