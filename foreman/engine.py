@@ -49,6 +49,10 @@ class LoadStatus:
     # failed only for now: the engine refused the load because the host lacks free memory (or a
     # model slot) at the moment. gpud keeps a media job waiting instead of failing it.
     deferred: bool = False
+    # failed on the client's side only: the request reached the server and was abandoned (gpud
+    # aborted it, the answer never came), so the server may still finish the load. gpud keeps its
+    # load intent and claims the model if it appears, instead of calling it someone else's.
+    in_flight: bool = False
 
 
 class Engine(Protocol):
@@ -88,4 +92,18 @@ class Engine(Protocol):
     # Optional: def instance_id(self) -> str | None
     #   Identity of the running server process (mlx-serve: its process start time from /metrics).
     #   A change means the server restarted: every model gpud loaded on it is gone, and whatever is
-    #   resident now was loaded by someone else. None when unknown; must not raise.
+    #   resident now was loaded by someone else. None when unknown (never the last value read).
+    #   Without it (or while it reads None) gpud cannot see a restart, so an unexpected
+    #   disappearance of one of its models makes it disown the others on that engine.
+    #
+    # Optional: def loading_models(self) -> set[str]
+    #   Models a load is in flight for on the server, by any client. gpud waits for another
+    #   client's load instead of sending its own (a second load joins the first, and gpud would
+    #   take the copy for its own).
+    #
+    # Optional: def owned_id(self, model) -> str | None, set_owned_id(self, model, server_id)
+    #   For a server that can hold one model under several ids: the id of the copy gpud's load
+    #   made, recorded in model_owners and handed back to a restarted adapter.
+    #
+    # The optional extensions are hints: an exception from one, or a malformed answer, counts as
+    # "unknown" (noted once as engine_extension_error), never as an engine outage.

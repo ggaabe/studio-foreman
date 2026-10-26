@@ -120,7 +120,8 @@ INSERT OR IGNORE INTO supervisor_state (id) VALUES (1);
 -- loaded by someone else (another client, the server's own default): gpud never unloads it.
 -- The intent ('loading') is written before the load request is sent, so a gpud that dies with
 -- the request in flight can still claim the model when it appears; ownership ends when gpud
--- unloads the model, observes it gone, or sees the server restart (its instance changed).
+-- unloads the model, observes it gone, or sees the server restart (its instance changed). A row
+-- whose instance is NULL was recorded while the server's identity was unknown.
 CREATE TABLE IF NOT EXISTS model_owners (
   model     TEXT PRIMARY KEY,
   engine    TEXT NOT NULL,
@@ -130,7 +131,8 @@ CREATE TABLE IF NOT EXISTS model_owners (
   since     REAL NOT NULL,                        -- supervisor time the intent was recorded
   owned_at  REAL,
   job_id    INTEGER,
-  note      TEXT
+  note      TEXT,
+  server_id TEXT                                  -- the engine's id for gpud's copy (one model can have several)
 );
 
 -- The planner (foreman/planner.py). Its own state is persisted here so a restarted gpud (or a
@@ -244,6 +246,7 @@ _MIGRATIONS = {
                          ("instances", "TEXT NOT NULL DEFAULT '{}'"), ("observed_gb", "TEXT NOT NULL DEFAULT '{}'"),
                          ("owners_init", "INTEGER NOT NULL DEFAULT 0")],
     "planner_state": [("engine_fail_streak", "INTEGER NOT NULL DEFAULT 0")],
+    "model_owners": [("server_id", "TEXT")],
     "plan_items": [("reserved_slot", "INTEGER NOT NULL DEFAULT 0"), ("fail_class", "TEXT"), ("counted", "INTEGER"),
                    ("count_note", "TEXT")],
 }

@@ -124,6 +124,7 @@ class StreamConn:
         self._buf = b""
         self.status = None
         self.headers: dict = {}
+        self.sent = False  # the whole request reached the socket (the server may act on it)
 
     @property
     def closed(self) -> bool:
@@ -163,6 +164,7 @@ class StreamConn:
         try:
             sock.settimeout(max(self.connect_timeout, 5.0))
             sock.sendall(payload)
+            self.sent = True
             sock.settimeout(self.poll_s)
         except OSError as e:
             if self._closed:

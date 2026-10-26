@@ -94,6 +94,10 @@ class Policy:
     load_defer_s: float = 15.0             # a media load the engine deferred (free memory) is retried after this,
     load_defer_max_backoff_s: float = 300.0  # ... doubling up to this,
     load_defer_max_s: float = 3600.0       # ... and the job waiting on it fails once the wait exceeds this
+    # (also the bound for a media job gpud cannot make room for, because the memory or the model
+    # slots it needs are held by models gpud may not unload, or whose model is in foreign_models)
+    brain_blocked_page_s: float = 900.0    # no brain this long while gpud cannot bring one back
+                                           # (someone else's models hold the memory or slots): page
 
     @property
     def usable_gb(self) -> float:

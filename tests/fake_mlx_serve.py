@@ -2,7 +2,9 @@
 
 It reproduces the shapes the adapter depends on (checked against the server source and the
 live Studio): /api/ps (READY models, ':latest' names), /v1/models (+ machine.free_mib),
-load by discovered id or absolute path (registered under the basename), idempotent unload,
+load by discovered id or absolute path (registered under the basename, or the discovered id
+for a discovered pack's own directory; while a load runs, /v1/models lists the id with state
+"loading": an assumption, not verified against the server), idempotent unload,
 SSE progress / complete / error for speech, music and video, streaming chat completions, and
 the fallback to the default model for an unknown id, and /metrics with
 `mlx_serve:process_start_time_seconds` (restart() starts a new server process). Per-request
@@ -61,6 +63,7 @@ class FakeMlxServe:
         self.sizes = dict(sizes or {})          # server id (or basename) -> bytes
         self.ready = collections.OrderedDict()  # server id -> bytes (what /api/ps shows)
         self.discovered = set()                 # ids /v1/models lists (discovery)
+        self.loading = set()                    # ids a load-model is working on (/v1/models state "loading")
         # mlx-serve v26.10.3 started without --model: the latest chat-capable load is promoted to
         # the default (default_promoted), unless a load said "default": true (setDefault).
         self.default_id = ""
@@ -222,8 +225,9 @@ class _Handler(BaseHTTPRequestHandler):
                 if s.default_id in ids:  # mlx-serve lists its default first
                     ids.remove(s.default_id)
                     ids.insert(0, s.default_id)
+                ids += sorted(s.loading - set(ids))
                 data = [{"id": i, "object": "model", "loaded": i in s.ready,
-                         "state": "ready" if i in s.ready else "unloaded",
+                         "state": "ready" if i in s.ready else "loading" if i in s.loading else "unloaded",
                          "capabilities": (["audio"] if any(m in i.lower() for m in s.media_markers)
                                           else ["chat", "streaming", "vision"])} for i in ids]
             return self._json(200, {"object": "list", "data": data,
@@ -250,16 +254,25 @@ class _Handler(BaseHTTPRequestHandler):
         target = body.get("model")
         if not isinstance(target, str) or not target:
             return self._error(400, "'model' must be a string")
-        if s.load_delay:
-            time.sleep(s.load_delay)
-        if s.load_error:
-            return self._error(s.load_error[0], s.load_error[1], "model_load_failed")
         if target.startswith("/"):
-            mid = os.path.basename(target.rstrip("/"))
+            # registerByPath: the directory of a discovered pack resolves to its discovered id;
+            # any other directory registers under its basename
+            own = [d for d in s.discovered if target.rstrip("/").endswith("/" + d)]
+            mid = own[0] if own else os.path.basename(target.rstrip("/"))
         elif target in s.discovered or target in s.ready:
             mid = target
         else:
             return self._error(404, "Unknown model id", "model_not_found")
+        if s.load_delay:
+            with s.lock:
+                s.loading.add(mid)
+            try:
+                time.sleep(s.load_delay)
+            finally:
+                with s.lock:
+                    s.loading.discard(mid)
+        if s.load_error:
+            return self._error(s.load_error[0], s.load_error[1], "model_load_failed")
         size = s.sizes.get(mid) or s.sizes.get(target) or int(1e9)
         with s.lock:
             s.ready[mid] = size

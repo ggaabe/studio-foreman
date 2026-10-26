@@ -232,6 +232,12 @@ class FakeEngine:
         """Optional Engine extension: the server process identity (changes on every restart)."""
         return f"{self.name}-boot-{self.restarts}"
 
+    def loading_models(self) -> set[str]:
+        """Optional Engine extension: models a load is in flight for, whoever asked for it (two
+        gpuds sharing this engine see each other's loads here; a second load() joins the first)."""
+        self._sync()
+        return {op.model for op in self._loads.values() if op.state == "loading"}
+
     def evict(self, model: str) -> None:
         """The engine drops a model on its own (memory pressure, idle TTL, ...)."""
         self._sync()

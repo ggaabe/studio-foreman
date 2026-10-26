@@ -4,7 +4,11 @@ What the adapter relies on (checked against the v26.10.3 source and the live ser
 
   * GET /api/ps lists READY models only, Ollama shape, names suffixed ':latest'. Models found
     by --model-dir discovery are named '<org>/<repo>'; a model loaded by absolute path is
-    registered under its directory basename. Both map back to the catalog name here.
+    registered under its directory basename. Both map back to the catalog name here, but only
+    one server model is ever reported as a catalog model: the copy gpud's own load made (its id
+    is remembered, and re-adopted from gpud's provenance record after a restart), else the only
+    one. Any other copy (someone else's same-named pack) is reported under its raw id, as a
+    model outside the catalog, so it is never unloaded and still counts in memory and slots.
   * POST /v1/load-model {"model": id | absolute path} blocks until the model is ready (or
     fails), so loads run on a worker thread behind a ticket. POST /v1/unload-model is
     idempotent but waits for in-flight generations on that model, so live runs on it are
@@ -85,14 +89,25 @@ class RequestRejected(RunFailed):
     adapter cannot even build): a content failure, reported to gpud as Poll.reason 'rejected'."""
 
 
-# 4xx answers that say "not now" or "not this server state" rather than "not these parameters".
-NOT_REJECTIONS = (404, 408, 409, 423, 429)
+# 4xx answers that say "not now", "not this server state" or "not this caller" rather than "not
+# these parameters": the caller was refused (401 Unauthorized, 403 Forbidden, 407 Proxy
+# Authentication Required: an auth proxy or an API key in front of the server), the endpoint does
+# not take the method (405: another server version), or the server is busy or lost the model.
+NOT_REJECTIONS = (401, 403, 404, 405, 407, 408, 409, 423, 429)
+# A size reading above this is physically impossible on any Mac (the largest has 512 GB of unified
+# memory): a glitch, never a plan (it would wedge every job of that model on memory).
+MAX_PLAUSIBLE_GB = 1024.0
+# Label of a second copy of a catalog model whose server id is the catalog name (the discovered
+# id) while gpud's own copy has another id: reported as "<id> (another copy)", a model outside the
+# catalog (never unloaded, counted in memory and slots).
+OTHER_COPY = "(another copy)"
 
 
 def rejected_status(status: int, message: str) -> bool:
-    """A 4xx that refuses the request's parameters. Not a 404/408/409/423/429, and not the
-    "does not support this modality" answer mlx-serve gives when a request reaches its default
-    model because the target is not resident (an eviction between the check and the request)."""
+    """A 4xx that refuses the request's parameters. Not one of NOT_REJECTIONS (the environment
+    refused the caller or is busy), and not the "does not support this modality" answer mlx-serve
+    gives when a request reaches its default model because the target is not resident (an eviction
+    between the check and the request)."""
     return 400 <= status < 500 and status not in NOT_REJECTIONS and "modality" not in (message or "").lower()
 
 
@@ -159,6 +174,9 @@ class _Load:
         self.ticket, self.model, self.timeout_s = ticket, model, timeout_s
         self.state, self.error = "loading", None
         self.deferred = False   # refused for now (free memory, a model slot): gpud retries later
+        # failed on this side only: the request reached the server and got no answer (gpud aborted
+        # it, the read timed out, the connection broke), so mlx-serve may still finish the load
+        self.in_flight = False
         self.conn: StreamConn | None = None
         self.started = time.monotonic()
 
@@ -291,8 +309,14 @@ class MlxServeEngine:
         self._unloads: dict[str, _Unload] = {}
         self._runs: dict[str, _Run] = {}
         self._by_run: dict[str, str] = {}
-        self._server_ids: dict[str, str] = {}     # catalog name -> id the server uses for it
-        self._sizes: dict[str, float] = {}        # model -> largest resident GB seen on this server instance
+        # Server ids. One catalog model can sit in mlx-serve under several ids: its discovered
+        # '<org>/<repo>' and the basename of any same-named directory someone loaded by path. Only
+        # one of them is reported under the catalog name (_reading): the copy gpud's own load made
+        # (_loaded_ids), else the only one, else the discovered id. Every other copy is reported
+        # under its raw server id, as a model outside the catalog (pinned, sized, a slot of its own).
+        self._loaded_ids: dict[str, str] = {}     # catalog name -> id gpud's load of it produced
+        self._canon: dict[str, str] = {}          # catalog name -> id it maps to in the last reading
+        self._sizes: dict[str, float] = {}        # reported name -> largest resident GB on this server instance
         self._resident: set[str] = set()          # last /api/ps reading, mapped
         self._instance: str | None = None         # the server's process start time (/metrics)
         self._instance_retry_at = 0.0             # /metrics unavailable: do not ask again before this
@@ -310,18 +334,40 @@ class MlxServeEngine:
         return any(p.lower() in model.lower() for p in self.forbidden)
 
     def server_id(self, model: str) -> str:
+        """The id to address `model` by: the copy gpud's own load made, else the id the catalog
+        name maps to in the last /api/ps reading, else the catalog name (the discovered id)."""
         with self._lock:
-            sid = self._server_ids.get(model) or model
+            sid = self._loaded_ids.get(model) or self._canon.get(model) or model
         if not sid or sid == "mlx-serve":
             raise ValueError(f"refusing to address mlx-serve with model id {sid!r} (it means the default model)")
         return sid
 
+    def owned_id(self, model: str) -> str | None:
+        """Optional Engine extension: the server id of the copy of `model` this adapter's own load
+        produced (or that gpud told it about with set_owned_id after a restart), or None."""
+        with self._lock:
+            return self._loaded_ids.get(model)
+
+    def set_owned_id(self, model: str, server_id: str | None) -> None:
+        """Optional Engine extension: gpud's provenance record says `server_id` is the copy of
+        `model` gpud loaded (a restarted gpud re-adopts it), or None: gpud no longer owns a copy, so
+        the next reading may report someone else's copy under the catalog name (as theirs)."""
+        if model not in self._mine:
+            return
+        with self._lock:
+            if isinstance(server_id, str) and server_id and server_id != "mlx-serve":
+                self._loaded_ids[model] = server_id
+            else:
+                self._loaded_ids.pop(model, None)
+
     def catalog_name(self, server_id: str) -> str:
-        """Catalog name for an id mlx-serve reports; unknown ids are returned unchanged."""
+        """Catalog name for an id mlx-serve reports (the discovered id, the id gpud's load got
+        back, or a directory basename); unknown ids are returned unchanged. Several ids can share
+        one name: _reading decides which of them is reported as the catalog model."""
         if server_id in self._mine:
             return server_id
         with self._lock:
-            for name, sid in self._server_ids.items():
+            for name, sid in self._loaded_ids.items():
                 if sid == server_id:
                     return name
         base = server_id.rstrip("/").rsplit("/", 1)[-1]
@@ -329,6 +375,35 @@ class MlxServeEngine:
             if name.rsplit("/", 1)[-1] == base:
                 return name
         return server_id
+
+    def _mapping(self, ids) -> dict:
+        """{server id: reported name} for one /api/ps reading. Per catalog name exactly one id is
+        reported as the catalog model: the id gpud's own load produced (if gpud loaded a copy and
+        that copy is gone, no alias stands in for it: gpud must see its model go), else the only
+        id, else the discovered id. Other copies keep their raw server id (someone else's models
+        outside the catalog: pinned on the Studio, never unloaded, counted in memory and slots)."""
+        groups: dict = {}
+        for sid in ids:
+            groups.setdefault(self.catalog_name(sid), []).append(sid)
+        out = {}
+        with self._lock:
+            loaded = dict(self._loaded_ids)
+        for name, sids in groups.items():
+            if name not in self._mine:
+                out.update({s: s for s in sids})
+                continue
+            own = loaded.get(name)
+            if own is not None:
+                pick = own if own in sids else None
+            elif len(sids) == 1:
+                pick = sids[0]
+            else:
+                pick = name if name in sids else sorted(sids)[0]
+            for s in sids:
+                # another copy whose raw id is the catalog name itself (gpud's copy is the
+                # basename one) is labelled, so it cannot pass for the catalog model
+                out[s] = name if s == pick else (s if s not in self._mine else f"{s} {OTHER_COPY}")
+        return out
 
     def model_path(self, model: str) -> str:
         return os.path.join(self.model_dir, *model.split("/"))
@@ -354,27 +429,29 @@ class MlxServeEngine:
             out[raw[:-len(":latest")] if raw.endswith(":latest") else raw] = m
         return out
 
-    def resident_models(self) -> set:
+    def _reading(self) -> tuple:
+        """(/api/ps entries by server id, {server id: reported name}), and the caches updated."""
         ps = self._ps()
-        current, sizes, ids = set(), {}, {}
+        mapping = self._mapping(ps)
+        sizes = {}
         for sid, entry in ps.items():
-            name = self.catalog_name(sid)
-            current.add(name)
             size = number(entry.get("size_vram")) or number(entry.get("size"))
             if size:
-                sizes[name] = size / 1e9
-            if name in self._mine:
-                ids[name] = sid
+                sizes[mapping[sid]] = size / 1e9
         with self._lock:
-            self._resident = current
+            self._resident = set(mapping.values())
+            self._canon = {name: sid for sid, name in mapping.items() if name in self._mine}
             for name, gb in sizes.items():
                 self._note_size(name, gb)
-            self._server_ids.update(ids)
-        return current
+        return ps, mapping
+
+    def resident_models(self) -> set:
+        return set(self._reading()[1].values())
 
     def _note_size(self, model: str, gb: float) -> None:
-        """Keep the largest size seen (a render grows LTX by a few GB over its resident weights)."""
-        if gb > self._sizes.get(model, 0.0):
+        """Keep the largest size seen (a render grows LTX by a few GB over its resident weights).
+        A reading no Mac could hold is a glitch and is ignored."""
+        if 0 < gb <= MAX_PLAUSIBLE_GB and gb > self._sizes.get(model, 0.0):
             self._sizes[model] = gb
 
     def model_size_gb(self, model: str) -> float | None:
@@ -396,7 +473,9 @@ class MlxServeEngine:
         server without them is not asked again for a minute."""
         now = time.monotonic()
         if now < self._instance_retry_at:
-            return self._instance
+            # Not asked again yet: unknown. Never the last identity read, which may be the server
+            # that was running before a restart (gpud would take a new server for the old one).
+            return None
         value, missing = None, False
         try:
             status, body = self._metrics_text()
@@ -422,8 +501,23 @@ class MlxServeEngine:
             if self._instance is not None and inst != self._instance:
                 log.warning("mlx-serve restarted (process start %s -> %s)", self._instance, inst)
                 self._sizes.clear()
+                self._loaded_ids.clear()  # nothing on the new server was loaded by gpud
             self._instance = inst
         return inst
+
+    def loading_models(self) -> set:
+        """Optional Engine extension: catalog models a load is in flight for on the server, by any
+        client, when /v1/models reports a model's state as loading (gpud then waits for that load
+        instead of joining it with a load-model of its own, which would make the copy look like
+        gpud's). Empty when the server reports no such state."""
+        data = (self._get("/v1/models") or {}).get("data") or []
+        out = set()
+        for e in data:
+            if not (isinstance(e, dict) and isinstance(e.get("id"), str)):
+                continue
+            if str(e.get("state") or "").lower() == "loading" and self.catalog_name(e["id"]) in self._mine:
+                out.add(self.catalog_name(e["id"]))
+        return out
 
     def _metrics_text(self) -> tuple:
         return text_call(self.base_url, "/metrics", timeout=min(2.0, self.call_timeout_s))
@@ -470,14 +564,25 @@ class MlxServeEngine:
 
     def load(self, model: str) -> str:
         spec = self._check_model(model)
-        resident = self.resident_models()
+        ps, mapping = self._reading()
+        resident = set(mapping.values())
         with self._lock:
+            own = self._loaded_ids.get(model)
             for op in self._loads.values():
-                if op.model == model and (op.state == "loading" or (op.state == "ready" and model in resident)):
+                if op.model == model and (op.state == "loading" or (op.state == "ready" and own in ps)):
                     return op.ticket
             ticket = f"{self.name}-load-{next(self._seq)}-{self._boot}"
         op = _Load(ticket, model, max(60.0, spec.load_s * self.load_timeout_factor + 60.0))
-        problem, deferred = (None, False) if model in resident else self._preload_problem(model, spec, resident)
+        problem, deferred = None, False
+        if own is not None and own in ps:
+            op.state = "ready"  # gpud's own copy is resident already (a restarted gpud re-adopted it)
+        elif model in resident:
+            # Someone else's copy: a load-model would only join it (mlx-serve answers "ready" for a
+            # model it has), and gpud would then take their copy for its own and unload it later.
+            problem = (f"{model} is already resident in mlx-serve (as {self._canon.get(model, model)!r}), loaded by "
+                       f"another client: refusing to send a load-model that would only claim their copy")
+        else:
+            problem, deferred = self._preload_problem(model, spec, ps)
         with self._lock:
             self._loads[ticket] = op
             if problem:
@@ -485,7 +590,8 @@ class MlxServeEngine:
         if problem:
             log.warning("load of %s %s: %s", model, "deferred" if deferred else "refused", problem)
             return ticket
-        threading.Thread(target=self._load_main, args=(op,), name=f"foreman-load-{model}", daemon=True).start()
+        if op.state == "loading":
+            threading.Thread(target=self._load_main, args=(op,), name=f"foreman-load-{model}", daemon=True).start()
         return ticket
 
     def incomplete_pack(self, model: str) -> str | None:
@@ -504,18 +610,20 @@ class MlxServeEngine:
         return (f"{model} is still downloading ({len(partial)} partial file(s) in {self.model_path(model)}, "
                 f"e.g. {partial[0]}); refusing to load an incomplete pack")
 
-    def _preload_problem(self, model: str, spec: ModelSpec, resident: set) -> tuple:
+    def _preload_problem(self, model: str, spec: ModelSpec, ps) -> tuple:
         """(reason to refuse the load, deferred) or (None, False). `deferred` marks a refusal that
         says "not now" rather than "not this model": too little free memory beside the host's other
-        tenants, or every mlx-serve slot taken. gpud then keeps a media job waiting and retries."""
+        tenants, or every mlx-serve slot taken. gpud then keeps a media job waiting and retries.
+        `ps` is the raw /api/ps reading: every server model holds a slot, including two copies of
+        one catalog model under different ids."""
         partial = self.incomplete_pack(model)
         if partial:
             return partial, False
         cap = self.max_resident_models
-        if cap and len(resident) >= cap:
-            return (f"mlx-serve already holds {len(resident)} models (--max-resident-models {cap}); loading "
+        if cap and len(ps) >= cap:
+            return (f"mlx-serve already holds {len(ps)} models (--max-resident-models {cap}); loading "
                     f"{model} would make it LRU-evict one, possibly a model Foreman does not own: "
-                    f"{sorted(resident)}"), True
+                    f"{sorted(ps)}"), True
         avail = self.available_gb()
         if avail is None:
             return "cannot measure free memory (vm_stat and /v1/models machine.free_mib both unavailable)", False
@@ -534,8 +642,8 @@ class MlxServeEngine:
         except Exception:
             ids = set()
         with self._lock:
-            known = self._server_ids.get(model)
-        for cand in (known, model):
+            known = self._loaded_ids.get(model)
+        for cand in (known, model):  # never another client's alias: loading that would only claim it
             if cand and cand in ids:
                 return cand
         return self.model_path(model)
@@ -566,7 +674,7 @@ class MlxServeEngine:
             log.warning("could not restore mlx-serve's default model to %r: %s", prior, e)
 
     def _load_main(self, op: _Load) -> None:
-        conn = None
+        conn, answered = None, False
         try:
             try:
                 prior_default = self._server_default() if self.preserve_default else None
@@ -581,6 +689,7 @@ class MlxServeEngine:
             log.info("loading %s via POST /v1/load-model %s", op.model, target)
             status = conn.request("POST", "/v1/load-model", json.dumps({"model": target}).encode(),
                                   {"Content-Type": "application/json"}, header_timeout=op.timeout_s)
+            answered = True  # the server answered: whatever it said, the request is over
             body = conn.read_body(1 << 20, silence_s=30.0)
             if status != 200:
                 raise RunFailed(f"HTTP {status}: {error_message(body)}")
@@ -590,29 +699,36 @@ class MlxServeEngine:
             if not isinstance(sid, str) or not sid:
                 raise RunFailed(f"load-model answered without a model id: {body[:200]!r}")
             with self._lock:
-                self._server_ids[op.model] = sid
                 size = number(entry.get("bytes_resident"))
                 if size:
                     self._note_size(op.model, size / 1e9)
+                # This copy is gpud's (not an alias someone else loaded), even if gpud gave up on the
+                # request meanwhile: its load intent then claims the model when it appears.
+                self._loaded_ids[op.model] = sid
+                self._canon[op.model] = sid
                 if op.state == "loading":
                     op.state = "ready"
                     self._resident.add(op.model)
             log.info("loaded %s as %r in %.1fs", op.model, sid, time.monotonic() - op.started)
             self._restore_default(prior_default, sid)
-        except Cancelled:
-            self._fail_load(op, "load aborted (connection closed by gpud)")
-        except Silence:
-            self._fail_load(op, f"load-model did not answer within {op.timeout_s:.0f}s")
         except Exception as e:
-            self._fail_load(op, f"{type(e).__name__}: {e}")
+            pending = bool(conn is not None and conn.sent) and not answered
+            if isinstance(e, Cancelled):
+                self._fail_load(op, "load aborted (connection closed by gpud)", pending)
+            elif isinstance(e, Silence):
+                self._fail_load(op, f"load-model did not answer within {op.timeout_s:.0f}s", pending)
+            else:
+                self._fail_load(op, f"{type(e).__name__}: {e}", pending)
         finally:
             if conn is not None:
                 conn.close()
 
-    def _fail_load(self, op: _Load, error: str) -> None:
+    def _fail_load(self, op: _Load, error: str, in_flight: bool = False) -> None:
+        """`in_flight`: the request reached the server and got no answer, so mlx-serve may still
+        finish the load (gpud then keeps its load intent and claims the model if it appears)."""
         with self._lock:
             if op.state == "loading":
-                op.state, op.error = "failed", error
+                op.state, op.error, op.in_flight = "failed", error, bool(in_flight)
         log.warning("load of %s failed: %s", op.model, error)
 
     def poll_load(self, ticket: str) -> LoadStatus:
@@ -620,7 +736,7 @@ class MlxServeEngine:
             op = self._loads.get(ticket)
             if op is None:
                 return LoadStatus("failed", "unknown load ticket (issued by an earlier gpud process)")
-            return LoadStatus(op.state, op.error, op.deferred)
+            return LoadStatus(op.state, op.error, op.deferred, op.in_flight)
 
     # ------------------------------------------------------------------ unload / terminate
 
@@ -631,7 +747,11 @@ class MlxServeEngine:
         with self._lock:
             for op in self._loads.values():
                 if op.model == model and op.state == "loading":
-                    op.state, op.error = "failed", "aborted by unload"
+                    # A request already sent may still complete server-side (closing the connection
+                    # does not stop mlx-serve's load): say so, so gpud keeps its load intent.
+                    sent = op.conn is not None and op.conn.sent
+                    op.state, op.in_flight = "failed", sent
+                    op.error = "aborted by unload" + ("; mlx-serve may still finish loading it" if sent else "")
                     if op.conn is not None:
                         op.conn.close()
             live = [r for r in self._runs.values() if r.spec.model == model and r.status == "running"]
@@ -657,6 +777,10 @@ class MlxServeEngine:
             self._unloads.pop(model, None)
             if job.ok:  # the largest size seen stays: it plans the next load of this model
                 self._resident.discard(model)
+                if self._loaded_ids.get(model) == job.server_id:
+                    self._loaded_ids.pop(model, None)  # gpud's copy is gone
+                if self._canon.get(model) == job.server_id:
+                    self._canon.pop(model, None)
         if job.unreachable:
             raise ConnectionError(job.error or "mlx-serve unreachable")
         if not job.ok:
@@ -820,15 +944,13 @@ class MlxServeEngine:
     def _check_resident(self, run: _Run) -> None:
         """Pin the exact id mlx-serve has the model under, or refuse: a request naming an id the
         server does not have would be answered by its default model."""
-        ps = self._ps()
-        sids = [sid for sid in ps if self.catalog_name(sid) == run.spec.model]
+        _, mapping = self._reading()
+        sids = [sid for sid, name in mapping.items() if name == run.spec.model]  # the copy that is the model
         if not sids:
             raise RunFailed(f"{run.spec.model} is not resident in mlx-serve; refusing to send the request "
                             f"(mlx-serve would answer it with its default model)")
-        sid = run.server_model if run.server_model in sids else sids[0]
         with self._lock:
-            run.server_model = sid
-            self._server_ids[run.spec.model] = sid
+            run.server_model = sids[0]
 
     def _run_brain(self, run: _Run) -> None:
         if self.brain is None:

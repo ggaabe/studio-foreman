@@ -184,10 +184,37 @@ def load_config(path: str | None = None, env=None, **overrides) -> Config:
         raise ValueError(f"{path}: planner_options must be an object of planner settings")
     if not isinstance(cfg.foreign_models, (list, tuple)) or not all(isinstance(m, str) for m in cfg.foreign_models):
         raise ValueError(f"{path}: foreign_models must be a list of model names")
+    cfg.foreign_models = [catalog_model(m, f"{path}: foreign_models") for m in cfg.foreign_models]
     if number(cfg.min_headroom_gb) is None or cfg.min_headroom_gb < 0:
         raise ValueError(f"{path}: min_headroom_gb must be a number >= 0")
+    usable = cfg.policy().usable_gb
+    brain = catalog()[BRAIN_PRIMARY]
+    if usable < brain.size_gb:
+        raise ValueError(f"min_headroom_gb {cfg.min_headroom_gb:g} leaves {usable:g} GB to plan with "
+                         f"(256 GB - {OS_RESERVE_GB:g} macOS - {OTHER_TENANTS_GB:g} other services - the headroom), "
+                         f"less than the {brain.size_gb:g} GB brain: nothing could ever be loaded. At most "
+                         f"{256.0 - OS_RESERVE_GB - OTHER_TENANTS_GB - brain.size_gb:g} GB")
     cfg.planner_config()  # fail early on an unknown or malformed planner option
     return cfg.finish()
+
+
+def catalog_model(name: str, where: str = "model") -> str:
+    """The catalog name for a model written the way mlx-serve shows it: the catalog name itself
+    ('<org>/<repo>'), the directory basename a load by path registers (as /api/ps lists it, with
+    or without ':latest'), or the pack's path. Anything else is refused: an override that names a
+    model gpud never compares against would be silently ineffective."""
+    names = list(catalog())
+    text = str(name).strip()
+    if text.endswith(":latest"):
+        text = text[:-len(":latest")]
+    if text in names:
+        return text
+    base = text.rstrip("/").rsplit("/", 1)[-1]
+    hits = [n for n in names if n.rsplit("/", 1)[-1] == base]
+    if len(hits) == 1:
+        return hits[0]
+    raise ValueError(f"{where}: {name!r} is not a catalog model (known: {names}); models outside the catalog are "
+                     f"never unloaded on the Studio anyway")
 
 
 def find_ffmpeg(setting: str, home: str) -> str | None:

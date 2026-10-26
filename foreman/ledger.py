@@ -17,15 +17,19 @@ P(ship) per template is Beta(prior.alpha + accepts, prior.beta + rejects): only 
 verdicts move it, never the brain's review and never the planner.
 
 A failed item is classified (fail_class). `infra`: the environment failed it (a load failed or
-was refused for memory past its deferral, the engine was unreachable or lost, a gpud restart
-interrupted it, gpud raised on it, the run crashed or timed out server-side, gpud cancelled it
-while draining). `content`: the work itself did not pass (a validator: black, frozen or silent
-output; the server rejected the request's parameters with a 4xx; the brain's review rejected
-it; the owner or a paused template cancelled it). Weekly caps and the day's review minutes
+was refused for memory past its deferral, gpud could not make room for it beside someone else's
+models, the engine was unreachable or lost, a gpud restart interrupted it, gpud raised on it, the
+run crashed or timed out server-side once, gpud cancelled it while draining). `content`: the work
+itself did not pass (a validator: black, frozen or silent output, also output that finished
+during a timeout's cancel; the server rejected the request's parameters with a 4xx; the brain's
+review rejected it, or was refused for its own request; a crash or timeout that repeated in the
+lineage; the owner or a paused template cancelled it). Weekly caps and the day's review minutes
 count queued items, produced items and content failures; an infrastructure failure does not
-count, up to a per-template budget per day (planner.infra_budget), after which it counts again
-so a persistently failing environment cannot recycle the same slots forever. Each failed item
-records whether it counted and why (counted, count_note).
+count, up to per-template budgets per day and per 7 days (planner.infra_budget,
+infra_budget_week), after which it counts again so a persistently failing environment cannot
+recycle the same slots forever. Each failed item records whether it counted and why (counted,
+count_note). An uncounted infrastructure failure produced nothing, so its brief may be proposed
+again (its row keeps its history under a retired content hash).
 """
 from __future__ import annotations
 
@@ -41,6 +45,9 @@ INFRA_REASONS = frozenset({"load_failed", "engine_unreachable", "engine_lost", "
                            "interrupted", "supervisor_error", "timeout", "crash"})
 # ... and those that are the work's: anything not listed above counts as content (fail closed).
 CONTENT_REASONS = frozenset({"validator", "rejected", "cancelled"})
+# Infrastructure the first time in a lineage; when the brain's retry fails the same way, the
+# request itself is the likelier cause (parameters that crash or hang the engine), so it counts.
+REPEAT_IS_CONTENT = frozenset({"crash", "timeout"})
 STOCK_STATES = ("queued", "review", "accepted")
 LIVE = ("queued", "starting", "running", "cancelling")
 DAY = 86400.0
@@ -110,8 +117,27 @@ def item_for_job(store, job_id: int) -> dict | None:
     return _item(row) if row else None
 
 
+# An item that failed for infrastructure reasons and did not count: its content was never
+# produced, so the same brief may be proposed again (the old row keeps its history under a
+# retired hash, see retire_hash).
+REPROPOSABLE = "state = 'failed' AND fail_class = 'infra' AND counted = 0"
+
+
 def hash_exists(store, content_hash: str) -> bool:
-    return store.conn.execute("SELECT 1 FROM plan_items WHERE content_hash = ?", (content_hash,)).fetchone() is not None
+    """The content was proposed already, and not by an item that failed for infrastructure
+    reasons without counting (that one may be proposed again)."""
+    return store.conn.execute(f"SELECT 1 FROM plan_items WHERE content_hash = ? AND NOT ({REPROPOSABLE})",
+                              (content_hash,)).fetchone() is not None
+
+
+def retire_hash(store, content_hash: str) -> int:
+    """Before the same content is admitted again: rename the hash of the uncounted
+    infrastructure failure that holds it (to '<hash>~<item id>'), and return how many earlier
+    admissions of this content exist (it numbers the new job's idempotency key)."""
+    store.conn.execute(f"UPDATE plan_items SET content_hash = content_hash || '~' || id "
+                       f"WHERE content_hash = ? AND {REPROPOSABLE}", (content_hash,))
+    return store.conn.execute("SELECT COUNT(*) AS n FROM plan_items WHERE content_hash LIKE ?",
+                              (content_hash + "~%",)).fetchone()["n"]
 
 
 def record_rejection(store, plan_job_id, at: float, template_id, reason: str, detail: str | None) -> None:
@@ -225,12 +251,25 @@ def _decision(job: Job) -> dict:
     return art.get("decision") if isinstance(art, dict) and isinstance(art.get("decision"), dict) else {}
 
 
+def _bad_output(o: dict) -> list:
+    """The checks a finished run's output failed: a run that completed (also during its cancel
+    grace, after its timeout) with black, frozen or silent output failed on its content, whatever
+    reason the timeout gave it."""
+    if o.get("finished_during_cancel") != "done":
+        return []
+    return [str(r.get("check")) for r in (o.get("validator_results") or []) if isinstance(r, dict) and not r.get("ok")]
+
+
 def failure_class(store, media: list) -> tuple:
     """('infra' | 'content', why) for an item whose lineage ended without output for review.
-    Content if any media job failed for a content reason, or produced output that the brain's
-    review turned down or a human was handed; infra if every failure was the environment's (a
-    review that could not run is the environment's too)."""
+    Content if any media job failed for a content reason (also output that finished during a
+    timeout's cancel and failed its validators), or produced output that the brain's review
+    turned down or a human was handed, or the brain's review of it was refused for its
+    request (rejected); content too when a crash or timeout repeated in the lineage (the same
+    request failing the engine the same way again is the request's doing). Infra if every
+    failure was the environment's (a review that could not run otherwise is the environment's too)."""
     content, infra = [], []
+    repeats = []
     for j in media:
         o = j.outcome if isinstance(j.outcome, dict) else {}
         if j.state == "succeeded":
@@ -242,15 +281,27 @@ def failure_class(store, media: list) -> tuple:
                 content.append(f"job {j.id}'s output was handed to a human")
             elif child.state != "succeeded":
                 r = (child.outcome or {}).get("reason") if isinstance(child.outcome, dict) else None
-                infra.append(f"the brain's review of job {j.id} could not run ({child.state}: {r})")
+                if r == "rejected":  # e.g. a 4xx for a review prompt the output made too big
+                    content.append(f"the brain's review of job {j.id} was refused for its request ({r})")
+                else:
+                    infra.append(f"the brain's review of job {j.id} could not run ({child.state}: {r})")
             else:
                 verdict = _decision(child).get("verdict")
                 if verdict not in ("accept", "human_review"):
                     content.append(f"the brain's review of job {j.id} said {verdict}")
             continue
         reason = o.get("reason")
-        if reason == "cancelled" and o.get("cancelled_by") == "gpud":
+        bad = _bad_output(o)
+        if bad:
+            content.append(f"job {j.id} finished during its {reason} cancel with output that failed {bad}")
+        elif reason == "cancelled" and o.get("cancelled_by") == "gpud":
             infra.append(f"job {j.id} cancelled by gpud")
+        elif reason in REPEAT_IS_CONTENT:
+            repeats.append(j.id)
+            if len(repeats) > 1:
+                content.append(f"jobs {repeats} each crashed or timed out: the same request failed the engine again")
+            else:
+                infra.append(f"job {j.id} {reason}")
         elif reason in INFRA_REASONS:
             infra.append(f"job {j.id} {reason}")
         else:

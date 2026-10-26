@@ -19,13 +19,14 @@ test suite makes no network calls outside 127.0.0.1 and starts no real model ser
 
 ```bash
 cd foreman
-python3 -m unittest discover -s tests -v     # 307 tests (plus subtests), about 70 to 90 seconds
+python3 -m unittest discover -s tests -v     # 355 tests (plus subtests), about 75 to 100 seconds
 python3 -m foreman.demo                       # narrated timeline: render hangs, brain recovers
 python3 -m foreman.demo --fault crash         # also: garbage, wedged, none
 ```
 
 The suite reports `OK`. Two red-team tests originally demanded that gpud crash on an engine or
-pager outage; they now assert the opposite. See [Inverted red-team tests](#inverted-red-team-tests).
+pager outage; they now assert the opposite, and one subtest of the live-fixes red team pins a
+documented gap instead of demanding a fix. See [Inverted red-team tests](#inverted-red-team-tests).
 
 ## Layout
 
@@ -64,6 +65,8 @@ pager outage; they now assert the opposite. See [Inverted red-team tests](#inver
 | `tests/test_planner_adversarial.py` | The planner red team's 46 attacks (A to U), all passing unchanged |
 | `tests/test_planner_fixes.py` | X1 to X12: regression tests for the design concerns the planner red team raised |
 | `tests/test_live_fixes.py` | LV1 to LV13: regressions from the planner's first live run (deferred media loads, retracting a verdict, model provenance, calibrated memory plans, infrastructure failures that do not use caps) |
+| `tests/test_live_fixes_adversarial.py` | The red team's 30 attacks on those three fixes (RP provenance, RC calibration, RF failure classes); one subtest adjusted, see below |
+| `tests/test_live_fixes_round2.py` | LR1 to LR4: regressions for the answers to that red team and its design concerns |
 
 ## How the brain comes back
 
@@ -181,7 +184,7 @@ because the bad input was persisted and `recover()` walked into it again. Now:
 | I5 | Primary retried once, then fallback, then page + SAFE. No load loop (a flapping brain counts as a failed load), and the ladder survives restarts. Every way into SAFE pages a human | `I5BrainLoadLadder`, `A3`, `A7`, `P2` |
 | I6 | Max attempts leads to quarantine + `human_review`, and a request cannot raise `max_attempts`. Identical resubmissions without `retry_of` are counted. The per-lineage failure budget bounds varied resubmissions. A poisoned brain job is quarantined, and the depth limit ends infinite chains. gpud's own deaths are not charged | `I6Poison`, `A4`, `H5` |
 | I7 | The brain is never away longer than `max_brainless_s` when brain loads take their nominal time, even when every chunk of a split batch runs into its hard timeout, even when callers set priorities, and even across wall-clock steps. If loads fail, see the gap below | `I7MaxBrainless`, `A2`, `A5`, `A9` |
-| I8 | Autonomous eviction of an idle, busy, or co-resident brain is detected and the brain is reloaded when needed. Models gpud does not know are sized by the adapter (or assumed to fill the host) and unloaded before planning (simulation default; the Studio pins them). A catalog model gpud did not load itself is someone else's: never unloaded, always counted (see [Which models are gpud's](#which-models-are-gpuds)) | `I8Eviction`, `A1` foreign model, `H8`, `LV6` to `LV8` |
+| I8 | Autonomous eviction of an idle, busy, or co-resident brain is detected and the brain is reloaded when needed. Models gpud does not know are sized by the adapter (or assumed to fill the host) and unloaded before planning (simulation default; the Studio pins them). A catalog model gpud did not load itself is someone else's: never unloaded (not even by restarting its engine), always counted (see [Which models are gpud's](#which-models-are-gpuds)) | `I8Eviction`, `A1` foreign model, `H8`, `LV6` to `LV8`, `RP`, `LR1`, `LR2` |
 | I9 | Every resume brief is complete. A stateless brain can rebuild the retry from the brief alone. Artifacts written before a failure, or finished during the cancel grace, are in the brief | `I9ResumeBrief`, `A11`, checks on every continuation in `assert_invariants` |
 | I10 | No adapter exception, malformed adapter result, validator error, malformed decision, pager outage or gpud fault on one job escapes `tick()`. Each becomes a recorded outcome | `A1`, `H1`, `H6`, `H9` (seeded chaos with random gpud kills) |
 
@@ -200,6 +203,17 @@ exception killing the process. The fixed gpud rides out both outages, so those a
 inverted to `assertEqual(crashes, [])`. Every other assertion in them is unchanged.
 `test_hardening.H1NoCrashOnOutages` covers the same ground independently.
 
+`test_live_fixes_adversarial.RP4RestartGpudCannotSee`, subtest `unchanged`, asserted that gpud
+never releases a model another client reloaded inside one tick of a server restart whose identity
+reads the same before and after. With a readable identity that does not change, the restart is
+indistinguishable from no restart; the only trace is that another of gpud's models disappeared,
+which is what a routine LRU eviction looks like. Passing would mean disowning all of gpud's models
+on every eviction under a trusted identity, which pins gpud's own media models (memory it then
+cannot free: the over-planning this round fixed) until a human or the server removes them. That
+subtest now asserts the documented gap (the release happens); the `missing` subtest (no identity
+at all), where gpud does disown its other models after such a disappearance, is unchanged and
+passes. Every other attack in that file passes as written.
+
 ## Mapping to the real engines
 
 The mlx-serve adapter exists (next section); an oMLX adapter does not. The points below are the
@@ -214,10 +228,19 @@ requirements any adapter has to meet. How the mlx-serve adapter meets them is de
   example oMLX after DeepSeek) should be reported as having no models, not raise. Otherwise it is
   declared lost after `engine_lost_s` and a human is paged.
 - Optional `model_size_gb(model)`: the footprint of a model the catalog does not know (loaded by
-  another client). Without it, such a model is assumed to fill the host.
+  another client). Without it, such a model is assumed to fill the host. A reading larger than the
+  host's memory is a glitch and is ignored (`model_size_implausible`).
+- Optional `instance_id()`: the server process's identity (a change means it restarted). Without
+  it, or while it reads `None`, gpud cannot see a restart (see [Which models are gpud's](#which-models-are-gpuds)).
+- Optional `loading_models()`: models a load is in flight for, by any client, so gpud waits for
+  another client's load instead of joining it. Optional `owned_id(model)` / `set_owned_id(model,
+  id)`: for a server that can hold one model under several ids, the id of gpud's own copy.
+- Optional extensions are hints: one that raises or returns garbage counts as "unknown" (noted once
+  as `engine_extension_error`) and never marks the engine down.
 - `load(model)` / `poll_load(ticket)`: if the server's load call blocks, run it on a worker thread
   and expose a ticket. A load that takes longer than `load_timeout_factor` x `load_s` counts as
-  failed.
+  failed. A failed `LoadStatus` with `in_flight` says the request reached the server and was given
+  up on client-side (aborted, timed out), so the server may still finish it.
 - `unload(model)`: the server's graceful unload, which must also abort an in-flight load. Return
   `False` when it refuses or hangs.
 - `start(spec)` / `find(run_id)`: recovery depends on starting being idempotent on `run_id`. If the
@@ -265,15 +288,18 @@ its plan time). The earlier estimates (brain 24 GB / 25 s, LTX 60 GB / 45 s, Fla
 88 to 110 GB were free. A model can still be bigger than its plan (a longer clip, another
 quantization): gpud and the adapter's preflight both plan with the largest size mlx-serve reported
 for the model since the server started whenever that exceeds the catalog number (`model_size_observed`
-is logged when it does), and forget those readings when the server restarts.
+is logged when it does), and forget those readings when the server restarts. A reading no machine
+could hold (more than the host's memory; the adapter's limit is 1 TB) is ignored and logged once
+(`model_size_implausible`): one glitch must not keep every job of that model waiting on memory.
 
 The policy reserves 96 GB of the 256 GB (macOS 16 GB, other inference services that live outside
 mlx-serve 40 GB, and the `min_headroom_gb` margin, 40 GB by default), so 160 GB are planned: the
 27B, LTX and someone else's Flash-Next fit together (20 + 40 + 77 GB). `min_headroom_gb` (config,
 or `FOREMAN_MIN_HEADROOM_GB`) sets both the adapter's free-memory preflight and the policy's
-reserve. Models in mlx-serve that gpud did not load (anything the user or another app loaded,
-catalog models included) are **pinned**: they count against memory and model slots and are never
-unloaded (next section).
+reserve; a headroom that leaves less than the 27B brain's 20 GB to plan with (more than 180 GB) is
+refused at startup. Models in mlx-serve that gpud did not load (anything the user or another app
+loaded, catalog models included) are **pinned**: they count against memory and model slots and are
+never unloaded (next section).
 
 ### Which models are gpud's
 
@@ -290,19 +316,54 @@ the catalog's fallback brain.
   with the request in flight, the next gpud claims the model when it appears on the same server
   instance within the load's timeout plus 60 s (`model_claimed`); otherwise the intent expires.
   A load the engine answered as failed (or refused before sending) ends its intent at once, so a
-  copy another client loads right after is theirs.
+  copy another client loads right after is theirs. A load gpud gave up on after the request
+  reached the server (its 3x timeout, then the abort; the adapter reports it `in_flight`) keeps its
+  intent from that moment: the server may still finish it, and the model is then gpud's to
+  release, not a leak nobody owns.
+- **One copy is gpud's.** mlx-serve can hold one catalog model under two ids (the discovered
+  `<org>/<repo>` and the basename of a same-named directory someone loaded by path). The adapter
+  reports only the copy gpud's own load made under the catalog name (its id is recorded as
+  `server_id` in `model_owners` and handed back to the adapter after a gpud restart); any other copy
+  is reported under its raw id (the discovered id as `<id> (another copy)`), a model outside the
+  catalog: pinned, sized, a slot of its own. If gpud's copy goes, no alias stands in for it, and
+  unloads and runs address gpud's id. A load of a model someone else already has resident is
+  refused by the adapter (mlx-serve would only answer "ready" for their copy), and gpud waits for
+  another client's load in flight instead of joining it (`loading_models`; this needs mlx-serve to
+  list the model as `loading` in `/v1/models`, which is assumed, not verified).
 - **Ownership ends** when gpud unloads the model, when it observes the model gone
   (`ownership_dropped`), or when the server instance changes (`engine_instance_changed`): after a
   restart nothing resident was loaded by gpud, even a model with the same name. A model that comes
-  back without a gpud load is someone else's.
+  back without a gpud load is someone else's. While the identity is unknown (no `/metrics`, or a
+  read that failed; the adapter never reports the previous server's identity for it), loads are
+  recorded without an instance and adopt the next one read, and an unexpected disappearance of one
+  of gpud's models makes gpud disown its others on that server: a restart plus someone else's
+  reload cannot be ruled out, so they are never unloaded (the safe side; a human is paged if that
+  leaves no room for a brain).
+- **Never by force, never by restart.** gpud's escalation of a refused unload is `terminate()`
+  (SIGTERM, launchd restarts the engine). It is not used on an engine that also holds models gpud
+  did not load, or that someone else is loading: that would take them down too. gpud enters SAFE
+  for that engine and pages instead. (mlx-serve's adapter refuses terminate anyway.)
 - **Someone else's brain** may serve gpud's brain jobs read-only (`use_foreign_brains`, on by
   default; the planner may then plan on it too). gpud never loads a second copy of a model that is
   resident already, so a media job whose model someone else has loaded runs on their copy, read-only;
-  a timeout's cleanup then skips the unload (`cleanup: foreign`).
+  a timeout's cleanup then skips the unload (`cleanup: foreign`). With `use_foreign_brains` off, a
+  brain someone else holds resident is not gpud's to load either: if that leaves no brain in the
+  ladder, gpud enters SAFE and pages.
 - **Owner override.** `"foreign_models": [...]` in `config.json` lists catalog models that are
   always someone else's: gpud never loads, unloads or claims them (it may still use a resident one
-  as a brain). Leaving the fallback brain out of the ladder this way means a failing primary ends
-  in SAFE mode instead.
+  as a brain, or run a media job on a resident one). Entries may be written the way mlx-serve shows
+  them (the basename, with or without `:latest`, or the pack's path) and are normalized to the
+  catalog name; a name that matches no catalog model stops gpud at startup. The planner never
+  routes work to such a model, and a job for one that nobody has resident waits (nothing is
+  unloaded for it, the queue behind it moves) and fails after an hour. Leaving the fallback brain
+  out of the ladder this way means a failing primary ends in SAFE mode instead.
+- **Waiting is bounded.** A media job that cannot run because the memory or the model slots it
+  needs are held by models gpud may not unload waits without holding up the jobs behind it
+  (`media_blocked`), and fails with `load_failed` after `load_defer_max_s` (1 h), so its baton fires
+  and a planned item stops counting toward stock. gpud checks slots before it unloads anything,
+  so it never gives up its own brain for a model that could not get a slot anyway. When no brain
+  can come back for `brain_blocked_page_s` (15 min) because of such models (or another client's
+  load that never finishes), a human is paged once per absence (`brain_blocked`).
 - **Upgrade.** A database from before provenance is seeded once from its event log: a resident
   model whose latest event is gpud's own `model_loaded` is gpud's, any other is someone else's
   (`ownership_seeded`). `status` marks each resident model `gpud` or `not gpud`.
@@ -417,7 +478,13 @@ Checked against the v26.10.3 source and, read-only, against the live server:
   can close it (`http.client` is unusable after one read timeout).
 - `resident_models()`: `GET /api/ps` lists READY models (names end in `:latest`; `expires_at`
   is ignored). Sizes come from `size_vram` and feed `model_size_gb()`. Read every tick, because
-  mlx-serve evicts on its own.
+  mlx-serve evicts on its own. Each catalog model is reported once, for the copy gpud loaded (or
+  the only copy); a second copy under another id is reported under its raw id
+  ([Which models are gpud's](#which-models-are-gpuds)).
+- `instance_id()`: `mlx_serve:process_start_time_seconds` from `/metrics` (`/metrics.json` as a
+  fallback); a server without either is not asked again for a minute, and reads `None` meanwhile,
+  never the identity of the server that was running before. `loading_models()`: `/v1/models`
+  entries whose `state` is `loading`.
 - **Your default model stays yours.** An mlx-serve started without `--model` promotes the latest
   chat-capable load to its default, so loading the brain would silently capture every request
   that names no model (your apps, the "mlx-serve" alias). Before each load the adapter notes the
@@ -434,9 +501,12 @@ Checked against the v26.10.3 source and, read-only, against the live server:
   unloading anything in between; only a wait over 1 h fails the job (`Policy.load_defer_*`). An
   incomplete pack or an unreadable memory probe is refused outright (a failed load). Free memory
   is `vm_stat` free + inactive + speculative pages x page size, and the server's own
-  `machine.free_mib`; the smaller wins. gpud's planner also reads `max_resident_models` and frees
-  a slot itself, unloading its own idle models (media first), so mlx-serve's LRU never picks a
-  victim that Foreman does not own.
+  `machine.free_mib`; the smaller wins. Slots are counted per server model, so two copies of one
+  catalog model hold two. gpud's planner also reads `max_resident_models` and frees a slot itself,
+  unloading its own idle models (media first), so mlx-serve's LRU never picks a victim that
+  Foreman does not own. A model someone else already has resident is never "loaded" (that
+  load-model would only answer ready for their copy), and a request that reached the server and
+  then got no answer (aborted by gpud, timed out, connection broken) is reported `in_flight`.
 - `unload()`: `POST /v1/unload-model` is idempotent, but it waits for in-flight generations on
   that model, so the adapter first closes its own streams on it. A drain that takes longer than
   8 s raises `UnloadPending` (gpud notes `engine_busy` and retries on the next tick). Only a refusal, or a drain longer than 600 s,
@@ -532,15 +602,25 @@ leave gpud stopped.
   carries `pending = True`, so the supervisor records one `engine_busy` note per wait instead of
   marking the engine down (live: about 12 s while LTX reached its next step boundary).
 - A model loaded by absolute path is matched to the catalog by directory basename. That only
-  names it: whether it is Foreman's is decided by provenance, so someone else's copy under the
-  same basename is still someone else's.
-- Provenance cannot tell two loads of the same model apart. If another client loads a model while
-  gpud's own load intent for it is open (the request in flight, or gpud just restarted mid-load),
-  gpud takes that copy for its own. If the server restarts between gpud's once-a-tick instance check
-  and a load request, gpud treats its own load as someone else's: it never unloads it (the safe
-  side). Without `/metrics` the instance is unknown, and only a model observed gone ends ownership.
+  names it: whether it is Foreman's is decided by provenance, and of two copies under different ids
+  only the one gpud loaded is reported as the catalog model.
+- Provenance cannot tell two loads of the same id apart. If another client loads a model while
+  gpud's own load intent for it is open (the request in flight, gpud just restarted mid-load, or a
+  load gpud gave up on that may still complete), gpud takes that copy for its own; the same goes
+  for a second gpud on the same server whose load joins the first, when mlx-serve does not list
+  the model as `loading` in `/v1/models` (that state is assumed, not verified against the server).
+  If the owner loads the very id gpud loaded, it is a no-op for mlx-serve and gpud cannot see it:
+  gpud may later release that model when idle. If the server restarts between gpud's once-a-tick
+  instance check and a load request, gpud treats its own load as someone else's: it never unloads
+  it (the safe side).
+- Without a readable identity (no `/metrics`, or while it does not answer) a restart is invisible.
+  gpud then disowns its other models on that server whenever one of its models disappears
+  unexpectedly (the safe side), at the price of pinning its own models after a plain eviction. An
+  identity that reads the same across a restart (a broken `/metrics`) is trusted: a restart plus
+  another client's reload inside one tick is then taken for gpud's own model.
 - If the user's own models fill every mlx-serve slot, gpud cannot load a brain. It records
-  `insufficient_slots` and waits rather than unload them, and it does not page for this.
+  `insufficient_slots` and waits rather than unload them, and pages a human once the brain has been
+  away for `brain_blocked_page_s` (15 min).
 - Plan sizes and load times in `foreman/studio.py` are calibrated on the Studio (table above);
   Flash-Next's load time was not measured and keeps its 70 s estimate. The video `expected_s` and
   the decode budget are calibrated too, with other inference services sharing the GPU; heavier
@@ -551,8 +631,9 @@ leave gpud stopped.
 - mlx-serve answers a request that fails validation (for example `steps` outside [1, 100]) with
   HTTP 400 before any SSE event. The adapter reports it as `Poll.reason = "rejected"` and the
   supervisor records reason `rejected` (a content failure for the ledger); the message is in the
-  brief's detail. 404, 408, 409, 423, 429 and the "does not support this modality" answer (a
-  request that reached mlx-serve's default model) are not rejections: they stay `crash`.
+  brief's detail. 401, 403, 405, 407 (the caller or the endpoint was refused: an auth proxy, an API
+  key, another server version), 404, 408, 409, 423, 429 and the "does not support this modality"
+  answer (a request that reached mlx-serve's default model) are not rejections: they stay `crash`.
 - mlx-serve writes a media stream's headers only when the job reaches its inference thread. A
   request queued behind another client's long generation shows no progress, so it can hit the
   no-progress timeout (at least 120 s) before it starts.
@@ -736,20 +817,27 @@ from its jobs (`ledger.failure_class`):
 
 | Class | Failures | Counts against caps and review minutes |
 |---|---|---|
-| infra | the load failed, or was refused for memory until its deferral expired (`load_failed`); the engine was unreachable or lost (`engine_unreachable`, `engine_lost`, `engine_error`, `engine_unconfigured`); a gpud restart interrupted it (`interrupted`); gpud raised on it (`supervisor_error`); the run crashed or stalled server-side (`crash`, `timeout`); gpud cancelled it while draining or switching modes (`cancelled` with `cancelled_by: gpud`); the brain's review of good output could not run | no, within the template's daily budget |
-| content | a validator failed (black, frozen or silent output: `validator`); the server rejected the request's parameters with a 4xx (`rejected`); the brain's review turned the output down; the owner (or a paused template) cancelled it; anything not listed above | yes |
+| infra | the load failed, or was refused for memory until its deferral expired, or gpud could not make room for it beside models it may not unload for an hour (`load_failed`); the engine was unreachable or lost (`engine_unreachable`, `engine_lost`, `engine_error`, `engine_unconfigured`); a gpud restart interrupted it (`interrupted`); gpud raised on it (`supervisor_error`); the run crashed or stalled server-side once (`crash`, `timeout`; also an HTTP 5xx or 401/403/407 answer, and an SSE `error` event); gpud cancelled it (`cancelled` with `cancelled_by: gpud`; no gpud path does this today: a drain or restart shows up as `interrupted`); the brain's review of good output could not run | no, within the template's daily and weekly budgets |
+| content | a validator failed (black, frozen or silent output: `validator`), also on output that finished during a timeout's cancel grace; the server rejected the request's parameters with a 4xx (`rejected`); a crash or timeout that happened again in the same lineage (the brain's retry of the same request failed the engine the same way); the brain's review turned the output down, or was itself refused for its request (`rejected`); the owner (or a paused template) cancelled it; anything not listed above | yes |
 
 A lineage with any content failure is content. Weekly caps (`per_week`), `max_stock` and
 `two_week_use` (which count only items queued, awaiting review or accepted anyway) and the day's
 review minutes leave an infrastructure failure out; its GPU time still counts toward the
 speculative and filler shares, for the time it actually ran (a load that failed ran nothing).
 
-**Bounded.** At most `infra_budget_per_day` infrastructure failures per template per day (planner
-option; 0, the default, means the template's own `per_week`, i.e. at most one week's slots handed
-back per day) go uncounted; beyond that they count again, so a persistently failing environment
+**Bounded.** At most `infra_budget_per_day` infrastructure failures per template per day, and at
+most `infra_budget_per_week` in any 7 days (planner options; 0, the default, means the template's
+own `per_week` for both, so a rolling week admits at most per_week counted items plus per_week
+uncounted ones), go uncounted; beyond that they count again, so a persistently failing environment
 fills the week's cap instead of recycling it. Each planned item also keeps gpud's retry limits (at
 most `max_attempts` media jobs per lineage). Every failed item records `fail_class`, whether it
 `counted`, and why (`count_note`, also on the `item_failed` event); `review --all` prints it.
+
+**The same brief again.** An item that failed for infrastructure reasons and did not count
+produced nothing, so its brief may be proposed again: `<recent_outputs>` marks it `may_repeat`,
+and admitting it again retires the old row's content hash (`<hash>~<item id>`, history kept) and
+gives the new job its own idempotency key. Any other earlier item still makes the brief a
+`duplicate`.
 
 **Restoring slots after an upgrade.** Items the previous version settled carry no
 classification. gpud's next upkeep classifies them from their lineages, oldest failure first, with
@@ -861,7 +949,7 @@ unknown or malformed options stop gpud at startup with the list of known ones.
 | PL1 | Only active, unpaused, owner-written templates produce work. Inbound text, goals and replies cannot add templates or change caps; a plan decision's `submit` is ignored; no request or brain decision can submit a plan job; a paused template's queued work does not start and its retries are refused; inside a planned lineage the brain may only retry the planned job | `P1`, `P4`, `P13`, adversarial `E`, `R`, `X3`, `X4`, `X5` |
 | PL2 | Planning never causes a model load: no resident brain means no tick, a `plan` job never loads a model, and the load/unload sequence of a scenario is identical with and without the planner | `P6`, adversarial `L`, `R` |
 | PL3 | Every rejected proposal is recorded with a reason code from `REASONS`, in `plan_rejections` and the event log; a proposal can only reject itself, never the rest of its tick | `P3`, `assert_logged`, adversarial `A`, `I` |
-| PL4 | Weekly caps, stock, the review budget (with reserved hard-deadline slots) and the speculative and filler shares hold across many ticks; when nothing qualifies, nothing runs. Infrastructure failures do not use the caps or the review minutes, within a per-template daily budget; content failures do | `P5`, `LV10`, `LV11` |
+| PL4 | Weekly caps, stock, the review budget (with reserved hard-deadline slots) and the speculative and filler shares hold across many ticks; when nothing qualifies, nothing runs. Infrastructure failures do not use the caps or the review minutes, within per-template daily and weekly budgets; content failures do, and so does a crash or timeout that repeats in a lineage | `P5`, `LV10`, `LV11`, `RF`, `LR3` |
 | PL5 | Admission is in EV order, EV <= 0 is never admitted, and planned work queues behind the owner's own submissions | `P4` |
 | PL6 | Backoff doubles after 3 empty ticks up to the cap and resets on an admission; 3 invalid ticks (a reply that crashes its own application included) suspend and page while the queue keeps running; an engine-side loss is not an invalid tick; the daily token budget holds, whatever the reply's length and whatever the wall clock does | `P7`, `P8`, `P9`, adversarial `A`, `P`, `X1`, `X2`, `X6`, `X10` |
 | PL7 | No duplicate job from a re-run tick, a crash inside the application, a fresh gpud, invisible or fullwidth characters, or numerically equal params | `P10`, adversarial `B`, `K` |
@@ -905,10 +993,11 @@ unknown or malformed options stop gpud at startup with the list of known ones.
   and its error is logged.
 - The tests use `ScriptedPlanner` and `FakeEngine` (the adapter test `FakeMlxServe`); the live
   run below is the only check against the real Qwen3.8-27B.
-- The failure classification is by reason code. A `timeout` or `crash` is taken for the
-  environment's, so work that deterministically hangs or crashes the engine is retried until the
-  template's daily budget of uncounted failures is used (then it counts). A duplicate brief is
-  still refused after an infrastructure failure: the planner has to propose new content.
+- The failure classification is by reason code and lineage. A single `timeout` or `crash` is taken
+  for the environment's (a GPU fault and a request that crashes the engine look the same once); a
+  second one in the lineage counts. A brain review that crashed or timed out on the output (the
+  vision brain choking on its frames) is taken for the environment's too; only a refused review
+  request (`rejected`) counts.
 - Proposals are admitted in EV order, so a speculative proposal is measured against the week's
   GPU time before the cheaper committed work admitted later in the same tick is counted; it may
   be refused for its share in one tick and admitted in the next.
@@ -941,7 +1030,13 @@ The run left three issues, fixed since (`LV6` to `LV13`): the cascade's failed l
 ad clips' weekly cap (they are infrastructure failures now and stop counting on gpud's first
 upkeep after the upgrade); LTX's 60 GB plan kept renders waiting while 88 to 110 GB were free (40
 GB now, from the measured 33 to 36 GB); and the fallback brain someone else had loaded counted as
-gpud's (provenance now records what gpud loads).
+gpud's (provenance now records what gpud loads). A red team then attacked the three fixes
+(`tests/test_live_fixes_adversarial.py`, 30 attacks); its findings are fixed and covered by
+`LR1` to `LR4`: same-named copies of a model under two server ids, loads gpud gave up on that the
+server finished, restarts gpud could not identify, a standby taking over, two gpuds on one server,
+owner overrides written the way mlx-serve shows them, no brain gpud may use, implausible sizes,
+an unbounded headroom, garbage that finished during a timeout's cancel, and auth refusals counted
+as content.
 
 ## Known gaps
 
