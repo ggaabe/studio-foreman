@@ -381,6 +381,15 @@ class Store:
         rows = self.conn.execute(sql + " ORDER BY id", args)
         return [dict(r, data=json.loads(r["data"])) for r in rows]
 
+    def events_after(self, after_id: int, limit: int = 1000) -> list[dict]:
+        """Events with id > after_id, oldest first (log shipping and `events --tail`)."""
+        rows = self.conn.execute("SELECT * FROM events WHERE id > ? ORDER BY id LIMIT ?", (after_id, limit))
+        return [dict(r, data=json.loads(r["data"])) for r in rows]
+
+    def last_event_id(self) -> int:
+        row = self.conn.execute("SELECT MAX(id) AS m FROM events").fetchone()
+        return int(row["m"] or 0)
+
     # ---- singleton supervisor state ----
     def state(self) -> dict:
         d = dict(self.conn.execute("SELECT * FROM supervisor_state WHERE id = 1").fetchone())

@@ -18,6 +18,7 @@ class ModelSpec:
     family: str            # brain | video | music | tts | image | llm
     vision: bool = False
     exclusive: bool = False  # must be the only model resident on the host
+    evicts_brain: bool = False  # no brain may stay resident while this model runs (other models may)
 
     @property
     def is_brain(self) -> bool:
@@ -80,6 +81,7 @@ class Policy:
     engine_lost_s: float = 120.0           # an engine failing every call this long is 'lost' -> page
     max_clock_step_s: float = 30.0         # wall-clock jump treated as a step (no monotonic source)
     page_backoff_max_s: float = 60.0       # pager retry backoff ceiling
+    unload_foreign: bool = True            # False: models outside the catalog are pinned, never unloaded
 
     @property
     def usable_gb(self) -> float:

@@ -8,6 +8,7 @@ from __future__ import annotations
 from .policy import number
 
 MAX_BLACK_FRAME_RATIO = 0.2
+MAX_FROZEN_FRAME_RATIO = 0.5
 MAX_SILENCE_RATIO = 0.5
 
 
@@ -43,6 +44,10 @@ def check(family: str, payload: dict, artifact) -> list[dict]:
         add("black_frames", ratio is not None and ratio <= MAX_BLACK_FRAME_RATIO,
             f"black_frame_ratio={art.get('black_frame_ratio')!r}"
             + ("" if ratio is not None else " (missing or not a number: clip could not be probed)"))
+        if "frozen_frame_ratio" in art:  # measured by foreman.media on real frames (not by the sim)
+            frozen = number(art.get("frozen_frame_ratio"))
+            add("frozen_frames", frozen is not None and frozen <= MAX_FROZEN_FRAME_RATIO,
+                f"frozen_frame_ratio={art.get('frozen_frame_ratio')!r}")
     if family in ("music", "tts"):
         ratio = number(art.get("silence_ratio"))
         add("silence", ratio is not None and ratio <= MAX_SILENCE_RATIO,

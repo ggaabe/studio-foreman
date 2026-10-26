@@ -972,8 +972,19 @@ class Supervisor:
         return [m for m in dict.fromkeys(order) if m in self.catalog]
 
     def _pinned(self) -> set[str]:
-        """Resident models gpud cannot unload right now (their engine is unavailable)."""
-        return {m for m, e in self._resident.items() if not self._avail(e)}
+        """Resident models gpud cannot unload right now (their engine is unavailable), plus, when
+        Policy.unload_foreign is off, every model outside the catalog (someone else's)."""
+        pinned = {m for m, e in self._resident.items() if not self._avail(e)}
+        if not self.p.unload_foreign:
+            pinned |= {m for m in self._resident if m not in self.catalog}
+        return pinned
+
+    def _slot_cap(self, engine: str | None) -> int | None:
+        """Optional adapter attribute `max_resident_models`: how many models the engine keeps
+        before it LRU-evicts one on its own (mlx-serve: 3). gpud frees a slot itself first, so
+        the engine never picks the victim (it could pick a model gpud does not own)."""
+        cap = number(getattr(self.engines.get(engine), "max_resident_models", None))
+        return int(cap) if cap and cap >= 1 else None
 
     def _fits_alone(self, model: str) -> bool:
         pinned = sum(self._size(m) for m in self._pinned() if m != model)
@@ -1062,6 +1073,7 @@ class Supervisor:
             self._note(now, "insufficient_memory", (tuple(sorted(target)), tuple(sorted(pinned))),
                        target=sorted(target), pinned=sorted(pinned), pinned_gb=pinned_gb)
             return False
+        no_brain = any(m in self.catalog and self.catalog[m].evicts_brain for m in target)
         victims = sorted((m for m in self._resident if m not in target and m not in pinned),
                          key=lambda m: (self._is_brain(m), -self._size(m)))
         for m in victims:
@@ -1069,7 +1081,7 @@ class Supervisor:
                 continue  # dropped by an engine restart earlier in this loop
             used = sum(self._size(x) for x in self._resident)
             need = sum(self._size(x) for x in target if x not in self._resident)
-            must = exclusive or (m in self.catalog and self.catalog[m].exclusive)
+            must = exclusive or (m in self.catalog and self.catalog[m].exclusive) or (no_brain and self._is_brain(m))
             if not must and used + need <= usable:
                 continue
             try:
@@ -1083,8 +1095,35 @@ class Supervisor:
             self._note(now, "insufficient_memory", (tuple(sorted(target)), used, need),
                        target=sorted(target), used=used, need=need)
             return False
+        if not self._make_slots(target, pinned, now):
+            return False
         self._noted.pop("insufficient_memory", None)
         self.crash_hook("after_make_room")
+        return True
+
+    def _make_slots(self, target: set[str], pinned: set[str], now: float) -> bool:
+        """Per-engine model-count caps (see _slot_cap): unload gpud's own idle models, media
+        first and biggest first, until the target fits under each engine's cap."""
+        for name in sorted({e for e in (self._engine_name(m) for m in target) if e}):
+            cap = self._slot_cap(name)
+            if cap is None:
+                continue
+            while True:
+                held = [m for m, e in self._resident.items() if e == name]
+                new = [m for m in target if m not in self._resident and self._engine_name(m) == name]
+                if len(held) + len(new) <= cap:
+                    break
+                cands = sorted((m for m in held if m not in target and m not in pinned),
+                               key=lambda m: (self._is_brain(m), -self._size(m)))
+                if not cands:
+                    self._note(now, "insufficient_slots", (name, tuple(sorted(target)), tuple(sorted(held))),
+                               engine=name, cap=cap, target=sorted(target), resident=sorted(held))
+                    return False
+                try:
+                    if self._unload(cands[0], now, reason=f"make room ({name} keeps at most {cap} models)") == "wedged":
+                        return False
+                except EngineUnavailable:
+                    return False
         return True
 
     # ------------------------------------------------------------------ running jobs & leases
@@ -1432,6 +1471,12 @@ class Supervisor:
                 if isinstance(e, EscalatingAdmissionError):
                     self._human_review(cur, err, now, idem=e.idem, brief=cur.payload.get("brief"))
                     escalated = True
+        if decision.get("verdict") == "human_review":
+            # The brain itself asks for a person (it is unsure, or its own output was unusable).
+            note = decision.get("note") if isinstance(decision.get("note"), str) else ""
+            self._human_review(cur, f"the brain asked for human review: {note}"[:500], now,
+                               idem=f"brain-review:{cur.id}.{cur.attempt}", brief=cur.payload.get("brief"))
+            escalated = True
         if cur.is_continuation and rejected and not children and not escalated:
             # The baton reached the brain but nothing it asked for can run: do not let the
             # logical task end silently.
@@ -1673,7 +1718,7 @@ class Supervisor:
     def _plan_media(self, model: str, now: float, st: dict) -> tuple[set[str], str | None]:
         """Target residency for a media job, keeping a brain co-resident whenever it fits."""
         spec = self.catalog[model]
-        if spec.exclusive:
+        if spec.exclusive or spec.evicts_brain:
             return {model}, None
         room = self.p.usable_gb - spec.size_gb - sum(self._size(m) for m in self._pinned() if m != model)
         for b in sorted(self._usable_brains(), key=lambda m: -self._size(m)):

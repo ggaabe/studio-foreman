@@ -6,15 +6,18 @@ unloaded so a big media model fits, the brain returns when that job ends, whethe
 failed, hung, crashed, produced garbage, or the supervisor itself died along the way. When it
 returns, it knows what to do next. When it cannot return by itself, a human is paged.
 
-Everything here runs in simulation: a virtual clock, fake engines with scripted faults, and a
-scripted stand-in for the LLM. It uses only the Python standard library (3.9 or newer; tested on 3.9.6 and 3.12), makes no
-network calls, and starts no real model server.
+The supervisor core is proven in simulation: a virtual clock, fake engines with scripted faults,
+and a scripted stand-in for the LLM. On top of that core, `foreman/adapters/mlx_serve.py` drives a
+real [mlx-serve](https://github.com/ddalcu/mlx-serve) server and `foreman/brain_client.py` makes
+the LLM decisions through it (see [Running on a Mac with mlx-serve](#running-on-a-mac-with-mlx-serve)).
+Everything uses only the Python standard library (3.9 or newer; tested on 3.9.6 and 3.12). The
+test suite makes no network calls outside 127.0.0.1 and starts no real model server.
 
 ## Run it
 
 ```bash
 cd foreman
-python3 -m unittest discover -s tests -v     # 104 tests (plus subtests), about 20 seconds
+python3 -m unittest discover -s tests -v     # 147 tests (plus subtests), about 30 seconds
 python3 -m foreman.demo                       # narrated timeline: render hangs, brain recovers
 python3 -m foreman.demo --fault crash         # also: garbage, wedged, none
 ```
@@ -34,9 +37,19 @@ pager outage; they now assert the opposite. See [Inverted red-team tests](#inver
 | `foreman/validators.py` | Deterministic artifact checks: exists, duration, black frames, silence, dimensions |
 | `foreman/sim.py` | `VirtualClock`, `FakeEngine` with fault scripts, `ScriptedBrain`, the `Sim` harness |
 | `foreman/demo.py` | `python3 -m foreman.demo` |
+| `foreman/adapters/mlx_serve.py` | `MlxServeEngine`: the `Engine` interface over mlx-serve's HTTP API (loads, SSE runs, cancel by disconnect, fault injection) |
+| `foreman/adapters/sse.py` | Incremental SSE reader; streams a huge `complete` event's base64 straight to disk |
+| `foreman/httpio.py` | urllib calls with hard timeouts, and a raw-socket streaming client that any thread can close |
+| `foreman/media.py` | Stdlib artifact analysis: WAV duration/RMS/silence, rgb8 black/frozen frames, a PNG encoder |
+| `foreman/brain_client.py` | `BrainClient`: chat-completion decisions from the resume brief, with sampled frames for vision |
+| `foreman/studio.py` | The Mac Studio deployment: catalog, policy, config loading |
+| `foreman/daemon.py` | `python3 -m foreman.daemon`: gpud itself (lock, recover, 1 s ticks, JSON logs, SIGTERM) |
+| `foreman/cli.py` | `python3 -m foreman.cli`: submit speech/music/video, status, jobs, events, cancel, clear-safe |
+| `deploy/`, `scripts/` | LaunchAgent template and install/uninstall scripts (no sudo) |
 | `tests/test_brain_return.py` | Invariants I1 to I9 (the original 48 tests, unchanged) |
 | `tests/test_adversarial.py` | The red team's 37 attacks (two inverted to require no crash; see below) |
 | `tests/test_hardening.py` | Regression tests for the hardening, including a seeded chaos test |
+| `tests/test_mlx_serve_adapter.py` | The adapter, brain client, media analysis, CLI and daemon against a local fake mlx-serve (`tests/fake_mlx_serve.py`) |
 
 ## How the brain comes back
 
@@ -173,11 +186,11 @@ exception killing the process. The fixed gpud rides out both outages, so those a
 inverted to `assertEqual(crashes, [])`. Every other assertion in them is unchanged.
 `test_hardening.H1NoCrashOnOutages` covers the same ground independently.
 
-## Mapping to the real engines (NOT IMPLEMENTED)
+## Mapping to the real engines
 
-No real adapter exists yet. A real one implements `foreman.engine.Engine`. The points below are
-requirements and open questions. They are not claims about the current mlx-serve v26.10.3 or
-oMLX 0.7.2 APIs, which still need to be checked against each server's actual endpoints.
+The mlx-serve adapter exists (next section); an oMLX adapter does not. The points below are the
+requirements any adapter has to meet. How the mlx-serve adapter meets them is described in
+[Running on a Mac with mlx-serve](#running-on-a-mac-with-mlx-serve).
 
 - Every call must have a client-side timeout (a few seconds). gpud calls adapters synchronously
   from `tick()`, so a call that hangs blocks the supervisor. A timeout that raises is handled as
@@ -207,6 +220,204 @@ oMLX 0.7.2 APIs, which still need to be checked against each server's actual end
 - gpud itself would run as a launchd agent with `KeepAlive`, using a SQLite file on local disk
   (so `flock` works) and `foreman.clock.SystemClock`. `tick()` would be called about once a
   second.
+
+## Running on a Mac with mlx-serve
+
+gpud runs on the same Mac as an already running mlx-serve (v26.10.x, port 11234). It never
+starts, stops or restarts that server: on the reference Studio, MLX-Serve.app owns it. It needs
+only `/usr/bin/python3` (3.9 or newer) and the model packs under `~/.mlx-serve/models`.
+
+### The Studio deployment (`foreman/studio.py`)
+
+| Role | Model (mlx-serve id) | Plan GB | Notes |
+|---|---|---|---|
+| primary brain, vision | `ddalcu/Qwen3.8-27B-MLX-Serve-4bit` | 24 | qwen3_5 with a vision tower: reviews get sampled frames |
+| fallback brain | `ddalcu/Qwen3.8-Flash-Next-MLX-Serve-iQ-MLX-4.7bpw` | 74 | text only |
+| speech | `ddalcu/Kokoro-82M-MLX-Serve` | 1 | `/v1/audio/speech`, WAV |
+| music | `ddalcu/ACE-Step-1.5-XL-Turbo-MLX-Serve-4bit` | 8 | `/v1/audio/music-generations`, 10 to 600 s |
+| video | `ddalcu/LTX-2.5-MLX-Serve-4bit` | 60 | `/v1/video/generations`, rgb8 frames + pcm audio, 24 fps |
+
+Model names are the ids mlx-serve's `--model-dir` discovery gives the packs (`<org>/<repo>`).
+Packs downloaded after the server started are not discovered until a rescan, so the adapter then
+loads them by absolute path, which registers them under the directory basename; both names map
+back to the catalog. FastH3-Omni (MiniMax-H3 derived; its license excludes US users) is not in
+the catalog, and the adapter refuses to load or run anything matching it. Plan sizes are on-disk
+size plus activation headroom; they are estimates, not measurements.
+
+The policy reserves 96 GB of the 256 GB (macOS, other inference services that live outside
+mlx-serve, and a 40 GB margin), so 160 GB are planned. Models in mlx-serve that are not in the
+catalog (anything the user loaded) are **pinned**: they count against memory and model slots and
+are never unloaded (`Policy.unload_foreign=False`).
+
+`video_exclusive` (default **on** for this deployment) unloads the brain while LTX renders, so
+every render exercises the brain-return path: the review job reloads the vision brain, which
+then looks at the frames. The production-friendlier setting is `"video_exclusive": false`: the
+27B vision brain fits beside LTX, a review needs no reload, and mlx-serve's GenYield lets a
+co-resident brain answer chat between denoise steps (at some cost in render speed).
+
+Four small supervisor features back this deployment. None changes the simulation (its 104
+original tests are untouched): the first three are off by default, and no scripted brain returns
+`human_review`.
+
+- `Policy.unload_foreign=False` pins every resident model outside the catalog.
+- `ModelSpec.evicts_brain` (set on LTX by `video_exclusive`) makes the planner unload a brain
+  even when it would fit, and never plan a co-resident brain for that model.
+- An adapter may expose `max_resident_models`. The planner then unloads gpud's own idle models
+  (media first, biggest first) until the target fits under that count.
+- A brain decision with `verdict: "human_review"` pages a person (`kind: human_review`).
+
+### Run it
+
+```bash
+cd ~/src/studio-foreman
+python3 -m foreman.daemon --once                    # smoke test: recover, one tick, exit
+python3 -m foreman.daemon                           # gpud in the foreground (Ctrl-C stops it)
+
+python3 -m foreman.cli submit-speech "Hello from the Studio"
+python3 -m foreman.cli submit-music "warm lo-fi piano, rain on the window" --seconds 30
+python3 -m foreman.cli submit-video "a red fox trotting through fresh snow" --seconds 5 --width 768 --height 512
+python3 -m foreman.cli status --live                # mode, residency, jobs; --live also reads /api/ps
+python3 -m foreman.cli jobs                         # brain verdicts and failure reasons per job
+python3 -m foreman.cli events --tail 40             # the append-only event log
+python3 -m foreman.cli cancel 12                    # graceful: gpud closes the stream, then unloads
+python3 -m foreman.cli clear-safe                   # a human leaving SAFE mode
+```
+
+Each submission carries its baton: speech and music finish with `review_audio` (the vision
+brain sees the waveform and the measured WAV statistics) or `recover_audio` / `recover_music`;
+video finishes with `review_render` (2 to 4 sampled frames attached) or `recover_render`. The CLI
+opens the same SQLite file as a non-leader client (`Supervisor(lead=False)`), so admission rules
+apply and it never takes gpud's lock.
+
+State lives in `~/.foreman/`: `foreman.db` (plus `foreman.db.lock`), `logs/gpud.log` (JSON lines,
+rotated; every supervisor event is mirrored there), `pages.jsonl` (one line per page to a human)
+and `artifacts/<run id>-<process>/`. Audio runs leave `output.wav` and `waveform.png`. Video runs
+leave `frames.rgb` (raw rgb8), `video.json` (width, height, fps, frame count, measured stats),
+`frame_NNNN.png` samples, `audio.wav`, and `output.mp4` only when `ffmpeg` is on the PATH (the
+Studio has none). Artifacts are never deleted automatically; a 5 s 720p clip is about 330 MB raw.
+
+Configuration, later sources winning: defaults, `~/.foreman/config.json` (keys are the `Config`
+fields in `foreman/studio.py`, for example `{"video_exclusive": false}`), environment variables
+(`FOREMAN_HOME`, `FOREMAN_DB`, `FOREMAN_MLX_URL`, `FOREMAN_MODEL_DIR`, `FOREMAN_VIDEO_EXCLUSIVE`,
+`FOREMAN_MIN_HEADROOM_GB`, `FOREMAN_MAX_RESIDENT_MODELS`, `FOREMAN_FAULT_STALL_AFTER`,
+`FOREMAN_FAULT_KINDS`, ...), then command-line flags.
+
+### As a LaunchAgent
+
+`deploy/com.github.ggaabe.foreman.gpud.plist` is a user LaunchAgent template: `KeepAlive` true
+(gpud holds no GPU memory, so restarting it however it exited strands nothing),
+`ThrottleInterval` 30, `ExitTimeOut` 60, `ProcessType` Background, stdout and stderr under
+`~/.foreman/logs`. Nothing installs it automatically.
+
+```bash
+scripts/install-launchagent.sh --dry-run   # print the rendered plist
+scripts/install-launchagent.sh             # render, plutil -lint, launchctl bootstrap gui/$(id -u)
+scripts/uninstall-launchagent.sh           # launchctl bootout, remove the plist (keeps ~/.foreman)
+```
+
+Neither script uses sudo. On SIGTERM gpud finishes its tick, closes its HTTP streams and exits.
+mlx-serve aborts a run whose client disconnected, so a restarted gpud finds those runs gone,
+records them as `failed(interrupted)` and fires their `on_failure` batons. A watchdog thread exits
+the process (status 70) if one tick ever runs longer than `watchdog_s` (300 s), and launchd
+restarts it.
+
+### How the adapter maps the Engine interface onto mlx-serve
+
+Checked against the v26.10.3 source and, read-only, against the live server:
+
+- **Every call made from `tick()` has a client-side timeout.** Residency is one
+  `GET /api/ps` (5 s). Loads, runs and unloads run on worker threads. Streaming uses a
+  raw-socket client that reads with a 1 s socket timeout, so it notices a cancel and any thread
+  can close it (`http.client` is unusable after one read timeout).
+- `resident_models()`: `GET /api/ps` lists READY models (names end in `:latest`; `expires_at`
+  is ignored). Sizes come from `size_vram` and feed `model_size_gb()`. Read every tick, because
+  mlx-serve evicts on its own.
+- `load()`: `POST /v1/load-model` blocks until the model is ready, so it runs on a thread
+  behind a ticket. Before sending it, the adapter refuses the load (a failed ticket, which moves
+  the brain ladder or fails the media job) when free memory minus the model's size would drop
+  below 40 GB, or when mlx-serve already holds `--max-resident-models` (3) models. Free memory
+  is `vm_stat` free + inactive + speculative pages x page size, and the server's own
+  `machine.free_mib`; the smaller wins. gpud's planner also reads `max_resident_models` and frees
+  a slot itself, unloading its own idle models (media first), so mlx-serve's LRU never picks a
+  victim that Foreman does not own.
+- `unload()`: `POST /v1/unload-model` is idempotent, but it waits for in-flight generations on
+  that model, so the adapter first closes its own streams on it. A drain that takes longer than
+  8 s raises (gpud retries on the next tick). Only a refusal, or a drain longer than 600 s,
+  returns False. It refuses outright to unload a model outside the catalog. An empty or
+  `mlx-serve` id would unload the server's *default* model, so one is never sent.
+- `start()`: a worker thread checks `/api/ps` for the exact id first. An unknown id would make
+  mlx-serve **silently answer with its default model** (verified live: a speech request for an
+  unregistered Kokoro came back with "Target model does not support this modality" from the
+  user's chat model). Then it POSTs the media request with `"stream": true`. Only whitelisted
+  payload fields are forwarded (`input`/`voice` for speech, `prompt`/`duration_seconds`/`lyrics`
+  for music, `prompt`/`num_frames`/`width`/`height`/`steps`/`seed` for video). `goal`,
+  `expected_s` and other Foreman fields stay in Foreman. Brain runs call the brain client instead.
+- `poll()`: every SSE `progress` event (and `: keepalive` comment) strictly increases the
+  reported progress, which is what renews the lease. Step fractions map into [0, 0.9], and a
+  restarted or repeated counter still moves it a little. LTX goes silent between
+  `Decoding video` and `complete` (VAE decode, about 20 s to minutes). For that one stage the
+  adapter reports a time-based heartbeat from 0.95 to 0.99 over a budget of
+  3.6 s per megapixel-frame (at least 60 s), then stops. A healthy decode keeps its lease, and a
+  decode that never ends still trips the dead-man switch.
+- The `complete` event (base64 WAV, or base64 rgb8 frames plus `pcm_s16le` audio, about 440 MB
+  of text for 5 s at 720p) is parsed as a stream. Small events are `json.loads`-ed. A line past
+  256 KB is parsed incrementally as a flat JSON object, and its `data` / `audio_data` strings are
+  base64-decoded straight into files. Then `foreman.media` measures the files and the
+  validators check those measurements, never the engine's claims: duration, black-frame ratio,
+  frozen-frame ratio, silence ratio.
+- `error` events and HTTP errors fail the run with the server's message. A stream that ends
+  without a terminal event fails it, and is reported `lost` if `/health` no longer answers.
+- `cancel()`: mlx-serve has no cancel endpoint; closing the connection makes it abort at the
+  next step boundary (not during the VAE decode). The run reports `cancelled` at once.
+- `find()` / `poll()` only know runs this process started. After a gpud restart the old stream
+  is gone and mlx-serve has aborted the run, so the old handle polls `lost` and the supervisor
+  records it as interrupted. A `starting` job is requeued uncharged, as before.
+- `terminate()` always returns False. mlx-serve belongs to MLX-Serve.app, so the supervisor's
+  escalation ends in SAFE mode and a page. Nothing is ever force-killed.
+
+The brain client (`foreman/brain_client.py`) streams `POST /v1/chat/completions` over a
+connection the run can cancel. It sends `enable_thinking: false`,
+`response_format: {"type": "json_object"}` and the resume brief, and reports token progress. The
+model answers a small schema: `accept`, `retry` (with whitelisted changes such as a new prompt
+or seed), `give_up` or `human_review`. The client builds the actual resubmission from the brief
+itself, as a `retry_of` the source job, refused once attempts are used up. Malformed output, an
+unknown verdict or an impossible retry becomes `human_review`, which the supervisor now turns into
+a page. `batch_checkpoint` and `brain_checkpoint` are handled deterministically without the LLM.
+
+### Fault injection: the dead-man lease against the real engine
+
+```bash
+FOREMAN_FAULT_STALL_AFTER=3 FOREMAN_FAULT_KINDS=compose_music python3 -m foreman.daemon
+```
+
+A media run then stops reading the stream and stops reporting progress after 3 progress events
+(runs that emit none, like Kokoro, are unaffected). The lease expires after the job's
+no-progress timeout (at least 120 s). gpud cancels by closing the connection, so mlx-serve
+aborts at its next step boundary. gpud then unloads the model, records `failed(timeout)` and
+fires `on_failure`, so the brain comes back with the brief. The engine is never harmed: it only
+sees a client that went quiet and then hung up. Do not leave the variables set in a LaunchAgent.
+
+### Known gaps of the mlx-serve adapter
+
+- A run lives only as long as the gpud process that started it. Any gpud restart, including
+  a planned one, aborts in-flight renders; they come back as `interrupted` failures for the
+  brain to retry.
+- The memory and slot checks are point-in-time. Another client can load a model between the
+  check and the load, and mlx-serve may then evict by its own LRU rule. The next tick sees the
+  eviction (`model_evicted`) and the brain is reloaded when needed.
+- An unload that waits behind a decode is retried each tick, and each retry records an
+  `engine_error` / `engine_recovered` pair, so the event log is noisy while it drains.
+- A model loaded by absolute path is matched to the catalog by directory basename. Someone else
+  loading the same pack under the same basename would be taken for Foreman's.
+- If the user's own models fill every mlx-serve slot, gpud cannot load a brain. It records
+  `insufficient_slots` and waits rather than unload them, and it does not page for this.
+- Plan sizes, load times and the decode budget are estimates. GPU contention with other
+  services slows renders. The defaults (`expected_s`, 3.6 s per megapixel-frame of decode) are
+  guesses to replace with measurements from the Studio.
+- mlx-serve writes a media stream's headers only when the job reaches its inference thread. A
+  request queued behind another client's long generation shows no progress, so it can hit the
+  no-progress timeout (at least 120 s) before it starts.
+- No MP4 without ffmpeg: the artifacts are raw frames, PNG samples and a WAV.
 
 ## Known gaps
 
@@ -251,7 +462,8 @@ oMLX 0.7.2 APIs, which still need to be checked against each server's actual end
   and load times in `policy.py` are estimates, not measurements.
 - Batch checkpoints count toward `max_continuation_depth` (default 32), so very long batches need a
   higher limit.
-- The validators read simulated metadata. Real ones would need ffprobe-style probing (blackdetect,
-  silencedetect), which is outside the standard library.
+- In simulation the validators read simulated metadata. With mlx-serve they read what
+  `foreman.media` measured on the files (sampled pixels and 50 ms audio windows, not a full
+  ffprobe-style blackdetect / silencedetect).
 - Pages are delivered at least once and may repeat after a crash. `human_review` and
   `engine_lost` jobs have no resolve API yet; only `clear_safe()` exists.
