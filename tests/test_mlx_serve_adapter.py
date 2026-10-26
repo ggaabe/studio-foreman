@@ -977,6 +977,19 @@ class M7Process(TmpCase):
                 h.close()
             fake.stop()
 
+    def test_video_expected_time_follows_studio_measurements(self):
+        from foreman import cli
+        # measured: 8 MPF 9-12 s, 109 MPF 70-82 s, 217 MPF 177 s (request to artifact on disk)
+        for mpf, measured in ((8.0, 12.0), (109.0, 82.0), (217.0, 177.0)):
+            exp = cli.video_expected_s(mpf)
+            self.assertGreater(exp, 1.5 * measured, mpf)
+            self.assertLess(exp, 5.0 * measured, mpf)
+        self.assertEqual(cli.video_expected_s(10000.0), 640.0)
+        req = cli.video_request("a fox", 5, 1280, 704)
+        self.assertEqual((req["payload"]["num_frames"], req["payload"]["width"], req["payload"]["height"]),
+                         (121, 1280, 704))
+        self.assertAlmostEqual(req["payload"]["expected_s"], cli.video_expected_s(121 * 1280 * 704 / 1e6))
+
     def test_config_layers(self):
         path = os.path.join(self.tmp, "c.json")
         with open(path, "w") as f:

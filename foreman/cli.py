@@ -84,6 +84,17 @@ def music_request(prompt: str, seconds: float, lyrics: str | None = None, seed: 
             "on_failure": {"kind": "recover_music"}}
 
 
+def video_expected_s(mpix_frames: float) -> float:
+    """Expected LTX-2.5 4-bit render time (request to artifact on disk) for frames x megapixels,
+    with headroom for GPU contention. Measured on the Studio (M5 Ultra, other inference services
+    sharing the GPU), distilled 8-step schedule:
+        49 frames 512x320 (8 MPF)       9-12 s
+        121 frames 1280x704 (109 MPF)   70-82 s   (denoise ~6 s/step, decode + transfer ~17 s)
+        241 frames 1280x704 (217 MPF)   177 s     (denoise ~15 s/step, decode + transfer ~35 s)
+    This gives about 1.9x those times (53 s, 166 s, 309 s); the lease's hard timeout is 2.5x it."""
+    return min(640.0, 45.0 + 1.0 * mpix_frames + 0.001 * mpix_frames ** 2)
+
+
 def video_request(prompt: str, seconds: float, width: int = 768, height: int = 512, steps: int | None = None,
                   seed: int | None = None, expected_s: float | None = None) -> dict:
     from .adapters.mlx_serve import VIDEO_FPS, video_frames_for
@@ -94,7 +105,7 @@ def video_request(prompt: str, seconds: float, width: int = 768, height: int = 5
     mpix_frames = w * h * frames / 1e6
     payload = {"goal": f"{seconds:g}s {w}x{h} clip: {prompt[:120]}", "prompt": prompt, "width": w, "height": h,
                "num_frames": frames, "duration_s": frames / float(VIDEO_FPS),
-               "expected_s": expected_s or min(640.0, 90.0 + 6.0 * mpix_frames)}
+               "expected_s": expected_s or video_expected_s(mpix_frames)}
     if steps:
         payload["steps"] = int(steps)
     if seed is not None:

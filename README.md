@@ -300,7 +300,11 @@ Configuration, later sources winning: defaults, `~/.foreman/config.json` (keys a
 fields in `foreman/studio.py`, for example `{"video_exclusive": false}`), environment variables
 (`FOREMAN_HOME`, `FOREMAN_DB`, `FOREMAN_MLX_URL`, `FOREMAN_MODEL_DIR`, `FOREMAN_VIDEO_EXCLUSIVE`,
 `FOREMAN_MIN_HEADROOM_GB`, `FOREMAN_MAX_RESIDENT_MODELS`, `FOREMAN_FAULT_STALL_AFTER`,
-`FOREMAN_FAULT_KINDS`, ...), then command-line flags.
+`FOREMAN_FAULT_KINDS`, `FOREMAN_PROGRESS_TIMEOUT_S`, ...), then command-line flags.
+
+The adapter refuses to load a pack whose directory still holds partial download files
+(`*.partial`, `*.partial.parts`, ...): MLX-Serve.app downloads in place, and on the Studio the
+fallback brain was still downloading while gpud ran.
 
 ### As a LaunchAgent
 
@@ -355,10 +359,11 @@ Checked against the v26.10.3 source and, read-only, against the live server:
 - `poll()`: every SSE `progress` event (and `: keepalive` comment) strictly increases the
   reported progress, which is what renews the lease. Step fractions map into [0, 0.9], and a
   restarted or repeated counter still moves it a little. LTX goes silent between
-  `Decoding video` and `complete` (VAE decode, about 20 s to minutes). For that one stage the
-  adapter reports a time-based heartbeat from 0.95 to 0.99 over a budget of
-  3.6 s per megapixel-frame (at least 60 s), then stops. A healthy decode keeps its lease, and a
-  decode that never ends still trips the dead-man switch.
+  `Decoding video` and `complete` (VAE decode plus the base64 transfer: 17 s for 5 s at 1280x704,
+  35 s for 10 s, measured). For that one stage the adapter reports a time-based heartbeat from
+  0.95 to 0.99 over a budget of 0.6 s per megapixel-frame (at least 60 s, about 4x the measured
+  time), then stops. A healthy decode keeps its lease, and a decode that never ends still trips
+  the dead-man switch.
 - The `complete` event (base64 WAV, or base64 rgb8 frames plus `pcm_s16le` audio, about 440 MB
   of text for 5 s at 720p) is parsed as a stream. Small events are `json.loads`-ed. A line past
   256 KB is parsed incrementally as a flat JSON object, and its `data` / `audio_data` strings are
@@ -412,9 +417,16 @@ sees a client that went quiet and then hung up. Do not leave the variables set i
   loading the same pack under the same basename would be taken for Foreman's.
 - If the user's own models fill every mlx-serve slot, gpud cannot load a brain. It records
   `insufficient_slots` and waits rather than unload them, and it does not page for this.
-- Plan sizes, load times and the decode budget are estimates. GPU contention with other
-  services slows renders. The defaults (`expected_s`, 3.6 s per megapixel-frame of decode) are
-  guesses to replace with measurements from the Studio.
+- Plan sizes and load times in `foreman/studio.py` are still estimates (they are generous: the
+  measured loads below are 1 to 9 s). The video `expected_s` and the decode budget are now
+  calibrated on the Studio, with other inference services sharing the GPU; heavier contention
+  than that slows renders further.
+- A run that a gpud restart interrupts comes back as `failed(interrupted)` and the brain's retry
+  counts as an attempt (only a job the engine never saw is requeued uncharged). Three restarts in
+  the middle of the same task's renders quarantine it.
+- mlx-serve answers a request that fails validation (for example `steps` outside [1, 100]) with
+  HTTP 400 before any SSE event. The adapter fails the run with the server's message, and the
+  supervisor records it with the generic reason `crash`; the message is in the brief's detail.
 - mlx-serve writes a media stream's headers only when the job reaches its inference thread. A
   request queued behind another client's long generation shows no progress, so it can hit the
   no-progress timeout (at least 120 s) before it starts.

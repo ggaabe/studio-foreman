@@ -22,8 +22,9 @@ What the adapter relies on (checked against the v26.10.3 source and the live ser
     restart find() knows nothing and poll() reports the old handle as 'lost'.
   * LTX goes silent between 'Decoding video' and 'complete' (VAE decode, 20 s to minutes).
     The adapter reports a bounded, time-based heartbeat during that one stage, sized from
-    frames x pixels, so the dead-man lease does not fire on a healthy decode but still fires
-    on a decode that never ends.
+    frames x pixels (decode_s_per_mpf, 0.6 s per megapixel-frame, at least 60 s; measured on
+    the Studio: decode plus the base64 transfer take about 0.16 s per MPF), so the dead-man
+    lease does not fire on a healthy decode but still fires on a decode that never ends.
 
 Hard rules for this deployment: terminate() always refuses (mlx-serve belongs to MLX-Serve.app,
 so a human decides), unload() refuses any model outside Foreman's catalog, nothing is ever
@@ -216,7 +217,7 @@ class MlxServeEngine:
                  max_resident_models: int | None = 3, call_timeout_s: float = 5.0,
                  connect_timeout_s: float = 5.0, read_poll_s: float = 1.0, unload_wait_s: float = 8.0,
                  unload_timeout_s: float = 600.0, load_timeout_factor: float = 4.0,
-                 max_silence_s: float = 1800.0, decode_s_per_mpf: float = 3.6, min_decode_grace_s: float = 60.0,
+                 max_silence_s: float = 1800.0, decode_s_per_mpf: float = 0.6, min_decode_grace_s: float = 60.0,
                  sample_frames: int = 4, sample_max_side: int = 512, stall_after: int | None = None,
                  stall_kinds=None, forbidden=FORBIDDEN_PATTERNS, ffmpeg: str | None = "auto"):
         split_url(base_url)  # validate early
