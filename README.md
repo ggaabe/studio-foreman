@@ -291,7 +291,8 @@ brain returns `human_review` or defers a load.
   `load_defer_max_backoff_s` (5 min), nothing is unloaded for it in between, other models' jobs
   run meanwhile, and only a wait over `load_defer_max_s` (1 h) fails the job it was for, one job
   per such wait. A brain's deferred load is a failed load, so the ladder still moves. Found live:
-  a memory dip below LTX's headroom failed seven queued renders in 40 s (see below).
+  a memory dip below LTX's headroom failed six queued renders in 40 s, and a seventh two minutes
+  later (see [Planner live on the Studio](#planner-live-on-the-studio-2026-10-26)).
 
 ### Run it
 
@@ -816,8 +817,42 @@ unknown or malformed options stop gpud at startup with the list of known ones.
   move them, but a time-zone change does). A template file edited while gpud runs is picked up
   within a minute (by name, size, mtime, ctime and inode); one that stops validating drops out
   and its error is logged.
-- The real brain client has not been run against the live Qwen3.8-27B for planning yet: every
-  planner test uses `ScriptedPlanner` and `FakeEngine`, and the adapter test `FakeMlxServe`.
+- The tests use `ScriptedPlanner` and `FakeEngine` (the adapter test `FakeMlxServe`); the live
+  run below is the only check against the real Qwen3.8-27B.
+- `per_week` and the day's review minutes count every item admitted, including one that failed
+  before its media job ever ran. That keeps a template whose jobs keep failing from being
+  re-admitted every few minutes, but an infrastructure failure (the live run's load cascade,
+  before the fix) uses up the week's cap with nothing made. The owner can raise `per_week` in
+  the template file for the week.
+- Proposals are admitted in EV order, so a speculative proposal is measured against the week's
+  GPU time before the cheaper committed work admitted later in the same tick is counted; it may
+  be refused for its share in one tick and admitted in the next.
+- A model in the catalog that someone else loaded (mlx-serve shows it without gpud having loaded
+  it) counts as gpud's own: it can serve gpud's brain jobs and, if the memory plan ever needs the
+  room, be unloaded. On the Studio this happened to the fallback brain, which another client
+  loaded as mlx-serve's default; the plan has never needed its room.
+
+### Planner live on the Studio (2026-10-26)
+
+Five owner templates (pitch-pack video clips and music beds for a prospective client, ad-test
+clips and music beds for the owner's own service, and an internal calibration render), all
+commercial, on the 27B vision brain that stays resident (the fallback brain, loaded by another
+client, and other inference services shared the host).
+
+| Tick | What happened |
+|---|---|
+| 1 (plan-now) | 68 s on the resident 27B, 1879 prompt tokens. 15 proposals: 12 admitted in EV order (1 pitch clip at EV $94, 2 pitch songs at $16, 6 ad clips at $5, 3 ad songs at $2.5), 2 pitch clips refused for `speculative_share` (22 % > 20 %) |
+| between ticks | The first clip rendered in 76 s, its raw frames were deleted after the MP4 mux, and the brain's review accepted it from 4 sampled frames; five songs rendered and were accepted. Then free memory beside the host's other tenants dropped to about 96 GB, below LTX's 60 + 40 GB, and before the fix every queued clip failed its load in turn, six in 40 s (now the jobs wait: see the deferred loads above) |
+| 2 (job finished) | 1 pitch clip admitted, 1 refused for its share; it failed the same way |
+| 3, 4 (after the fix) | The third pitch clip rendered and passed the brain's review; with an inbox note asking for it, two calibration renders were admitted, rendered in 8 s each and passed |
+| 5 to 8 | Every weekly cap used: the brain proposed nothing, or one clip refused as a `duplicate` of an earlier brief. Interval 30 -> 60 -> 120 min after the third and fourth empty tick |
+
+Two calibration items took test verdicts (accept and ship, reject): P(ship) went from 0.80 to
+0.82 to 0.75. Every other item waits for the owner. Eight plan jobs started on the resident
+brain with 0 s wait; no model was loaded for any of them, and no brain was loaded at all during
+the run. Each tick cost 2 to 68 s of brain time and 1.9 to 2.8k prompt tokens (23k tokens for the
+day). Renders kept only the MP4, PNG samples, WAV and video.json: 0.5 to 3 MB per clip instead of
+about 330 MB of raw frames.
 
 ## Known gaps
 
