@@ -46,6 +46,7 @@ CHANGES = {
     "video": {"prompt": str, "seed": int, "steps": int},
 }
 MAX_TEXT = 4000
+MAX_PLAN_TOKENS = 16000  # a plan reply never needs more; caps a payload's max_tokens
 
 SYSTEM = """You are the deciding brain of Foreman, a supervisor that runs GPU media jobs (speech, \
 music, video) on a Mac Studio. You are stateless: the resume brief is everything you know about \
@@ -241,7 +242,7 @@ class BrainClient:
         prompt = payload.get("prompt") if isinstance(payload.get("prompt"), dict) else {}
         messages = [{"role": "system", "content": str(prompt.get("system") or "")},
                     {"role": "user", "content": str(prompt.get("user") or "")}]
-        max_tokens = int(number(payload.get("max_tokens")) or self.max_tokens)
+        max_tokens = int(min(MAX_PLAN_TOKENS, number(payload.get("max_tokens")) or self.max_tokens))
         if ctx is not None:
             ctx.log(f"planning with {ctx.server_model} (prompt ~{payload.get('prompt_tokens')} tokens)")
         raw = self.chat(model, messages, ctx, max_tokens=max_tokens)

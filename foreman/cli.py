@@ -37,6 +37,7 @@ from .clock import SystemClock
 from .media_requests import music_request, speech_request, video_expected_s, video_request  # noqa: F401
 from .supervisor import AdmissionError, Supervisor
 from .templates import load_templates
+from .text import printable as _p
 
 
 class _ClientEngine:
@@ -60,7 +61,7 @@ def _when(wall) -> str:
 
 
 def _short(model) -> str:
-    return str(model).split("/")[-1] if model else "-"
+    return _p(str(model).split("/")[-1]) if model else "-"
 
 
 # ---------------------------------------------------------------- submissions
@@ -107,7 +108,7 @@ def cmd_status(cfg, live: bool) -> None:
     print(f"planner          {pst['state']}; review queue {review_n} item(s); open pages {by_state.get('awaiting_human', 0)}")
     active = [j for j in jobs if j.state in ("starting", "running", "cancelling", "queued", "awaiting_human")]
     for j in active[-15:]:
-        print(f"  {j.id:>5} {j.state:<15} {j.kind:<16} {_short(j.requires):<34} attempt {j.attempt}")
+        print(f"  {j.id:>5} {j.state:<15} {_p(j.kind, 40):<16} {_short(j.requires):<34} attempt {j.attempt}")
     if live:
         from .httpio import json_call
         try:
@@ -135,8 +136,8 @@ def cmd_jobs(cfg, show_all: bool) -> None:
             reason = f"{d.get('verdict')}: {str(d.get('note') or '')[:60]}"
         elif j.state == "awaiting_human":
             reason = str((j.payload or {}).get("reason") or "")[:80]
-        print(f"{j.id:>5} {j.state:<15} {j.kind:<16} {_short(j.requires):<34} {j.attempt:>3} "
-              f"{j.parent_id if j.parent_id else '-':>6}  {reason}")
+        print(f"{j.id:>5} {j.state:<15} {_p(j.kind, 40):<16} {_short(j.requires):<34} {j.attempt:>3} "
+              f"{j.parent_id if j.parent_id else '-':>6}  {_p(reason, 120)}")
 
 
 def cmd_events(cfg, tail: int, job: int | None) -> None:
@@ -179,20 +180,24 @@ def cmd_review(cfg, show_all: bool) -> None:
         sup.close()
     if not queue:
         print("review queue is empty")
+    # Briefs and brain notes are untrusted text (inbound note -> LLM -> brief): every field is
+    # printed through text.printable, so no escape sequence or carriage return reaches the terminal.
     for it in queue:
-        age = (now - (it.get("produced_at") or now)) / 3600.0
-        print(f"job {it['job_id']:<5} {it['template_id']}  for {it['consumer']!r}  "
+        produced = it.get("produced_at")
+        age = (now - (produced if produced is not None else now)) / 3600.0
+        print(f"job {it['job_id']:<5} {_p(it['template_id'], 80)}  for {_p(repr(it['consumer']), 120)}  "
               f"waiting {age:.1f} h  (review ~{it['review_minutes'] or 0:g} min)")
-        print(f"    brief: {it['brief'][:200]}")
+        print(f"    brief: {_p(it['brief'], 200)}")
         if it.get("brain_verdict"):
-            print(f"    brain: {it['brain_verdict']}" + (f": {it['brain_note'][:200]}" if it.get("brain_note") else ""))
+            print(f"    brain: {_p(it['brain_verdict'], 40)}"
+                  + (f": {_p(it['brain_note'], 200)}" if it.get("brain_note") else ""))
         for label, path in _files(it.get("artifacts")):
-            print(f"    {label:<4} {path}")
+            print(f"    {label:<4} {_p(path)}")
         print(f"    -> python3 -m foreman.cli verdict {it['job_id']} accept|reject [--minutes M] [--note TEXT]")
     for it in recent:
         extra = it.get("verdict_note") or it.get("fail_reason") or ""
-        print(f"  [{it['state']:<8}] job {it['job_id']:<5} {it['template_id']}: {it['brief'][:80]}"
-              + (f"  ({extra[:80]})" if extra else ""))
+        print(f"  [{it['state']:<8}] job {it['job_id']:<5} {_p(it['template_id'], 80)}: {_p(it['brief'], 80)}"
+              + (f"  ({_p(extra, 80)})" if extra else ""))
 
 
 def cmd_verdict(cfg, job_id: int, verdict: str, minutes, note) -> None:
@@ -230,7 +235,7 @@ def cmd_resolve(cfg, ids, note) -> int:
                 print("no open pages")
             for j in pages:
                 reason = str((j.payload or {}).get("reason") or "")
-                print(f"page {j.id:<5} {j.kind:<18} {reason[:160]}")
+                print(f"page {j.id:<5} {_p(j.kind, 40):<18} {_p(reason, 160)}")
             return 0
         now, failed = sup._now(), 0
         for pid in ids:
@@ -276,14 +281,18 @@ def cmd_templates(cfg, action: str, tid, note) -> int:
         w = s.get("7d") or {}
         flow = f"{w.get('produced', 0)}/{w.get('accepted', 0)}/{w.get('rejected', 0)}/{w.get('shipped', 0)}"
         p = s.get("p_ship")
-        print(f"{t_id:<34} {(t.kind if t else '-'):<14} {status[:26]:<26} {('%.2f' % p) if p is not None else '-':>7} "
+        print(f"{_p(t_id, 80):<34} {(t.kind if t else '-'):<14} {_p(status, 26):<26} "
+              f"{('%.2f' % p) if p is not None else '-':>7} "
               f"{week:>6} {stock:>7} {flow:>21} {(s.get('28d') or {}).get('usd', 0):>8.2f}")
         if ps.get("paused") and ps.get("detail"):
-            print(f"    {ps['detail']}")
+            print(f"    {_p(ps['detail'], 300)}")
     if not templates and not stats:
         print(f"(no templates in {os.path.join(cfg.home, 'templates')}; see examples/templates)")
-    for e in errors:
-        print(f"error: {e}")
+    for e in errors:  # a template error quotes the owner's file: printed line by line, escaped
+        lines = str(e).splitlines() or [""]
+        print(f"error: {_p(lines[0], 400)}")
+        for line in lines[1:]:
+            print(_p(line, 400))
     return 1 if errors else 0
 
 
@@ -308,7 +317,7 @@ def cmd_planner(cfg, action: str, note) -> None:
         print("plan-now recorded: gpud plans on its next tick once a brain is home and the GPU is free"
               + ("" if st["state"] == "active" else f" (but the planner is {st['state']}: resume it first)"))
     due = st["next_due_in_s"]
-    print(f"planner          {st['state']}" + (f" ({st['paused_note']})" if st.get("paused_note") else ""))
+    print(f"planner          {st['state']}" + (f" ({_p(st['paused_note'], 200)})" if st.get("paused_note") else ""))
     print(f"interval         {(st['interval_s'] or 0) / 60:.0f} min (empty ticks in a row: {st['empty_streak']}, "
           f"invalid in a row: {st['invalid_streak']}, suspensions: {st['suspensions']})")
     print("next tick        " + ("-" if due is None else "due now" if due <= 0 else f"in {due / 60:.0f} min")

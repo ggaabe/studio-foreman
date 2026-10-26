@@ -2,11 +2,14 @@
 clip is about 330 MB of raw rgb8 frames.
 
   * After a successful MP4 mux the adapter deletes frames.rgb (keeping the sampled PNGs,
-    audio.wav, video.json and output.mp4), unless keep_raw_frames is set. A failed mux keeps it.
+    audio.wav, video.json and output.mp4), unless keep_raw_frames is set. A failed mux keeps it,
+    and so does an MP4 whose box structure is truncated or incomplete (mp4_complete).
   * Planner items: artifacts of rejected items are pruned 7 days after the verdict, and those of
     items nobody reviewed (expired in the review queue, or failed) after 14 days.
   * The planner admits nothing while the internal disk has less than min_disk_free_gb free or the
-    artifacts directory holds more than artifacts_cap_gb.
+    artifacts directory holds more than artifacts_cap_gb, counting what the work still in flight
+    and the work admitted earlier in the same tick may write (estimate_bytes): the reading is
+    cached, and admitted work writes later.
 
 Deletion is confined to directories strictly inside the artifacts root (resolved, no symlinks),
 so a path in the database can never point it anywhere else.
@@ -14,11 +17,13 @@ so a path in the database can never point it anywhere else.
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import time
 
 from . import ledger
+from .policy import number
 
 DAY = 86400.0
 
@@ -28,7 +33,11 @@ def drop_raw_frames(art: dict, keep_raw: bool, note=lambda line: None) -> dict:
     sampled PNGs, audio.wav and video.json stay) unless keep_raw; records what it did in the
     artifact and in video.json."""
     frames = art.get("frames_path")
-    if keep_raw or not isinstance(frames, str) or not os.path.exists(frames):
+    mp4 = art.get("path")
+    complete = mp4_complete(mp4) if isinstance(mp4, str) else False
+    if complete is False and isinstance(frames, str) and os.path.exists(frames) and not keep_raw:
+        note(f"kept raw frames: {os.path.basename(str(mp4))} is not a complete MP4")
+    if keep_raw or complete is False or not isinstance(frames, str) or not os.path.exists(frames):
         if isinstance(frames, str) and frames not in art.setdefault("paths", []):
             art["paths"].append(frames)
         return art
@@ -55,6 +64,64 @@ def drop_raw_frames(art: dict, keep_raw: bool, note=lambda line: None) -> dict:
         except (OSError, ValueError) as e:
             note(f"could not update video.json: {e}")
     return art
+
+
+def mp4_complete(path: str):
+    """True when `path` is an ISO-BMFF file (MP4) whose top-level boxes are all whole and include
+    ftyp, moov and mdat; False when it is missing, empty, truncated or lacks one of them; None when
+    it does not start with an ISO-BMFF box at all (not something this check can judge, e.g. a test
+    stand-in for ffmpeg), in which case the caller trusts ffmpeg's exit status."""
+    try:
+        if os.path.islink(path) or not os.path.isfile(path):
+            return False
+        size = os.path.getsize(path)
+        if size <= 0:
+            return False
+        seen, pos = set(), 0
+        with open(path, "rb") as f:
+            head = f.read(8)
+            if len(head) < 8 or head[4:8] != b"ftyp":
+                return None
+            while pos < size:
+                f.seek(pos)
+                hdr = f.read(8)
+                if len(hdr) < 8:
+                    return False
+                box, kind = int.from_bytes(hdr[:4], "big"), hdr[4:8]
+                if box == 1:
+                    ext = f.read(8)
+                    if len(ext) < 8:
+                        return False
+                    box = int.from_bytes(ext, "big")
+                elif box == 0:
+                    box = size - pos  # the last box runs to the end of the file
+                if box < 8 or pos + box > size:
+                    return False
+                seen.add(kind)
+                pos += box
+        return {b"ftyp", b"moov", b"mdat"} <= seen
+    except OSError:
+        return False
+
+
+def estimate_bytes(request: dict) -> float:
+    """What one admitted request may write under the artifacts directory, at most: a render's raw
+    rgb8 frames (deleted after a good mux, kept if the mux fails or keep_raw_frames is set) plus
+    its MP4, PNG samples and audio; a song's WAV; speech is small."""
+    payload = request.get("payload") if isinstance(request, dict) else None
+    payload = payload if isinstance(payload, dict) else {}
+    kind = request.get("kind") if isinstance(request, dict) else None
+
+    def num(key, default):
+        v = number(payload.get(key))
+        return v if v is not None and v >= 0 else default
+    if kind == "render_video":
+        frames = num("num_frames", 121.0)
+        raw = num("width", 768.0) * num("height", 512.0) * 3.0 * frames
+        return raw * 1.2 + 48000 * 2 * 2 * num("duration_s", frames / 24.0)
+    if kind == "compose_music":
+        return 48000 * 2 * 2 * num("duration_s", 30.0) * 1.1
+    return 2e6
 
 
 def _inside(path: str, root: str) -> bool:
@@ -111,14 +178,18 @@ def prune_due(store, now: float, root: str, cfg) -> list:
                         skipped=len(res["skipped"]), bytes=res["bytes"])
         done.append((it["id"], why, res["bytes"]))
 
+    def since(it: dict, key: str) -> float:
+        t = it.get(key)
+        return now if t is None else t  # explicit: a timestamp of 0.0 is a time, not "missing"
+
     for it in ledger.items(store, "rejected"):
-        if it.get("pruned_at") is None and (it.get("verdict_at") or now) <= now - cfg.prune_rejected_days * DAY:
+        if it.get("pruned_at") is None and since(it, "verdict_at") <= now - cfg.prune_rejected_days * DAY:
             prune(it, f"rejected {cfg.prune_rejected_days:g}+ days ago")
     for it in ledger.items(store, "review"):
-        if (it.get("produced_at") or now) <= now - cfg.prune_unreviewed_days * DAY:
+        if since(it, "produced_at") <= now - cfg.prune_unreviewed_days * DAY:
             prune(it, f"never reviewed in {cfg.prune_unreviewed_days:g} days", new_state="expired")
     for it in ledger.items(store, "failed"):
-        if it.get("pruned_at") is None and (it.get("finished_at") or now) <= now - cfg.prune_unreviewed_days * DAY:
+        if it.get("pruned_at") is None and since(it, "finished_at") <= now - cfg.prune_unreviewed_days * DAY:
             prune(it, f"failed {cfg.prune_unreviewed_days:g}+ days ago")
     return done
 
@@ -143,15 +214,35 @@ class DiskProbe:
         return self._cached
 
 
-def disk_guard(probe, cfg) -> tuple:
-    """(blocked, detail). A probe that fails blocks: unknown disk state is not a reason to fill it."""
+def disk_reading(probe) -> tuple:
+    """((free GB, artifacts GB), None), or (None, why) when the probe fails or its reading is not
+    two finite, non-negative numbers (NaN compares False with everything, so it must not reach a
+    threshold check)."""
     try:
         free, art = probe()
         free, art = float(free), float(art)
     except Exception as e:
-        return True, f"disk probe failed: {type(e).__name__}: {e}"
+        return None, f"disk probe failed: {type(e).__name__}: {e}"
+    if not (math.isfinite(free) and math.isfinite(art)) or free < 0 or art < 0:
+        return None, f"disk probe gave an unusable reading ({free!r} GB free, {art!r} GB of artifacts)"
+    return (free, art), None
+
+
+def disk_verdict(reading: tuple, cfg, reserved_gb: float = 0.0) -> tuple:
+    """(blocked, detail) for a reading, after `reserved_gb` more is written (work already admitted
+    this tick but not on disk yet)."""
+    free, art = reading[0] - reserved_gb, reading[1] + reserved_gb
+    extra = f" after {reserved_gb:.1f} GB reserved for admitted work" if reserved_gb >= 0.05 else ""
     if free < cfg.min_disk_free_gb:
-        return True, f"internal disk has {free:.0f} GB free (< {cfg.min_disk_free_gb:g} GB)"
+        return True, f"internal disk has {free:.0f} GB free{extra} (< {cfg.min_disk_free_gb:g} GB)"
     if art > cfg.artifacts_cap_gb:
-        return True, f"artifacts use {art:.0f} GB (> cap {cfg.artifacts_cap_gb:g} GB)"
-    return False, f"{free:.0f} GB free, artifacts {art:.0f} GB"
+        return True, f"artifacts use {art:.0f} GB{extra} (> cap {cfg.artifacts_cap_gb:g} GB)"
+    return False, f"{free:.0f} GB free, artifacts {art:.0f} GB{extra}"
+
+
+def disk_guard(probe, cfg) -> tuple:
+    """(blocked, detail). A probe that fails blocks: unknown disk state is not a reason to fill it."""
+    reading, err = disk_reading(probe)
+    if reading is None:
+        return True, err
+    return disk_verdict(reading, cfg)

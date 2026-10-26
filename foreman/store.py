@@ -131,8 +131,9 @@ CREATE TABLE IF NOT EXISTS planner_state (
   trigger          TEXT,                         -- pending event trigger
   last_event_id    INTEGER NOT NULL DEFAULT 0,   -- events scanned for triggers
   last_review_size INTEGER,
-  tokens_day       TEXT,                         -- local day the token count belongs to
-  tokens_used      INTEGER NOT NULL DEFAULT 0
+  tokens_day       TEXT,                         -- day (of supervisor time) the token count belongs to
+  tokens_used      INTEGER NOT NULL DEFAULT 0,
+  engine_fail_streak INTEGER NOT NULL DEFAULT 0  -- plan jobs lost to the engine in a row (backoff, not invalid)
 );
 INSERT OR IGNORE INTO planner_state (id) VALUES (1);
 
@@ -160,6 +161,7 @@ CREATE TABLE IF NOT EXISTS plan_items (
   review_minutes  REAL,
   deadline_wall   REAL,
   hard_deadline   INTEGER NOT NULL DEFAULT 0,
+  reserved_slot   INTEGER NOT NULL DEFAULT 0,    -- admitted into a reserved hard-deadline review slot
   rationale       TEXT,
   created_at      REAL NOT NULL,
   created_wall    REAL,
@@ -216,6 +218,8 @@ _MIGRATIONS = {
                          ("engine_health", "TEXT NOT NULL DEFAULT '{}'"),
                          ("orphans", "TEXT NOT NULL DEFAULT '[]'"),
                          ("t_now", "REAL"), ("t_wall", "REAL"), ("t_mono", "REAL")],
+    "planner_state": [("engine_fail_streak", "INTEGER NOT NULL DEFAULT 0")],
+    "plan_items": [("reserved_slot", "INTEGER NOT NULL DEFAULT 0")],
 }
 
 

@@ -43,10 +43,14 @@ CATALOG = _catalog(
 
 def number(value) -> float | None:
     """A finite real number, or None. bool and numeric strings are not numbers here: LLM output
-    is untrusted, and '8 seconds' must be refused at admission, not crash a validator later."""
+    is untrusted, and '8 seconds' must be refused at admission, not crash a validator later. An
+    integer too large for a float (JSON allows 10**400) is not a number either."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    value = float(value)
+    try:
+        value = float(value)
+    except OverflowError:
+        return None
     return value if math.isfinite(value) else None
 
 

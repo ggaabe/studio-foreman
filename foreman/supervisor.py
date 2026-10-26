@@ -67,8 +67,11 @@ NUMERIC_PAYLOAD_KEYS = ("expected_s", "p90_s", "duration_s", "progress_interval_
 INFRA_REASONS = ("engine_unreachable",)
 # The planner's brain job (foreman/planner.py). It runs only on a brain that is already resident
 # (payload.resident_only), is never retried and never pages on failure: its decision is a list of
-# proposals the planner validates, never requests gpud admits as they are.
+# proposals the planner validates, never requests gpud admits as they are. Only the planner's own
+# tick creates one (idempotency key plan-tick:<n>); admission refuses the kind from anyone else,
+# and a plan job without that key is never applied.
 PLAN_KIND = "plan"
+PLAN_KEY_PREFIX = "plan-tick:"
 
 
 class AdmissionError(ValueError):
@@ -85,6 +88,11 @@ class EscalatingAdmissionError(AdmissionError):
 
 class DepthLimitError(EscalatingAdmissionError):
     pass
+
+
+class LineageClosed(AdmissionError):
+    """Refused because the owner (or a kill criterion) closed the lineage: a planned item whose
+    template is paused takes no new work. Deliberate, so it pages nobody."""
 
 
 class LineageBudgetError(EscalatingAdmissionError):
@@ -423,8 +431,8 @@ class Supervisor:
         except Exception as e:
             n = self._phase_errors.get(name, 0) + 1
             self._phase_errors[name] = n
-            log.exception("gpud phase %s failed (%d in a row)", name, n)
-            if n == 1 or n % 100 == 0:
+            if n == 1 or n % 100 == 0:  # a phase failing every tick must not flood the log either
+                log.exception("gpud phase %s failed (%d in a row)", name, n)
                 try:
                     with self.store.tx():
                         self.store.event(now, "supervisor_error", None, phase=name, count=n,
@@ -642,6 +650,9 @@ class Supervisor:
         kind = req.get("kind")
         if not isinstance(kind, str) or not kind.strip():
             raise AdmissionError("job kind is required (a non-empty string)")
+        if kind.strip().lower() == PLAN_KIND:
+            raise AdmissionError("plan jobs come only from the planner's own ticks; no request or brain "
+                                 "decision may submit one")
         requires = req.get("requires")
         requires = "brain" if requires is None else requires
         if not isinstance(requires, str) or not requires:
@@ -661,6 +672,10 @@ class Supervisor:
             if spec.size_gb > p.usable_gb:
                 raise AdmissionError(f"{requires} needs {spec.size_gb} GB, host has {p.usable_gb} GB usable")
         self._check_payload(requires, payload)
+        if parent is not None and self.planner is not None:
+            # A planned item's lineage may only retry its own job, and nothing once its template
+            # is paused (foreman.planner.Planner.check_child).
+            self.planner.check_child(self, parent.root_id or parent.id, kind, requires, payload)
         req_max = _opt_int(req, "max_attempts")
         if req_max is not None and req_max < 1:
             raise AdmissionError("max_attempts must be at least 1")
@@ -1455,18 +1470,31 @@ class Supervisor:
         by the planner inside this transaction, in a savepoint: a planner bug is recorded, never
         fatal, and a decision's `submit` is never admitted for a plan job."""
         ok = outcome["status"] == "succeeded"
+        ours = str(cur.idempotency_key or "").startswith(PLAN_KEY_PREFIX) and isinstance(cur.payload, dict) \
+            and bool(cur.payload.get("resident_only"))
         try:
             with self.store.savepoint():
                 if self.planner is None:
                     summary = {"ignored": "no planner is attached to this gpud"}
+                elif not ours:
+                    summary = {"ignored": "not a planner tick: only plan jobs the planner created are applied"}
+                    self.store.event(now, "plan_ignored", cur.id, key=cur.idempotency_key)
                 elif ok:
                     summary = self.planner.apply_plan(self, cur, outcome, now)
                 else:
                     summary = self.planner.plan_failed(self, cur, outcome, now)
         except Exception as e:
             log.exception("could not apply plan job %s", cur.id)
-            summary = {"error": f"{type(e).__name__}: {e}"}
+            summary = {"error": f"{type(e).__name__}: {str(e)[:300]}"}
             self.store.event(now, "plan_error", cur.id, error=summary["error"])
+            if self.planner is not None and ours:
+                # The reply crashed the application: it still costs its tokens and counts as an
+                # invalid tick, so a reply that breaks apply cannot repeat for free forever.
+                try:
+                    with self.store.savepoint():
+                        summary.update(self.planner.plan_crashed(self, cur, outcome, now, summary["error"]))
+                except Exception:
+                    log.exception("could not record the failed plan job %s", cur.id)
         state = "succeeded" if ok else "failed"
         self.store.update_job(cur.id, state=state, outcome=dict(outcome, plan=summary), finished_at=now, **reset)
         return state
@@ -1490,8 +1518,8 @@ class Supervisor:
         submit = decision.get("submit")
         children, rejected, escalated = [], [], False
 
-        def reject(kind, error: str) -> None:
-            rejected.append({"kind": kind, "error": error})
+        def reject(kind, error: str, quiet: bool = False) -> None:
+            rejected.append(dict({"kind": kind, "error": error}, **({"quiet": True} if quiet else {})))
             self.store.event(now, "admission_rejected", cur.id, kind=kind, error=error)
 
         if submit is None:
@@ -1512,7 +1540,7 @@ class Supervisor:
                     children.append(self._admit(req, now, parent=cur, idem=f"child:{cur.id}.{cur.attempt}.{i}"))
             except Exception as e:
                 err = str(e) if isinstance(e, AdmissionError) else f"malformed request: {type(e).__name__}: {e}"
-                reject(kind, err)
+                reject(kind, err, quiet=isinstance(e, LineageClosed))
                 if isinstance(e, EscalatingAdmissionError):
                     self._human_review(cur, err, now, idem=e.idem, brief=cur.payload.get("brief"))
                     escalated = True
@@ -1522,9 +1550,11 @@ class Supervisor:
             self._human_review(cur, f"the brain asked for human review: {note}"[:500], now,
                                idem=f"brain-review:{cur.id}.{cur.attempt}", brief=cur.payload.get("brief"))
             escalated = True
-        if cur.is_continuation and rejected and not children and not escalated:
+        if cur.is_continuation and rejected and not children and not escalated \
+                and any(not r.get("quiet") for r in rejected):
             # The baton reached the brain but nothing it asked for can run: do not let the
-            # logical task end silently.
+            # logical task end silently. (A lineage the owner closed by pausing its template
+            # ends on purpose: nobody is paged for that.)
             self._human_review(cur, f"every request in the brain's {cur.kind} decision was rejected: "
                                + "; ".join(r["error"] for r in rejected)[:500], now,
                                idem=f"rejected:{cur.id}", brief=cur.payload.get("brief"))
@@ -1721,7 +1751,7 @@ class Supervisor:
             if brain:
                 self._start(job, brain, now)
                 return True
-            if isinstance(job.payload, dict) and job.payload.get("resident_only"):
+            if job.kind == PLAN_KIND or (isinstance(job.payload, dict) and job.payload.get("resident_only")):
                 return False  # never load a model for this job (the planner's): wait for a resident brain
             return self._bring_brain(needs, now, job.id, st)
         model = job.requires

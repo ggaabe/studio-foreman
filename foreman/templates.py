@@ -46,6 +46,7 @@ import re
 from dataclasses import dataclass, field
 
 from .policy import number
+from .text import fold, variants
 
 KINDS = {"speak": "tts", "compose_music": "music", "render_video": "video"}
 PARAM_TYPES = {
@@ -74,6 +75,8 @@ OUTWARD_KEYS = ("outward", "publish", "publish_to", "post", "post_to", "upload",
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$")
 SIZE_RE = re.compile(r"^(\d{2,4})x(\d{2,4})$")
 MAX_BRIEF = 2000
+MAX_VALUE_USD = 1000000
+MAX_CAP = 100000  # no cap above this is a real limit; a bigger one is a typo
 
 BANNED = (
     (r"content farm", "a platform-payout content farm"),
@@ -96,36 +99,70 @@ GENERIC_CONSUMERS = {
     "the algorithm", "none", "n/a", "na", "tbd", "todo", "unknown", "nobody", "no one", "speculative", "stock",
     "general", "market", "the market", "customers", "clients", "someone", "somebody",
 }
-URL_RE = re.compile(
-    r"(?i)\b[a-z][a-z0-9+.-]*://|\bwww\.|\bmailto:|\b[a-z0-9-]+\.(com|net|org|io|ai|dev|app|co|us|uk|de|fr|"
-    r"xyz|info|biz|me|tv|ly|gg|site|online|shop|link)\b")
+# A URL in any form a brief could carry one: a scheme, www., mailto:, an e-mail address, an IPv4
+# address, localhost, a host name followed by a path, port, query or fragment (acme.edu/x,
+# bit.ly/abc, acme-studio.eu/read), or a bare host name under a common top-level domain. Matched
+# against the folded text (see foreman.text), so fullwidth or zero-width tricks do not hide one.
+# The dotted labels of a host are matched as an atomic group, emulated as (?=(...))\N because
+# Python 3.9 has no possessive quantifiers: a failed match never backtracks into them, so a
+# 2000-character 'a.a.a.a...' brief costs milliseconds, not seconds of gpud's tick.
+_TLDS = ("com|net|org|edu|gov|mil|int|info|biz|name|pro|io|ai|dev|app|co|me|tv|ly|gg|cc|to|fm|am|ws|sh|"
+         "xyz|site|online|shop|store|link|club|top|live|news|blog|page|cloud|tech|art|studio|media|design|"
+         "us|uk|ca|eu|de|fr|es|it|nl|be|ch|at|se|no|dk|fi|pl|cz|ie|pt|ru|ua|jp|cn|kr|tw|hk|sg|in|au|nz|br|"
+         "mx|ar|za|il|tr|gr|ro|hu|is|lt|lv|ee")
+_LABELS = r"(?=((?:[a-z0-9-]+\.(?=[a-z0-9-]))+))\{n}"  # 'acme.' 'x.y.acme.': the dots between labels
+_HOST_START = r"(?<![a-z0-9.-])"
+URL_RE = re.compile("(?i)" + "|".join((
+    r"\b[a-z][a-z0-9+.-]*://\S*",
+    r"\bwww\.\S*",
+    r"\bmailto:\S*",
+    r"(?<![\w.+-])(?=([\w.+-]+))\1@" + _LABELS.format(n=2) + r"[a-z]{2,63}\b",
+    r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?(?:[/?#]\S*)?",
+    r"\blocalhost\b(?::\d{1,5})?(?:[/?#]\S*)?",
+    _HOST_START + _LABELS.format(n=3) + r"[a-z]{2,63}(?::\d{1,5})?[/?#]\S*",
+    _HOST_START + _LABELS.format(n=4) + r"[a-z]{2,63}:\d{1,5}\b",
+    _HOST_START + _LABELS.format(n=5) + r"(?:" + _TLDS + r")\b(?!\.\w)",
+)))
 
 
 class TemplateError(ValueError):
     """A template file that does not load. The message names the file and every problem."""
 
 
+def _squash(text: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[_\-./:]+", " ", text.casefold())).strip()
+
+
 def _norm(text: str) -> str:
-    return re.sub(r"\s+", " ", re.sub(r"[_\-./:]+", " ", str(text).lower())).strip()
+    """Case, punctuation, spacing, compatibility forms and invisible characters ignored."""
+    return _squash(fold(str(text)))
 
 
 def banned_reason(text) -> str | None:
-    """Which banned class `text` falls into, or None."""
+    """Which banned class `text` falls into, or None. Every spelling in text.variants() is tried,
+    so 'out<zero-width joiner>reach' and fullwidth 'ｃｏｌｄ ｅｍａｉｌ' are what they say."""
     if not isinstance(text, str) or not text:
         return None
-    t = _norm(text)
-    for rx, why in _BANNED:
-        if rx.search(t):
-            return why
+    for v in variants(text):
+        t = _squash(v)
+        for rx, why in _BANNED:
+            if rx.search(t):
+                return why
     return None
 
 
 def has_url(text) -> bool:
-    return isinstance(text, str) and bool(URL_RE.search(text))
+    return isinstance(text, str) and any(URL_RE.search(v) for v in variants(text))
+
+
+def strip_urls(text: str, repl: str = "[link removed]") -> str:
+    """The folded text with every URL replaced (ideas the planner leaves for the owner)."""
+    out = URL_RE.sub(repl, fold(text))
+    return out if not has_url(out) else repl
 
 
 def generic_consumer(name) -> bool:
-    return not isinstance(name, str) or len(name.strip()) < 3 or _norm(name) in GENERIC_CONSUMERS
+    return not isinstance(name, str) or len(fold(name).strip()) < 3 or _norm(name) in GENERIC_CONSUMERS
 
 
 @dataclass
@@ -188,6 +225,15 @@ class Template:
                 "notes": self.notes[:300]}
 
 
+def _r(value, limit: int = 60) -> str:
+    """repr() for an error message, bounded (a template may hold a 400-digit number)."""
+    try:
+        text = repr(value)
+    except Exception:  # noqa: BLE001 - e.g. an int beyond the str conversion limit
+        return f"<{type(value).__name__}>"
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
 def _suggest(key: str, options) -> str:
     close = difflib.get_close_matches(key, list(options), n=1, cutoff=0.6)
     return f" (did you mean {close[0]!r}?)" if close else ""
@@ -222,7 +268,7 @@ def _param_spec(kind: str, name: str, spec, problems: list) -> dict | None:
                 problems.append(f"{where}.{k} is required")
             elif not check(spec[k]):
                 problems.append(f"{where}.{k} must be {'an integer' if typ == 'int' else 'a number'}, "
-                                f"got {spec[k]!r}")
+                                f"got {_r(spec[k])}")
             else:
                 out[k] = spec[k]
         if "min" in out and "max" in out:
@@ -234,7 +280,7 @@ def _param_spec(kind: str, name: str, spec, problems: list) -> dict | None:
         if "default" in spec:
             d = spec["default"]
             if not check(d) or ("min" in out and d < out["min"]) or ("max" in out and d > out["max"]):
-                problems.append(f"{where}.default {d!r} is not within its own bounds")
+                problems.append(f"{where}.default {_r(d)} is not within its own bounds")
             else:
                 out["default"] = d
     elif typ in ("choice", "size"):
@@ -308,8 +354,8 @@ def parse_template(data, source: str = "<template>") -> Template:
     if "revenue_line" in data and (not isinstance(revenue, str) or not revenue.strip()):
         problems.append("revenue_line must be a non-empty string")
     value = data.get("value_usd")
-    if "value_usd" in data and (number(value) is None or value < 0):
-        problems.append(f"value_usd must be a number >= 0, got {value!r}")
+    if "value_usd" in data and (number(value) is None or value < 0 or value > MAX_VALUE_USD):
+        problems.append(f"value_usd must be a number in 0..{MAX_VALUE_USD}, got {_r(value)}")
     prior = data.get("prior")
     alpha = beta = None
     if "prior" in data:
@@ -317,8 +363,8 @@ def parse_template(data, source: str = "<template>") -> Template:
             problems.append("prior must be {\"alpha\": a, \"beta\": b}")
         else:
             alpha, beta = number(prior.get("alpha")), number(prior.get("beta"))
-            if alpha is None or beta is None or alpha <= 0 or beta <= 0:
-                problems.append(f"prior.alpha and prior.beta must be numbers > 0, got {prior!r}")
+            if alpha is None or beta is None or not (0 < alpha <= MAX_CAP and 0 < beta <= MAX_CAP):
+                problems.append(f"prior.alpha and prior.beta must be numbers > 0 (at most {MAX_CAP}), got {_r(prior)}")
     caps = data.get("caps")
     capv = {}
     if "caps" in data:
@@ -333,9 +379,9 @@ def parse_template(data, source: str = "<template>") -> Template:
                 ok = _is_int(v) if k != "two_week_use" else number(v) is not None
                 if k not in caps:
                     problems.append(f"caps.{k} is required")
-                elif not ok or v < 0:
-                    problems.append(f"caps.{k} must be a{'n integer' if k != 'two_week_use' else ' number'} >= 0, "
-                                    f"got {v!r}")
+                elif not ok or v < 0 or v > MAX_CAP:
+                    problems.append(f"caps.{k} must be a{'n integer' if k != 'two_week_use' else ' number'} >= 0 "
+                                    f"(at most {MAX_CAP}), got {_r(v)}")
                 else:
                     capv[k] = v
     params = {}
@@ -360,7 +406,7 @@ def parse_template(data, source: str = "<template>") -> Template:
         problems.append("style_prefix must not contain URLs")
     bmax = data.get("brief_max_chars", 600)
     if not _is_int(bmax) or not 20 <= bmax <= MAX_BRIEF:
-        problems.append(f"brief_max_chars must be an integer in 20..{MAX_BRIEF}, got {bmax!r}")
+        problems.append(f"brief_max_chars must be an integer in 20..{MAX_BRIEF}, got {_r(bmax)}")
         bmax = 600
     flags = data.get("flags", {})
     if not isinstance(flags, dict):
@@ -373,10 +419,10 @@ def parse_template(data, source: str = "<template>") -> Template:
         elif k not in FLAG_KEYS:
             problems.append(f"flags.{k} is not a flag (flags are {', '.join(FLAG_KEYS)})" + _suggest(k, FLAG_KEYS))
         elif not isinstance(v, bool):
-            problems.append(f"flags.{k} must be true or false, got {v!r}")
+            problems.append(f"flags.{k} must be true or false, got {_r(v)}")
     review = data.get("review_minutes")
     if "review_minutes" in data and (number(review) is None or review < 0 or review > 240):
-        problems.append(f"review_minutes must be a number in 0..240, got {review!r}")
+        problems.append(f"review_minutes must be a number in 0..240, got {_r(review)}")
     active = data.get("active", False)
     if not isinstance(active, bool):
         problems.append(f"active must be true or false, got {active!r}")
@@ -405,8 +451,8 @@ def load_template_file(path: str) -> Template:
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-    except ValueError as e:
-        raise TemplateError(f"{path}: not valid JSON: {e}") from None
+    except (ValueError, RecursionError) as e:
+        raise TemplateError(f"{path}: not valid JSON: {type(e).__name__}: {str(e)[:200]}") from None
     except OSError as e:
         raise TemplateError(f"{path}: cannot read: {e}") from None
     return parse_template(data, path)
@@ -428,6 +474,9 @@ def load_templates(directory: str | None) -> tuple:
         except TemplateError as e:
             errors.append(str(e))
             continue
+        except Exception as e:  # noqa: BLE001 - one owner file must never take the others down
+            errors.append(f"{path}: could not be validated: {type(e).__name__}: {str(e)[:200]}")
+            continue
         if t.id in templates:
             errors.append(f"{path}: duplicate template id {t.id!r} (already defined in {templates[t.id].source})")
             continue
@@ -436,7 +485,9 @@ def load_templates(directory: str | None) -> tuple:
 
 
 def dir_signature(directory: str | None) -> tuple:
-    """Cheap change detection for a directory of small files (names, sizes, mtimes)."""
+    """Cheap change detection for a directory of small files: name, size, mtime, ctime and inode.
+    ctime and the inode catch a same-size edit on a filesystem with coarse mtimes, a sync tool
+    that preserves mtime, and an editor that saves by renaming a new file over the old one."""
     if not directory or not os.path.isdir(directory):
         return ()
     out = []
@@ -445,7 +496,7 @@ def dir_signature(directory: str | None) -> tuple:
             st = os.stat(os.path.join(directory, name))
         except OSError:
             continue
-        out.append((name, st.st_size, st.st_mtime_ns))
+        out.append((name, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino))
     return tuple(out)
 
 

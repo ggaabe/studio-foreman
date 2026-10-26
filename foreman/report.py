@@ -14,6 +14,7 @@ import time
 
 from . import ledger
 from .planner import REASONS, status as planner_status
+from .text import printable
 
 DAY = 86400.0
 
@@ -23,7 +24,9 @@ def _h(seconds: float) -> str:
 
 
 def _cell(text) -> str:
-    return str(text).replace("|", "/").replace("\n", " ")
+    """Untrusted text (briefs, ideas, details) as one Markdown table cell or list item: escaped
+    (no control characters or line breaks), no pipes, no HTML."""
+    return printable(text).replace("|", "/").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def build(store, templates: dict, now: float, wall: float, days: float = 7.0, cfg=None) -> str:
@@ -105,7 +108,7 @@ def build(store, templates: dict, now: float, wall: float, days: float = 7.0, cf
     out += ["## Paused templates", ""]
     if killed:
         for tid, s in killed:
-            out.append(f"- {tid}: {s['reason']}" + (f" ({_cell(s['detail'])})" if s.get("detail") else ""))
+            out.append(f"- {_cell(tid)}: {_cell(s['reason'])}" + (f" ({_cell(s['detail'])})" if s.get("detail") else ""))
     else:
         out.append("None.")
     out.append("")

@@ -21,12 +21,14 @@ from __future__ import annotations
 import json
 import os
 
+from .policy import number
 from .store import TERMINAL, Job
 
 ITEM_JSON = ("params", "flags", "artifacts", "artifact_dirs")
 STOCK_STATES = ("queued", "review", "accepted")
 LIVE = ("queued", "starting", "running", "cancelling")
 DAY = 86400.0
+MAX_USD = 1e9  # what one shipped item earned, at most (a bigger number is a typo)
 
 
 def _enc(v):
@@ -98,7 +100,7 @@ def hash_exists(store, content_hash: str) -> bool:
 
 def record_rejection(store, plan_job_id, at: float, template_id, reason: str, detail: str | None) -> None:
     store.conn.execute("INSERT INTO plan_rejections (plan_job_id, at, template_id, reason, detail) VALUES (?, ?, ?, ?, ?)",
-                       (plan_job_id, at, template_id if isinstance(template_id, str) else None, reason,
+                       (plan_job_id, at, template_id[:80] if isinstance(template_id, str) else None, reason,
                         None if detail is None else str(detail)[:500]))
 
 
@@ -156,6 +158,16 @@ def shipped_value(it: dict) -> float:
     if it.get("shipped_at") is None:
         return 0.0
     return float(it["usd"]) if it.get("usd") is not None else float(it.get("value_usd") or 0.0)
+
+
+def realized_value(it: dict) -> float:
+    """What an item is worth to the kill criteria: its shipped value, or for an item the owner
+    accepted and has not shipped yet (work is often shipped in batches), the template's value_usd."""
+    if it.get("shipped_at") is not None:
+        return shipped_value(it)
+    if it.get("verdict") == "accept":
+        return float(it.get("value_usd") or 0.0)
+    return 0.0
 
 
 # ---------------------------------------------------------------- GPU time
@@ -230,7 +242,8 @@ def settle(store, it: dict) -> dict | None:
 
 
 def review_queue(store) -> list:
-    return sorted(items(store, "review"), key=lambda i: (i.get("produced_at") or 0, i["id"]))
+    return sorted(items(store, "review"),
+                  key=lambda i: (i["produced_at"] if i.get("produced_at") is not None else 0.0, i["id"]))
 
 
 # ---------------------------------------------------------------- the owner's actions
@@ -262,8 +275,8 @@ def resolve_page(store, page_id: int, note: str | None, now: float) -> None:
 def record_verdict(store, job_id: int, verdict: str, minutes: float | None, note: str | None, now: float) -> dict:
     if verdict not in ("accept", "reject"):
         raise LedgerError("a verdict is accept or reject")
-    if minutes is not None and (minutes < 0 or minutes > 600):
-        raise LedgerError("--minutes must be between 0 and 600")
+    if minutes is not None and (number(minutes) is None or minutes < 0 or minutes > 600):
+        raise LedgerError("--minutes must be a number between 0 and 600")
     it = _item_or_raise(store, job_id)
     if it["state"] != "review":
         raise LedgerError(f"item {it['id']} (job {it['job_id']}) is {it['state']}, not awaiting a verdict")
@@ -285,8 +298,8 @@ def record_verdict(store, job_id: int, verdict: str, minutes: float | None, note
 
 
 def record_ship(store, job_id: int, usd: float | None, now: float) -> dict:
-    if usd is not None and (usd < 0 or usd != usd):
-        raise LedgerError("--usd must be a number >= 0")
+    if usd is not None and (number(usd) is None or usd < 0 or usd > MAX_USD):
+        raise LedgerError(f"--usd must be a finite number in 0..{MAX_USD:g}")
     it = _item_or_raise(store, job_id)
     if it["state"] != "accepted":
         hint = " (record `verdict JOB accept` first)" if it["state"] == "review" else ""
@@ -337,7 +350,8 @@ def kill_check(store, templates: dict, now: float, cfg) -> list:
     """Pause templates that are not earning their review time (code, never the LLM):
     acceptance below cfg.kill_min_acceptance after cfg.kill_min_verdicts verdicts; nothing accepted or
     shipped in cfg.kill_unused_days; value per review-minute below cfg.kill_min_value_per_min over
-    cfg.kill_value_days. Returns [(template_id, reason, detail)] for the templates paused now."""
+    cfg.kill_value_days (shipped value, plus value_usd for accepted items not shipped yet).
+    Returns [(template_id, reason, detail)] for the templates paused now."""
     states = template_states(store)
     paused = []
     for tid in sorted(templates):
@@ -357,7 +371,7 @@ def kill_check(store, templates: dict, now: float, cfg) -> list:
         if n >= cfg.kill_min_verdicts and acc / float(n) < cfg.kill_min_acceptance:
             reason, detail = "kill_low_acceptance", f"{acc}/{n} accepted ({acc / float(n):.0%} < {cfg.kill_min_acceptance:.0%})"
         elif min(i["created_at"] for i in its) <= unused_lo and since <= unused_lo and not any(
-                (i.get("verdict") == "accept" and (i.get("verdict_at") or -1) >= unused_lo)
+                (i.get("verdict") == "accept" and i.get("verdict_at") is not None and i["verdict_at"] >= unused_lo)
                 or (i.get("shipped_at") is not None and i["shipped_at"] >= unused_lo) for i in its):
             reason, detail = "kill_unused_30d", f"nothing it produced was accepted or used in {cfg.kill_unused_days:g} days"
         elif judged:
@@ -366,11 +380,12 @@ def kill_check(store, templates: dict, now: float, cfg) -> list:
             first = min(i["verdict_at"] for i in judged)
             minutes = sum(float(i.get("verdict_minutes") or 0) for i in recent)
             if first <= lo and recent and minutes > 0:
-                value = sum(shipped_value(i) for i in recent)
+                value = sum(realized_value(i) for i in recent)
                 if value / minutes < cfg.kill_min_value_per_min:
                     reason = "kill_low_value"
-                    detail = (f"${value:.2f} shipped for {minutes:.0f} review minutes over {cfg.kill_value_days:g} days "
-                              f"(${value / minutes:.2f}/min < ${cfg.kill_min_value_per_min:g}/min)")
+                    detail = (f"${value:.2f} shipped or accepted for {minutes:.0f} review minutes over "
+                              f"{cfg.kill_value_days:g} days (${value / minutes:.2f}/min < "
+                              f"${cfg.kill_min_value_per_min:g}/min)")
         if reason:
             set_template_paused(store, tid, True, reason, detail, now)
             paused.append((tid, reason, detail))
