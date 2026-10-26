@@ -973,6 +973,25 @@ class Supervisor:
             if row.get("state") == "owned" and row.get("server_id"):
                 self._optional(row["engine"], "set_owned_id", m, row["server_id"])
 
+    def _record_server_ids(self, current: dict, answered: set) -> None:
+        """An owned model with no server id on record (seeded from the event log on upgrade: the
+        previous version never recorded one) gets the id the engine reports it under now, and the
+        adapter is told it is gpud's copy. Without it the adapter cannot tell gpud's copy from a
+        same-named one someone else loads later, nor tell that the server default is gpud's own
+        model rather than someone else's."""
+        for m, row in sorted(self._owners.items()):
+            eng = row.get("engine")
+            if row.get("state") != "owned" or row.get("server_id") or eng not in answered or current.get(m) != eng:
+                continue
+            if not callable(getattr(self.engines.get(eng), "set_owned_id", None)):
+                continue
+            sid = self._optional(eng, "server_id", m, check=_opt_id)
+            if not sid:
+                continue
+            with self.store.tx():
+                self._set_owner(m, server_id=sid)
+            self._optional(eng, "set_owned_id", m, sid)
+
     def _intent_ttl(self, model: str) -> float:
         return (self._load_timeout(model) if model in self.catalog else 0.0) + 60.0
 
@@ -1193,6 +1212,8 @@ class Supervisor:
                 self._loading_seen[name] = set(self._optional(name, "loading_models", check=_model_set) or ())
         self._resident = current
         self._reconcile_owners(now, st, current, answered)
+        if fresh:
+            self._record_server_ids(current, answered)
         loading = (st["loading"] or {}).get("model")
         events = [("model_evicted", {"model": m, "engine": known[m]}) for m in sorted(set(known) - set(current))]
         for m in sorted(set(current) - set(known)):

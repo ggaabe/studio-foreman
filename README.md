@@ -19,7 +19,7 @@ test suite makes no network calls outside 127.0.0.1 and starts no real model ser
 
 ```bash
 cd foreman
-python3 -m unittest discover -s tests -v     # 355 tests (plus subtests), about 75 to 100 seconds
+python3 -m unittest discover -s tests -v     # 358 tests (plus subtests), about 75 to 100 seconds
 python3 -m foreman.demo                       # narrated timeline: render hangs, brain recovers
 python3 -m foreman.demo --fault crash         # also: garbage, wedged, none
 ```
@@ -67,6 +67,7 @@ documented gap instead of demanding a fix. See [Inverted red-team tests](#invert
 | `tests/test_live_fixes.py` | LV1 to LV13: regressions from the planner's first live run (deferred media loads, retracting a verdict, model provenance, calibrated memory plans, infrastructure failures that do not use caps) |
 | `tests/test_live_fixes_adversarial.py` | The red team's 30 attacks on those three fixes (RP provenance, RC calibration, RF failure classes); one subtest adjusted, see below |
 | `tests/test_live_fixes_round2.py` | LR1 to LR4: regressions for the answers to that red team and its design concerns |
+| `tests/test_live_integration.py` | LI1 to LI2: regressions from verifying those fixes on the Studio (the owner's default is a catalog model; seeded models get their server id) |
 
 ## How the brain comes back
 
@@ -366,7 +367,9 @@ the catalog's fallback brain.
   load that never finishes), a human is paged once per absence (`brain_blocked`).
 - **Upgrade.** A database from before provenance is seeded once from its event log: a resident
   model whose latest event is gpud's own `model_loaded` is gpud's, any other is someone else's
-  (`ownership_seeded`). `status` marks each resident model `gpud` or `not gpud`.
+  (`ownership_seeded`). The previous version recorded no server id, so a seeded model gets the id
+  the server reports it under on gpud's first look (and the adapter is told that copy is gpud's).
+  `status` marks each resident model `gpud` or `not gpud`.
 
 By default the 27B vision brain stays resident while LTX renders: it fits beside LTX (about
 18 + 36 GB), a review starts with no reload, and mlx-serve's GenYield lets it answer chat
@@ -491,7 +494,9 @@ Checked against the v26.10.3 source and, read-only, against the live server:
   default (the first entry of `/v1/models`, if it is chat-capable). If the load took it over
   from a model Foreman does not own, and that model is still resident, the adapter puts it back
   with `POST /v1/load-model {"model": <yours>, "default": true}`. That pins it, so later loads
-  cannot take it again. Turn this off with `preserve_default=False`.
+  cannot take it again. "Does not own" is provenance, not the catalog: on the Studio the default
+  is MLX-Serve.app's Flash-Next, the catalog's fallback brain, and it is restored like any other
+  model; only a copy gpud's own load made is left alone. Turn this off with `preserve_default=False`.
 - `load()`: `POST /v1/load-model` blocks until the model is ready, so it runs on a thread
   behind a ticket. Before sending it, the adapter refuses the load when free memory minus the
   model's size would drop below 40 GB, or when mlx-serve already holds `--max-resident-models`

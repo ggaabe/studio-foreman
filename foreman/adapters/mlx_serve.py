@@ -661,9 +661,15 @@ class MlxServeEngine:
         """A server started without --model promotes the latest chat-capable load to its default
         model, so loading the brain would silently take over every request that names no model.
         If that happened to someone else's model, point the default back at it. "default": true
-        pins it explicitly, so later loads no longer steal it."""
-        if not self.preserve_default or not prior or prior == loaded or self.catalog_name(prior) in self._mine:
+        pins it explicitly, so later loads no longer steal it. Someone else's means any copy gpud's
+        own loads did not make, catalog models included: on the Studio the owner's default is
+        the catalog's fallback brain, loaded by MLX-Serve.app (provenance, not the catalog, says
+        whose a model is)."""
+        if not self.preserve_default or not prior or prior == loaded:
             return
+        with self._lock:
+            if prior in self._loaded_ids.values():
+                return  # gpud's own copy was the default: nobody else's default to keep
         try:
             if self._server_default() != loaded or prior not in self._ps():
                 return
