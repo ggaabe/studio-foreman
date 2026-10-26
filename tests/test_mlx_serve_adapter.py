@@ -130,6 +130,30 @@ class M1Media(TmpCase):
         with self.assertRaises(media.MediaError):
             media.wav_stats(os.path.join(self.tmp, "missing.wav"))
 
+    def test_slow_motion_is_not_frozen_but_repeated_frames_are(self):
+        # Live Studio, run 22.2: LTX rendered "a hot air balloon rising over a misty valley" with
+        # consecutive frames differing by 0.15-0.44 (mean |delta|, 0..255) and frame 0 vs 120 by
+        # 4.9. The first threshold (0.5) called that 100 % frozen and the brain re-rendered a
+        # good clip. Model it: ~2 in 10 bytes move by 1 each frame, so the mean delta is ~0.2.
+        w, h, n = 64, 64, 25
+        base = bytes((x * 7 + y * 3) % 200 + 20 for y in range(h) for x in range(w) for _ in range(3))
+        slow = os.path.join(self.tmp, "slow.rgb")
+        with open(slow, "wb") as f:
+            for i in range(n):
+                f.write(bytes(min(255, b + (i // 5) + (1 if (j + i) % 10 == 0 else 0)) for j, b in enumerate(base)))
+        st = media.video_stats(slow, w, h, n, 24)
+        self.assertGreater(st["motion_mean"], 0.1)
+        self.assertLess(st["motion_mean"], 0.5)
+        self.assertGreater(st["span_diff"], st["motion_mean"])
+        self.assertEqual(st["frozen_frame_ratio"], 0.0)
+        stuck = os.path.join(self.tmp, "stuck.rgb")
+        with open(stuck, "wb") as f:
+            f.write(base * n)
+        st = media.video_stats(stuck, w, h, n, 24)
+        self.assertEqual((st["frozen_frame_ratio"], st["motion_mean"], st["span_diff"]), (1.0, 0.0, 0.0))
+        self.assertFalse(validators.passed(validators.check("video", {}, {
+            "path": stuck, "exists": True, "black_frame_ratio": 0.0, "frozen_frame_ratio": 1.0})))
+
     def test_video_stats_black_frozen_and_duration(self):
         w, h = 48, 32
         ok = os.path.join(self.tmp, "ok.rgb")

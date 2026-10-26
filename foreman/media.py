@@ -27,7 +27,10 @@ SILENCE_DBFS = -50.0          # a 50 ms window quieter than this counts as silen
 SILENCE_WINDOW_S = 0.05
 BLACK_PIXEL_LEVEL = 26        # ~10 % of full scale, like ffmpeg blackdetect's pix_th=0.10
 BLACK_PICTURE_RATIO = 0.98    # ... and a frame is black when 98 % of its pixels are that dark
-FROZEN_MEAN_DIFF = 0.5        # mean |delta| (0..255) below this: the frame repeats the previous one
+# Mean |delta| (0..255, sampled pixels) below which a frame repeats the previous one. Measured on
+# the Studio: a slow but real LTX shot (a balloon rising over mist, 1280x704) moves 0.15-0.44 per
+# frame, so the first guess of 0.5 called it 100 % frozen; repeated frames measure 0.
+FROZEN_MEAN_DIFF = 0.1
 PIXEL_SAMPLES = 4096          # sampled pixels per frame
 AUDIO_SAMPLE_BUDGET = 2_000_000
 
@@ -230,8 +233,8 @@ def video_stats(path: str, width: int, height: int, frame_count: int, fps: float
     size = _frame_reader(path, width, height, frame_count)
     dark_level = BLACK_PIXEL_LEVEL * 3
     black = frozen = 0
-    prev = None
-    luma_sum = 0.0
+    prev = first = None
+    luma_sum = motion_sum = 0.0
     with open(path, "rb") as f:
         for _ in range(frame_count):
             frame = f.read(size)
@@ -245,15 +248,23 @@ def video_stats(path: str, width: int, height: int, frame_count: int, fps: float
             cur = r + g + b
             if prev is not None and len(prev) == len(cur):
                 diff = sum(map(abs, map(operator.sub, cur, prev))) / float(len(cur) or 1)
+                motion_sum += diff
                 if diff < FROZEN_MEAN_DIFF:
                     frozen += 1
+            if first is None:
+                first = cur
             prev = cur
     fps = float(fps) if fps else 0.0
+    span = (sum(map(abs, map(operator.sub, prev, first))) / float(len(prev) or 1)
+            if prev is not None and first is not None and len(prev) == len(first) else 0.0)
     return {"frame_count": frame_count, "width": width, "height": height, "fps": fps,
             "duration_s": frame_count / fps if fps > 0 else None,
             "black_frames": black, "black_frame_ratio": black / frame_count,
             "frozen_frames": frozen, "frozen_frame_ratio": frozen / max(1, frame_count - 1) if frame_count > 1 else 0.0,
-            "mean_luma": luma_sum / frame_count}
+            "mean_luma": luma_sum / frame_count,
+            # how much the picture moves: mean |delta| between consecutive frames, and first vs last
+            "motion_mean": motion_sum / (frame_count - 1) if frame_count > 1 else 0.0,
+            "span_diff": span}
 
 
 def read_frame(path: str, width: int, height: int, index: int) -> bytes:

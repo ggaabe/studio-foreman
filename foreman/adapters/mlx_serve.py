@@ -71,6 +71,7 @@ VIDEO_FPS = 24                 # LTX's frame rate in mlx-serve v26.10.3 (fixed s
 EVENT_CAP = 0.95               # progress reported for events stays below this
 DECODE_TOP = 0.99              # the decode heartbeat climbs from EVENT_CAP to this
 FORBIDDEN_PATTERNS = ("FastH3", "MiniMax-H3")  # license excludes US users: never load or run
+VIDEO_STATS = ("duration_s", "black_frame_ratio", "frozen_frame_ratio", "mean_luma", "motion_mean", "span_diff")
 PARTIAL_SUFFIXES = (".partial", ".parts", ".incomplete", ".download", ".crdownload")  # download in progress
 
 
@@ -896,7 +897,7 @@ class MlxServeEngine:
                "width": width, "height": height, "fps": fps, "frame_count": frames, "paths": []}
         try:
             art.update({k: v for k, v in media.video_stats(frames_path, width, height, frames, fps).items()
-                        if k in ("duration_s", "black_frame_ratio", "frozen_frame_ratio", "mean_luma")})
+                        if k in VIDEO_STATS})
             samples = []
             for i, png in media.sample_frames_png(frames_path, width, height, frames, self.sample_frames,
                                                   self.sample_max_side):
@@ -923,7 +924,7 @@ class MlxServeEngine:
                 "frames": os.path.basename(frames_path), "audio": os.path.basename(art["audio"]) if art.get("audio") else None,
                 "audio_sample_rate": fields.get("audio_sample_rate"), "audio_channels": fields.get("audio_channels"),
                 "model": run.spec.model, "run_id": run.spec.run_id,
-                "stats": {k: art.get(k) for k in ("duration_s", "black_frame_ratio", "frozen_frame_ratio", "mean_luma")}}
+                "stats": {k: art.get(k) for k in VIDEO_STATS}}
         meta_path = os.path.join(run.dir, "video.json")
         with open(meta_path, "w") as f:
             json.dump(meta, f, indent=1)
