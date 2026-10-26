@@ -342,7 +342,7 @@ Checked against the v26.10.3 source and, read-only, against the live server:
   victim that Foreman does not own.
 - `unload()`: `POST /v1/unload-model` is idempotent, but it waits for in-flight generations on
   that model, so the adapter first closes its own streams on it. A drain that takes longer than
-  8 s raises (gpud retries on the next tick). Only a refusal, or a drain longer than 600 s,
+  8 s raises `UnloadPending` (gpud notes `engine_busy` and retries on the next tick). Only a refusal, or a drain longer than 600 s,
   returns False. It refuses outright to unload a model outside the catalog. An empty or
   `mlx-serve` id would unload the server's *default* model, so one is never sent.
 - `start()`: a worker thread checks `/api/ps` for the exact id first. An unknown id would make
@@ -405,8 +405,9 @@ sees a client that went quiet and then hung up. Do not leave the variables set i
 - The memory and slot checks are point-in-time. Another client can load a model between the
   check and the load, and mlx-serve may then evict by its own LRU rule. The next tick sees the
   eviction (`model_evicted`) and the brain is reloaded when needed.
-- An unload that waits behind a decode is retried each tick, and each retry records an
-  `engine_error` / `engine_recovered` pair, so the event log is noisy while it drains.
+- An unload that waits behind a generation is retried each tick. The adapter's `UnloadPending`
+  carries `pending = True`, so the supervisor records one `engine_busy` note per wait instead of
+  marking the engine down (live: about 12 s while LTX reached its next step boundary).
 - A model loaded by absolute path is matched to the catalog by directory basename. Someone else
   loading the same pack under the same basename would be taken for Foreman's.
 - If the user's own models fill every mlx-serve slot, gpud cannot load a brain. It records

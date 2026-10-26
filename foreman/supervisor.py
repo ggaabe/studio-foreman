@@ -510,8 +510,19 @@ class Supervisor:
                 result = check(result)
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
+            if getattr(e, "pending", False) is True:
+                # The engine answered: the operation is still in progress (an unload draining
+                # behind a generation that stops at its next step boundary). Not an outage, so
+                # the engine stays healthy; the caller retries next tick, and the adapter bounds
+                # the wait (it returns False, and gpud escalates, if it never finishes).
+                self._note(self._t(), "engine_busy", (name, method, repr(args)[:200]),
+                           engine=name, method=method, detail=err[:300])
+                raise EngineUnavailable(name, method, err) from e
             self._engine_error(name, method, err)
             raise EngineUnavailable(name, method, err) from e
+        busy = self._noted.get("engine_busy")
+        if busy is not None and busy[:2] == (name, method):
+            self._noted.pop("engine_busy", None)  # finished: a later wait is noted again
         self._engine_ok(name)
         return result
 

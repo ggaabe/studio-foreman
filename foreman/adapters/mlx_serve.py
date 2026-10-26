@@ -80,7 +80,10 @@ class RunFailed(Exception):
 
 
 class UnloadPending(RuntimeError):
-    """The unload request is still draining server-side; gpud retries on a later tick."""
+    """The unload request is still draining server-side; gpud retries on a later tick. `pending`
+    tells the supervisor this is work in progress, not an engine outage."""
+
+    pending = True
 
 
 def number_or(value, default):

@@ -737,6 +737,31 @@ class M5SupervisorFeatures(TmpCase):
         self.assertLessEqual(max(counts), 3, f"never more than 3 models in the engine: {counts}")
         self.assertIn(foreign, sim.mlx.resident_models())
 
+    def test_an_unload_still_draining_is_busy_not_an_engine_outage(self):
+        # Live Studio, S5: after the lease closed a stalled LTX stream, mlx-serve's unload waited
+        # ~12 s for the render to reach its next step boundary. The adapter's UnloadPending was
+        # recorded as engine_error / engine_recovered pairs, marking the engine down each tick.
+        cat = {**CATALOG, "ltx-2.5": ModelSpec("ltx-2.5", "mlx-serve", 150, 40, "video", evicts_brain=True)}
+        sim = Sim(os.path.join(self.tmp, "f.db"))
+        sim.sup.catalog = cat
+        sim.run_until_quiet(600)
+        orig, left = sim.mlx.unload, [3]
+
+        def unload(model):
+            if left[0] > 0:
+                left[0] -= 1
+                raise mlx_serve.UnloadPending(f"unload of {model} still draining")
+            return orig(model)
+        sim.mlx.unload = unload
+        job = sim.sup.submit(**render_request("a fox", duration_s=4.0, expected_s=120.0))
+        self.assertTrue(sim.run_until_quiet(3600))
+        self.assertEqual(sim.store.job(job).state, "succeeded")
+        self.assertEqual(left[0], 0, "the unload really was pending three times")
+        kinds = [e["kind"] for e in sim.store.events()]
+        self.assertNotIn("engine_error", kinds)
+        self.assertEqual(kinds.count("engine_busy"), 1, "one note per wait, not one per tick")
+        self.assertTrue(sim.brain_resident())
+
     def test_brain_verdict_human_review_pages_a_person(self):
         class Asks(ScriptedBrain):
             def __call__(self, spec, model):
