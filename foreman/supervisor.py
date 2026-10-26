@@ -31,6 +31,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import math
 import os
 from typing import Callable, Mapping
 
@@ -44,6 +45,7 @@ log = logging.getLogger("foreman")
 # Named points where tests can kill the supervisor (see sim.CrashAt).
 CRASH_POINTS = (
     "tick_start",
+    "after_load_intent",
     "after_load_requested",
     "after_make_room",
     "after_starting_recorded",
@@ -65,6 +67,8 @@ NUMERIC_PAYLOAD_KEYS = ("expected_s", "p90_s", "duration_s", "progress_interval_
 # Outcomes caused by infrastructure rather than by the job: not charged to max_attempts
 # (bounded separately by Policy.max_interruptions).
 INFRA_REASONS = ("engine_unreachable",)
+# Failure reasons an engine may give for a failed run (Poll.reason); anything else is a "crash".
+ENGINE_FAILURE_REASONS = ("rejected",)
 # The planner's brain job (foreman/planner.py). It runs only on a brain that is already resident
 # (payload.resident_only), is never retried and never pages on failure: its decision is a list of
 # proposals the planner validates, never requests gpud admits as they are. Only the planner's own
@@ -169,6 +173,14 @@ def _opt_handle(result) -> str | None:
     return None if result is None else _handle(result)
 
 
+def _opt_instance(result) -> str | None:
+    if result is None:
+        return None
+    if isinstance(result, bool) or not isinstance(result, (str, int, float)):
+        raise TypeError(f"instance_id() returned {result!r}")
+    return str(result)[:200] or None
+
+
 def _ticket(result) -> str:
     if not isinstance(result, str) or not result:
         raise TypeError(f"expected a load ticket, got {result!r}")
@@ -192,8 +204,10 @@ def _poll(result) -> Poll:
     if isinstance(tail, (str, bytes)):
         tail = (tail,)
     err = getattr(result, "error", None)
+    reason = getattr(result, "reason", None)
     return Poll(status, progress if progress is not None else 0.0, getattr(result, "artifact", None),
-                None if err is None else str(err), tuple(str(x) for x in tail))
+                None if err is None else str(err), tuple(str(x) for x in tail),
+                reason if reason in ENGINE_FAILURE_REASONS else None)
 
 
 def _opt_int(req: dict, key: str) -> int | None:
@@ -241,6 +255,10 @@ class Supervisor:
         self._health: dict[str, dict] = dict(self.store.state()["engine_health"] or {})
         self._safe_engine: str | None = None
         self._sizes: dict[str, float] = {}    # adapter-reported sizes of non-catalog models
+        st0 = self.store.state()
+        self._owners: dict[str, dict] = self.store.owners()  # models gpud itself loaded (model_owners)
+        self._instances: dict = dict(st0["instances"] or {})  # engine -> server instance id
+        self._peaks: dict = dict(st0["observed_gb"] or {})    # model -> largest observed size
         self._noted: dict[str, object] = {}   # de-duplication of repetitive events
         self._idle_since: float | None = None  # queue empty and nothing running since (in-process)
         self._phase_errors: dict[str, int] = {}
@@ -282,17 +300,20 @@ class Supervisor:
                 raise
             raise err from e
 
-    def cancel_job(self, job_id: int, reason: str = "cancelled by request") -> bool:
+    def cancel_job(self, job_id: int, reason: str = "cancelled by request", by: str = "request") -> bool:
+        """`by` says who cancelled: "request" (the owner, a CLI, a caller) is a deliberate decision;
+        "gpud" (gpud draining or switching modes) is an infrastructure failure for the ledger."""
         now = self._now()
         job = self.store.job(job_id)
         if job is None:
             return False
         if job.state == "queued":
-            self._record_terminal(job, failed("cancelled", reason, [f"supervisor: cancelled before start ({reason})"]), now)
+            self._record_terminal(job, failed("cancelled", reason, [f"supervisor: cancelled before start ({reason})"],
+                                              cancelled_by=by), now)
             return self.store.job(job_id).state != "queued"
         if job.state == "running":
             # Only the leader talks to engines; a standby just records the request.
-            return self._begin_cancel(job, failed("cancelled", reason), now, lease_state="revoked",
+            return self._begin_cancel(job, failed("cancelled", reason, cancelled_by=by), now, lease_state="revoked",
                                       advance=self.leader and self._recovered)
         return False
 
@@ -321,7 +342,9 @@ class Supervisor:
             self.store.event(now, "supervisor_start", None, boot=boot, pid=os.getpid())
         self._epoch = boot
         self._recovered = True
-        self._phase("observe", self._observe, now)
+        self._owners = self.store.owners()
+        self._phase("owners", self._seed_owners, now)
+        self._phase("observe", lambda t: self._observe(t, fresh=True), now)
         for job in self.store.jobs("starting", "running"):
             self._guard_job(job, lambda j=job: self._reconcile(j, now, boot=True), now)
         # 'cancelling' jobs resume from their persisted cancel_stage; unfired continuations
@@ -339,7 +362,7 @@ class Supervisor:
         with self.store.tx():
             self._persist_time()
         self.crash_hook("tick_start")
-        self._phase("observe", self._observe, now)
+        self._phase("observe", lambda t: self._observe(t, fresh=True), now)
         self._phase("loads", self._check_load, now)
         self._phase("running", self._check_running, now)
         self._phase("engines", self._check_engines, now)
@@ -829,9 +852,15 @@ class Supervisor:
         return spec.engine if spec else None
 
     def _size(self, model: str) -> float:
+        """Planning size: the catalog's, or the largest size the server reported for the model
+        since it started if that is bigger (a model bigger than expected is never under-planned)."""
         spec = self.catalog.get(model)
+        peak = self._peaks.get(model)
+        seen = number(peak.get("gb")) if isinstance(peak, dict) else None
         if spec:
-            return spec.size_gb
+            return max(spec.size_gb, seen) if seen else spec.size_gb
+        if seen:
+            self._sizes[model] = max(self._sizes.get(model, 0.0), seen)
         if model not in self._sizes:
             name = self._resident.get(model)
             eng = self.engines.get(name)
@@ -857,7 +886,196 @@ class Supervisor:
         return self.p.load_timeout_s(self.catalog[model])
 
     def _usable_brains(self) -> list[str]:
-        return [m for m, e in self._resident.items() if self._is_brain(m) and self._avail(e)]
+        """Resident brains gpud may send brain jobs to: its own, and (Policy.use_foreign_brains)
+        someone else's, read-only: used, never unloaded."""
+        return [m for m, e in self._resident.items() if self._is_brain(m) and self._avail(e)
+                and (self.p.use_foreign_brains or self._ours(m))]
+
+    # ------------------------------------------------------------------ provenance
+
+    def _ours(self, model: str) -> bool:
+        """gpud loaded this model itself (or its load request is in flight). Everything else that
+        is resident is someone else's, even a catalog model: never unloaded by gpud."""
+        if model in self.p.foreign_models:
+            return False
+        row = self._owners.get(model)
+        if row is None:
+            return False
+        engine = self._resident.get(model)
+        return engine is None or row["engine"] == engine
+
+    def _may_unload(self, model: str) -> bool:
+        if model in self.catalog:
+            return self._ours(model)
+        return self.p.unload_foreign  # a model gpud does not know at all (the simulation's default)
+
+    def _set_owner(self, model: str, **cols) -> None:
+        row = dict(self._owners.get(model) or {}, **cols)
+        row.setdefault("since", self._t())
+        self.store.set_owner(model, **{k: v for k, v in row.items() if k != "model"})
+        self._owners[model] = dict(row, model=model)
+
+    def _drop_owner(self, model: str, now: float, reason: str | None = None, event: bool = True) -> None:
+        row = self._owners.pop(model, None)
+        self.store.drop_owner(model)
+        if row is not None and reason and event:
+            self.store.event(now, "ownership_dropped", row.get("job_id"), model=model, engine=row.get("engine"),
+                             state=row.get("state"), reason=reason)
+
+    def _intent_ttl(self, model: str) -> float:
+        return (self._load_timeout(model) if model in self.catalog else 0.0) + 60.0
+
+    def _seed_owners(self, now: float) -> None:
+        """Once, on a database from before provenance was recorded: a model gpud last loaded (its
+        latest model_loaded event, not followed by an unload, eviction or engine restart) is
+        gpud's; every other resident model is someone else's."""
+        st = self.store.state()
+        if st["owners_init"]:
+            return
+        known = self._known(st)
+        last: dict[str, str] = {}
+        if known:
+            rows = self.store.conn.execute(
+                "SELECT kind, data FROM events WHERE kind IN ('model_loaded', 'model_unloaded', 'model_evicted', "
+                "'model_appeared', 'engine_restarted') ORDER BY id")
+            for r in rows:
+                try:
+                    data = json.loads(r["data"])
+                except ValueError:
+                    continue
+                if r["kind"] == "engine_restarted":
+                    for m in data.get("dropped") or []:
+                        last[str(m)] = "engine_restarted"
+                elif isinstance(data.get("model"), str):
+                    last[data["model"]] = r["kind"]
+        owned = sorted(m for m, e in known.items() if m in self.catalog and m not in self.p.foreign_models
+                       and last.get(m) == "model_loaded")
+        load = st["loading"] or {}
+        with self.store.tx():
+            for m in owned:
+                self._set_owner(m, engine=known[m] or self.catalog[m].engine, state="owned", instance=None,
+                                boot=None, since=now, owned_at=now, job_id=None, note="seeded from the event log")
+            m = load.get("model")
+            if m in self.catalog and m not in owned and m not in self.p.foreign_models:
+                # A load the previous gpud had in flight: claimed if it appears (_reconcile_owners).
+                self._set_owner(m, engine=load.get("engine") or self.catalog[m].engine, state="loading",
+                                instance=None, boot=None, since=now, owned_at=None, job_id=load.get("for_job"),
+                                note="seeded: a load in flight")
+            self.store.set_state(owners_init=1)
+            if known:
+                self.store.event(now, "ownership_seeded", None, owned=owned,
+                                 foreign=sorted(m for m in known if m not in owned))
+
+    def _check_instance(self, name: str, now: float) -> None:
+        """A changed server instance (mlx-serve: a new process start time) means the server
+        restarted: what gpud loaded on it is gone, so its ownership records are dropped, and so
+        are the sizes observed on the old instance."""
+        if not callable(getattr(self.engines.get(name), "instance_id", None)):
+            return
+        try:
+            inst = self._call(name, "instance_id", check=_opt_instance)
+        except EngineUnavailable:
+            return
+        old = self._instances.get(name)
+        if inst is None or inst == old:
+            return
+        self._instances[name] = inst
+        with self.store.tx():
+            self.store.set_state(instances=self._instances)
+            if old is None:  # first reading: records made before it adopt it
+                for m, row in list(self._owners.items()):
+                    if row["engine"] == name and row.get("instance") is None:
+                        self._set_owner(m, instance=inst)
+                return
+            load = self.store.state()["loading"] or {}
+            # A load gpud sent to the new server (after gpud itself restarted it) stays gpud's; one
+            # sent to the old server died with it (_check_load fails it).
+            tracked = load.get("model") if load.get("engine") == name and load.get("instance") == inst else None
+            dropped = sorted(m for m, row in self._owners.items() if row["engine"] == name and m != tracked)
+            for m in dropped:
+                self._drop_owner(m, now, event=False)
+            stale = [m for m, p in self._peaks.items() if isinstance(p, dict) and p.get("engine") == name]
+            for m in stale:
+                self._peaks.pop(m, None)
+            self.store.set_state(observed_gb=self._peaks)
+            orphans = [o for o in (self.store.state()["orphans"] or []) if o.get("engine") != name]
+            self.store.set_state(orphans=orphans)
+            self.store.event(now, "engine_instance_changed", None, engine=name, old=old, new=inst,
+                             dropped_ownership=dropped,
+                             note="the server restarted: nothing resident on it now was loaded by gpud")
+
+    def _observe_sizes(self, name: str, models, now: float) -> None:
+        """Track the largest resident size the server reports per model on this instance
+        (mlx-serve: /api/ps size_vram), for planning (see _size)."""
+        if not callable(getattr(self.engines.get(name), "model_size_gb", None)):
+            return
+        inst = self._instances.get(name)
+        changed, over = [], []
+        for m in sorted(models):
+            try:
+                gb = number(self._call(name, "model_size_gb", m))
+            except EngineUnavailable:
+                return
+            if not gb or gb <= 0:
+                continue
+            gb = math.ceil(gb * 10.0 - 1e-6) / 10.0
+            cur = self._peaks.get(m) if isinstance(self._peaks.get(m), dict) else None
+            same = cur is not None and cur.get("engine") == name and cur.get("instance") == inst
+            if same and (number(cur.get("gb")) or 0.0) >= gb:
+                continue
+            entry = {"gb": gb, "engine": name, "instance": inst}
+            spec = self.catalog.get(m)
+            logged = number(cur.get("logged")) if same else None
+            if spec and gb > spec.size_gb and (logged is None or gb >= logged + 1.0):
+                entry["logged"] = gb
+                over.append((m, gb, spec.size_gb))
+            elif same and logged is not None:
+                entry["logged"] = logged
+            self._peaks[m] = entry
+            changed.append(m)
+        if changed:
+            with self.store.tx():
+                self.store.set_state(observed_gb=self._peaks)
+                for m, gb, plan in over:
+                    self.store.event(now, "model_size_observed", None, model=m, engine=name, gb=gb, plan_gb=plan,
+                                     note="larger than the catalog size: planned with the observed size")
+
+    def _reconcile_owners(self, now: float, st: dict, current: dict, answered: set) -> None:
+        """Ownership follows what the engines report: an owned model gpud sees gone is no longer
+        gpud's (if it comes back without a gpud load it is someone else's). A load intent whose
+        load gpud no longer tracks (it died with the request in flight) is claimed if the model
+        appears on the same server instance within the load's timeout, else it expires."""
+        loading = (st.get("loading") or {}).get("model")
+        todo = []
+        for m, row in sorted(self._owners.items()):
+            eng = row["engine"]
+            if eng not in answered:
+                continue  # unobservable: keep everything as it was
+            if m == loading and row["state"] == "loading":
+                continue  # the load is still being tracked (_check_load settles it)
+            inst = self._instances.get(eng)
+            if row.get("instance") is not None and inst is not None and row["instance"] != inst:
+                todo.append(("drop", m, "the server restarted"))
+            elif m in self.p.foreign_models:
+                todo.append(("drop", m, "listed in foreign_models"))
+            elif row["state"] == "owned":
+                if current.get(m) != eng:
+                    todo.append(("drop", m, "no longer resident"))
+            elif current.get(m) == eng:
+                todo.append(("claim", m, "a load gpud requested completed after gpud lost track of it"))
+            elif now - (number(row.get("since")) or now) > self._intent_ttl(m):
+                todo.append(("drop", m, "load intent expired: the model never appeared"))
+        if not todo:
+            return
+        with self.store.tx():
+            for action, m, why in todo:
+                if action == "drop":
+                    self._drop_owner(m, now, why)
+                else:
+                    row = self._owners[m]
+                    self._set_owner(m, state="owned", owned_at=now, instance=self._instances.get(row["engine"]),
+                                    note=why)
+                    self.store.event(now, "model_claimed", row.get("job_id"), model=m, engine=row["engine"], reason=why)
 
     def _known(self, st: dict) -> dict[str, str]:
         known = dict(st["known_resident"] or {})
@@ -866,24 +1084,31 @@ class Supervisor:
                 known[m] = self.catalog[m].engine
         return known
 
-    def _observe(self, now: float) -> None:
+    def _observe(self, now: float, fresh: bool = False) -> None:
         """Reconcile residency with engine reality (engines may evict on their own; another
-        client may load models gpud does not know) and track how long the brain has been away.
-        An engine that does not answer keeps its last known residency (conservative for memory
-        planning), and its models count as pinned: they cannot be unloaded or used."""
+        client may load models, catalog models included) and track how long the brain has been
+        away. An engine that does not answer keeps its last known residency (conservative for
+        memory planning), and its models count as pinned: they cannot be unloaded or used.
+        `fresh` (once per tick) also reads each engine's instance id and reported model sizes."""
         st = self.store.state()
         self._safe_engine = st["safe_engine"] if st["safe"] else None
         known = self._known(st)
         current: dict[str, str] = {}
+        answered: set = set()
         for name in self.engines:
             try:
                 models = self._call(name, "resident_models", check=_model_set)
             except EngineUnavailable:
                 current.update({m: e for m, e in known.items() if e == name})
                 continue
+            answered.add(name)
             for m in sorted(models):
                 current.setdefault(m, name)
+            if fresh:
+                self._check_instance(name, now)
+                self._observe_sizes(name, models, now)
         self._resident = current
+        self._reconcile_owners(now, st, current, answered)
         loading = (st["loading"] or {}).get("model")
         events = [("model_evicted", {"model": m, "engine": known[m]}) for m in sorted(set(known) - set(current))]
         for m in sorted(set(current) - set(known)):
@@ -892,6 +1117,9 @@ class Supervisor:
             data = {"model": m, "engine": current[m]}
             if m not in self.catalog:
                 data.update(foreign=True, size_gb=self._size(m))
+            elif not self._ours(m):
+                data.update(foreign=True, size_gb=self._size(m),
+                            note="a catalog model gpud did not load: someone else's, never unloaded by gpud")
             events.append(("model_appeared", data))
         updates: dict = {}
         if current != known:
@@ -904,7 +1132,7 @@ class Supervisor:
             updates["brainless_since"] = None
             events.append(("brain_returned", {"away_s": now - st["brainless_since"],
                                               "brains": sorted(self._usable_brains())}))
-        media = any(m in self.catalog and not self._is_brain(m) for m in current)  # gpud's own media models
+        media = any(m in self.catalog and not self._is_brain(m) and self._ours(m) for m in current)  # gpud's own
         mode = ("safe" if st["safe"] else "media+brain" if brain and media else "brain" if brain
                 else "brainless" if media else "empty")
         if mode != st["mode"]:
@@ -927,6 +1155,11 @@ class Supervisor:
         if model not in self.catalog:
             return self._abandon_load(now, f"unknown model {model!r}")
         limit = self._load_timeout(model)
+        sent_to, current = load.get("instance"), self._instances.get(name)
+        if sent_to is not None and current is not None and sent_to != current:
+            # The server restarted since the request was sent: that load died with it, and a copy
+            # resident now was loaded by someone else (its "ready" ticket must not make it gpud's).
+            return self._load_failed(load, "the server restarted while the load was in flight", now, definitive=True)
         try:
             status = self._call(name, "poll_load", load["ticket"], check=_load_status)
         except EngineUnavailable:
@@ -946,6 +1179,8 @@ class Supervisor:
             extra = {"deferred_s": round(now - float(waited.get("since", now)), 1)} if waited else {}
             with self.store.tx():
                 self.store.set_state(loading=None, ladder=ladder, known_resident=known)
+                self._set_owner(model, engine=name, state="owned", instance=self._instances.get(name),
+                                boot=load.get("boot"), owned_at=now, job_id=load.get("for_job"), note="loaded by gpud")
                 self.store.event(now, "model_loaded", load.get("for_job"), model=model, engine=name,
                                  took_s=now - load["started_at"], **extra)
             self._resident[model] = name
@@ -960,7 +1195,7 @@ class Supervisor:
             # SIGTERM if refused, then SAFE. A refused abort must not be forgotten: the half
             # loaded model may still hold its memory.
             try:
-                cleanup = self._unload(model, now, reason="abort stuck load")
+                cleanup = self._unload(model, now, reason="abort stuck load", own_load=True)
             except EngineUnavailable:
                 return  # retry the abort next tick
             if cleanup == "wedged":
@@ -972,11 +1207,25 @@ class Supervisor:
         self._load_failed(load, reason, now)
 
     def _abandon_load(self, now: float, reason: str) -> None:
+        # The load intent (model_owners) stays: whether the request completes is unknown, so the
+        # model is claimed if it appears within the load's timeout (_reconcile_owners).
         with self.store.tx():
             load = self.store.state()["loading"]
             if load:
                 self.store.set_state(loading=None)
                 self.store.event(now, "load_abandoned", load.get("for_job"), model=load.get("model"), reason=reason)
+
+    def _end_intent(self, load: dict, now: float, definitive: bool) -> None:
+        """A load that failed. If this process issued it and the engine answered that it failed
+        (or refused it before sending), the request is over: the intent goes. Otherwise (a ticket
+        from an earlier gpud, a load call that raised) it may still complete server-side, and the
+        intent waits for _reconcile_owners to claim the model or let the intent expire."""
+        model = load.get("model")
+        row = self._owners.get(model)
+        if row is None or row.get("state") != "loading":
+            return
+        if definitive:
+            self._drop_owner(model, now, event=False)
 
     def _load_deferred(self, load: dict, reason: str, now: float) -> None:
         """The engine refused a media model's load for now (LoadStatus.deferred: the host lacks
@@ -1001,6 +1250,7 @@ class Supervisor:
         with self.store.tx():
             if waited >= self.p.load_defer_max_s:
                 waits.pop(model, None)  # the next job that needs the model waits afresh
+                self._end_intent(load, now, definitive=True)
                 self.store.set_state(loading=None, ladder=ladder)
                 self.store.event(now, "load_failed", for_job, model=model, attempt=n, reason=reason[:300],
                                  deferred_s=round(waited, 1))
@@ -1011,12 +1261,13 @@ class Supervisor:
                         [f"supervisor: {model} could not be loaded for {waited:.0f}s ({reason})"]), now)
                 return
             waits[model] = {"since": since, "n": n, "until": now + delay, "reason": str(reason)[:300]}
+            self._end_intent(load, now, definitive=True)  # refused before the request was sent
             self.store.set_state(loading=None, ladder=ladder)
             if n & (n - 1) == 0:  # 1st, 2nd, 4th, 8th, ...: a long wait is logged on a log scale
                 self.store.event(now, "load_deferred", for_job, model=model, deferrals=n, retry_in_s=delay,
                                  waited_s=round(waited, 1), reason=str(reason)[:300])
 
-    def _load_failed(self, load: dict, reason: str, now: float) -> None:
+    def _load_failed(self, load: dict, reason: str, now: float, definitive: bool | None = None) -> None:
         """Retry each model once; a brain that fails twice is skipped (the ladder moves down);
         a media model that fails twice fails the job waiting on it (its on_failure fires)."""
         model = load["model"]
@@ -1025,7 +1276,10 @@ class Supervisor:
         fails, skip = ladder.setdefault("failures", {}), ladder.setdefault("skip_until", {})
         n = fails.get(model, 0) + 1
         exhausted = n >= self.p.load_attempts_per_model
+        if definitive is None:  # the engine answered "failed" for a ticket this process issued
+            definitive = self._epoch is not None and load.get("boot") == self._epoch
         with self.store.tx():
+            self._end_intent(load, now, definitive)
             self.store.event(now, "load_failed", load.get("for_job"), model=model, attempt=n, reason=reason)
             if exhausted:
                 fails.pop(model, None)
@@ -1046,15 +1300,22 @@ class Supervisor:
         return st["ladder"].get("skip_until", {}).get(model, float("-inf")) <= now
 
     def _ladder_order(self, needs: str) -> list[str]:
+        """Brains gpud may load, in ladder order (never one listed in Policy.foreign_models)."""
         order = ([self.p.vision_brain] if needs == "vision" else []) + list(self.p.text_ladder)
-        return [m for m in dict.fromkeys(order) if m in self.catalog]
+        return [m for m in dict.fromkeys(order) if m in self.catalog and m not in self.p.foreign_models]
 
     def _pinned(self) -> set[str]:
-        """Resident models gpud cannot unload right now (their engine is unavailable), plus, when
-        Policy.unload_foreign is off, every model outside the catalog (someone else's)."""
+        """Resident models gpud cannot unload: those on an engine that is unavailable right now,
+        every catalog model gpud did not load itself (someone else's: see _ours), and, when
+        Policy.unload_foreign is off, every model outside the catalog. All of them still count
+        against memory and model slots."""
         pinned = {m for m, e in self._resident.items() if not self._avail(e)}
-        if not self.p.unload_foreign:
-            pinned |= {m for m in self._resident if m not in self.catalog}
+        for m in self._resident:
+            if m in self.catalog:
+                if not self._ours(m):
+                    pinned.add(m)
+            elif not self.p.unload_foreign:
+                pinned.add(m)
         return pinned
 
     def _slot_cap(self, engine: str | None) -> int | None:
@@ -1069,6 +1330,10 @@ class Supervisor:
         return pinned + self._size(model) <= self.p.usable_gb
 
     def _loadable(self, model: str, now: float, st: dict) -> bool:
+        """gpud can load this model now. Not if someone else already has it resident (gpud would
+        only take over their copy) or it is listed in Policy.foreign_models."""
+        if model in self.p.foreign_models or (model in self._resident and not self._ours(model)):
+            return False
         return (model in self.catalog and self._ladder_ok(model, now, st)
                 and self._avail(self.catalog[model].engine) and self._fits_alone(model))
 
@@ -1093,22 +1358,41 @@ class Supervisor:
 
     def _begin_load(self, model: str, now: float, for_job: int | None) -> None:
         name = self._engine_name(model)
+        if model in self._resident or model in self.p.foreign_models:
+            # Resident already (someone else's copy: a no-op load would make gpud take it for its
+            # own), or never gpud's to load.
+            self._note(now, "load_skipped", (model, for_job), job_id=for_job, model=model, ours=self._ours(model),
+                       reason="resident already" if model in self._resident else "listed in foreign_models")
+            return
+        # Intent first, in its own commit: if gpud dies with the request in flight, the next gpud
+        # can still tell that the model it finds resident is its own (_reconcile_owners).
+        with self.store.tx():
+            self._set_owner(model, engine=name, state="loading", instance=self._instances.get(name),
+                            boot=self._epoch, since=now, owned_at=None, job_id=for_job, note="load requested")
+        self.crash_hook("after_load_intent")
         try:
             ticket = self._call(name, "load", model, check=_ticket)
         except EngineUnavailable as e:
-            return self._load_failed({"model": model, "engine": name, "for_job": for_job, "started_at": now},
-                                     f"load request failed: {e.error}", now)
+            return self._load_failed({"model": model, "engine": name, "for_job": for_job, "started_at": now,
+                                      "boot": self._epoch}, f"load request failed: {e.error}", now, definitive=False)
         with self.store.tx():
-            self.store.set_state(loading={"model": model, "engine": name, "ticket": ticket,
-                                          "started_at": now, "for_job": for_job})
+            self.store.set_state(loading={"model": model, "engine": name, "ticket": ticket, "started_at": now,
+                                          "for_job": for_job, "boot": self._epoch,
+                                          "instance": self._instances.get(name)})
             self.store.event(now, "load_started", for_job, model=model, engine=name,
                              expected_s=self.catalog[model].load_s)
         self.crash_hook("after_load_requested")
 
-    def _unload(self, model: str, now: float, reason: str) -> str:
+    def _unload(self, model: str, now: float, reason: str, own_load: bool = False) -> str:
         """Graceful unload; if refused, graceful terminate; if that fails, SAFE + page.
-        Returns 'unloaded', 'terminated' or 'wedged'. There is no force-kill path. Raises
-        EngineUnavailable if the engine does not answer (the caller retries later)."""
+        Returns 'unloaded', 'terminated' or 'wedged', or 'foreign' without calling the engine for
+        a model gpud did not load (someone else's is never unloaded, whatever the caller wanted).
+        There is no force-kill path. Raises EngineUnavailable if the engine does not answer (the
+        caller retries later)."""
+        if not own_load and not self._may_unload(model):
+            self._note(now, "unload_refused", (model, reason), model=model, reason=reason,
+                       note="not loaded by gpud: someone else's model is never unloaded")
+            return "foreign"
         name = self._engine_name(model)
         if self._call(name, "unload", model, check=bool):
             self._resident.pop(model, None)
@@ -1116,6 +1400,7 @@ class Supervisor:
                 known = self._known(self.store.state())
                 known.pop(model, None)
                 self.store.set_state(known_resident=known)
+                self._drop_owner(model, now, event=False)
                 self.store.event(now, "model_unloaded", None, model=model, reason=reason)
             return "unloaded"
         with self.store.tx():
@@ -1132,7 +1417,10 @@ class Supervisor:
             with self.store.tx():
                 known = {m: e for m, e in self._known(self.store.state()).items() if m not in gone and e != name}
                 self.store.set_state(known_resident=known)
+                for m in [m for m, row in self._owners.items() if row["engine"] == name]:
+                    self._drop_owner(m, now, event=False)
                 self.store.event(now, "engine_restarted", None, engine=name, dropped=sorted(gone))
+            self._check_instance(name, now)  # the restarted server's identity, for what gpud loads next
             return True
         self._enter_safe(f"{name} ignored a graceful terminate ({why}); force-kill is never "
                          f"automatic, a human must intervene", now, engine=name)
@@ -1163,9 +1451,10 @@ class Supervisor:
             if not must and used + need <= usable:
                 continue
             try:
-                if self._unload(m, now, reason="make room") == "wedged":
-                    return False
+                result = self._unload(m, now, reason="make room")
             except EngineUnavailable:
+                return False
+            if result == "wedged":
                 return False
         used = sum(self._size(x) for x in self._resident)
         need = sum(self._size(x) for x in target if x not in self._resident)
@@ -1198,9 +1487,10 @@ class Supervisor:
                                engine=name, cap=cap, target=sorted(target), resident=sorted(held))
                     return False
                 try:
-                    if self._unload(cands[0], now, reason=f"make room ({name} keeps at most {cap} models)") == "wedged":
-                        return False
+                    result = self._unload(cands[0], now, reason=f"make room ({name} keeps at most {cap} models)")
                 except EngineUnavailable:
+                    return False
+                if result in ("wedged", "foreign"):
                     return False
         return True
 
@@ -1331,7 +1621,8 @@ class Supervisor:
         if poll.status == "done":
             return self._complete(job, poll, now)
         if poll.status == "failed":
-            return self._record_terminal(job, failed("crash", poll.error or "engine reported failure", poll.log_tail,
+            reason = poll.reason if poll.reason in ENGINE_FAILURE_REASONS else "crash"
+            return self._record_terminal(job, failed(reason, poll.error or "engine reported failure", poll.log_tail,
                                                      **self._artifact_fields(job, poll.artifact)), now)
         self._record_terminal(job, failed("engine_lost", f"engine reported '{poll.status}'", poll.log_tail), now)
 
@@ -1831,6 +2122,9 @@ class Supervisor:
             return
         if want in self._resident and self._avail(self._resident[want]):
             return
+        rank = list(dict.fromkeys(list(self.p.text_ladder) + [self.p.vision_brain]))
+        if any(m in rank and rank.index(m) <= rank.index(want) for m in self._usable_brains()):
+            return  # a brain ranked at least as high is home already (someone else's, used read-only)
         if self._make_room({want}, now):
             self._begin_load(want, now, None)
 
@@ -1864,17 +2158,32 @@ class Supervisor:
         pref = list(self.p.text_ladder) + [self.p.vision_brain]
         return min(brains, key=lambda m: pref.index(m) if m in pref else len(pref))
 
+    def _slots_ok(self, target: set[str], pinned: set[str]) -> bool:
+        """`target` fits under every engine's model-count cap beside the models gpud cannot
+        unload there (someone else's, or on an engine that does not answer)."""
+        for name in {e for e in (self._engine_name(m) for m in target) if e}:
+            cap = self._slot_cap(name)
+            if cap is None:
+                continue
+            fixed = [m for m, e in self._resident.items() if e == name and m in pinned and m not in target]
+            if len(fixed) + sum(1 for m in target if self._engine_name(m) == name) > cap:
+                return False
+        return True
+
     def _plan_media(self, model: str, now: float, st: dict) -> tuple[set[str], str | None]:
-        """Target residency for a media job, keeping a brain co-resident whenever it fits."""
+        """Target residency for a media job, keeping a brain co-resident whenever it fits, in
+        memory and in the engine's model slots beside the models gpud may not unload."""
         spec = self.catalog[model]
         if spec.exclusive or spec.evicts_brain:
             return {model}, None
-        room = self.p.usable_gb - spec.size_gb - sum(self._size(m) for m in self._pinned() if m != model)
+        pinned = self._pinned()
+        room = self.p.usable_gb - self._size(model) - sum(self._size(m) for m in pinned if m != model)
         for b in sorted(self._usable_brains(), key=lambda m: -self._size(m)):
-            if self._size(b) <= room:
+            if self._size(b) <= room and self._slots_ok({model, b}, pinned):
                 return {model, b}, b
         co = self.p.co_resident_brain
-        if co and co in self.catalog and self._size(co) <= room and self._loadable(co, now, st):
+        if co and co in self.catalog and self._size(co) <= room and self._loadable(co, now, st) \
+                and self._slots_ok({model, co}, pinned):
             return {model, co}, co
         return {model}, None
 

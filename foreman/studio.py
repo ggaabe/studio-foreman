@@ -4,9 +4,23 @@ Model names are the ids mlx-serve's --model-dir discovery gives the packs under
 ~/.mlx-serve/models ('<org>/<repo>'). A pack loaded by absolute path is registered under its
 directory basename instead; the adapter maps both back to these names.
 
-Sizes are planning numbers: the on-disk size of each pack plus headroom for activations and
-KV cache (LTX's VAE decode peaks around 20 GB on top of its weights). Load times are rough SSD
-estimates. Measure both on the Studio before trusting the planner with tighter margins.
+Sizes and load times are calibrated on the Studio (2026-10-26, mlx-serve 26.10.3): the size is
+the measured peak plus a modest margin, the load time the measured wall time with room to spare
+(gpud gives a load 3x its load_s before it counts as failed). Measured:
+
+    model                    resident (/api/ps size_vram)       load (wall)     plan
+    Qwen3.8-27B brain        18.2 GB (load-model said 16.95)    2-6 s, up to 9  20 GB, 10 s
+    Qwen3.8-Flash-Next       75.3 GB                            not measured    77 GB, 70 s
+    Kokoro-82M               ~0.4 GB                            ~1 s             1 GB,  3 s
+    ACE-Step 1.5 XL 4-bit    ~4 GB pack                         1-2 s            6 GB,  5 s
+    LTX-2.5 4-bit            33.1 GB, 35.6 GB during a 5 s      3-5 s           40 GB, 10 s
+                             1280x704 render
+
+The earlier estimates (brain 24 GB/25 s, LTX 60 GB/45 s, Flash-Next 74 GB/70 s) were too
+loose: LTX's 60 GB plus the 40 GB headroom made renders wait up to an hour while 88-110 GB were
+free. The planner and the adapter's memory preflight also use the largest size mlx-serve
+reported for a model since it started whenever that exceeds these numbers (Supervisor._size,
+MlxServeEngine.plan_gb), so a model bigger than expected is never under-planned.
 
 Configuration sources, later ones winning: defaults below, $FOREMAN_HOME/config.json (or the
 file given with --config), environment variables (FOREMAN_*), command-line flags.
@@ -19,7 +33,7 @@ import os
 import shutil
 from dataclasses import dataclass, field
 
-from .policy import ModelSpec, Policy
+from .policy import ModelSpec, Policy, number
 
 ENGINE = "mlx-serve"
 BRAIN_PRIMARY = "ddalcu/Qwen3.8-27B-MLX-Serve-4bit"                    # vision (qwen3_5 + vision_config)
@@ -45,12 +59,12 @@ def catalog(video_exclusive: bool = False) -> dict:
     so reviews need no reload and mlx-serve's GenYield lets it answer between denoise steps.
     video_exclusive=True unloads the brain while LTX renders instead, which makes every render
     exercise the brain-return path (or frees memory on a smaller machine)."""
-    specs = (
-        ModelSpec(BRAIN_PRIMARY, ENGINE, 24, 25, "brain", vision=True),
-        ModelSpec(BRAIN_FALLBACK, ENGINE, 74, 70, "brain"),
-        ModelSpec(KOKORO, ENGINE, 1, 5, "tts"),
-        ModelSpec(ACE_STEP, ENGINE, 8, 15, "music"),
-        ModelSpec(LTX, ENGINE, 60, 45, "video", evicts_brain=video_exclusive),
+    specs = (  # sizes and load times measured on the Studio (module docstring)
+        ModelSpec(BRAIN_PRIMARY, ENGINE, 20, 10, "brain", vision=True),
+        ModelSpec(BRAIN_FALLBACK, ENGINE, 77, 70, "brain"),
+        ModelSpec(KOKORO, ENGINE, 1, 3, "tts"),
+        ModelSpec(ACE_STEP, ENGINE, 6, 5, "music"),
+        ModelSpec(LTX, ENGINE, 40, 10, "video", evicts_brain=video_exclusive),
     )
     return {s.name: s for s in specs}
 
@@ -85,6 +99,9 @@ class Config:
     ffmpeg: str = "auto"              # path, "auto" (PATH, $FOREMAN_HOME/bin, Homebrew), or "" for none
     min_headroom_gb: float = HEADROOM_GB
     max_resident_models: int = 3      # mlx-serve's --max-resident-models (default 3)
+    foreign_models: list = field(default_factory=list)  # catalog models that are always someone else's:
+                                      # gpud never loads, unloads or claims them (it may use a resident brain)
+    use_foreign_brains: bool = True   # a brain someone else loaded may serve gpud's brain jobs, read-only
     tick_s: float = 1.0
     watchdog_s: float = 300.0         # a tick stuck this long: exit and let launchd restart gpud
     stall_after: int | None = None    # fault injection (FOREMAN_FAULT_STALL_AFTER)
@@ -98,7 +115,9 @@ class Config:
     planner_options: dict = field(default_factory=dict)  # PlannerConfig fields, e.g. {"interval_s": 1800}
 
     def policy(self) -> Policy:
-        overrides = {}
+        overrides = {"host_reserve_gb": OS_RESERVE_GB + OTHER_TENANTS_GB + float(self.min_headroom_gb),
+                     "foreign_models": tuple(str(m) for m in (self.foreign_models or ())),
+                     "use_foreign_brains": bool(self.use_foreign_brains)}
         if self.progress_timeout_s:
             overrides["progress_timeout_s"] = float(self.progress_timeout_s)
         return policy(**overrides)
@@ -163,6 +182,10 @@ def load_config(path: str | None = None, env=None, **overrides) -> Config:
             setattr(cfg, k, v)
     if not isinstance(cfg.planner_options, dict):
         raise ValueError(f"{path}: planner_options must be an object of planner settings")
+    if not isinstance(cfg.foreign_models, (list, tuple)) or not all(isinstance(m, str) for m in cfg.foreign_models):
+        raise ValueError(f"{path}: foreign_models must be a list of model names")
+    if number(cfg.min_headroom_gb) is None or cfg.min_headroom_gb < 0:
+        raise ValueError(f"{path}: min_headroom_gb must be a number >= 0")
     cfg.planner_config()  # fail early on an unknown or malformed planner option
     return cfg.finish()
 

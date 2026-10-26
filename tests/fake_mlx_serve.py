@@ -4,8 +4,9 @@ It reproduces the shapes the adapter depends on (checked against the server sour
 live Studio): /api/ps (READY models, ':latest' names), /v1/models (+ machine.free_mib),
 load by discovered id or absolute path (registered under the basename), idempotent unload,
 SSE progress / complete / error for speech, music and video, streaming chat completions, and
-the fallback to the default model for an unknown id. Per-request behaviours (hang, error,
-drop, http500, black or frozen video) are scripted per endpoint.
+the fallback to the default model for an unknown id, and /metrics with
+`mlx_serve:process_start_time_seconds` (restart() starts a new server process). Per-request
+behaviours (hang, error, drop, http500, http400, black or frozen video) are scripted per endpoint.
 """
 from __future__ import annotations
 
@@ -77,8 +78,26 @@ class FakeMlxServe:
         self.disconnects = []                   # endpoints whose client went away mid-stream
         self.progress_delay = 0.0
         self.steps = 6
+        self.start_time = 1761456000            # mlx_serve:process_start_time_seconds (unix seconds)
+        self.metrics = "text"                   # text: /metrics; json: only /metrics.json; none: neither
         self.lock = threading.Lock()
         self._server = None
+
+    def restart(self, keep=()) -> None:
+        """The server process restarts (an update, a crash, its app relaunching it): every model
+        is gone (except `keep`, loaded again at startup as --model would) and the start time moves."""
+        with self.lock:
+            kept = {k: v for k, v in self.ready.items() if k in keep}
+            self.ready.clear()
+            self.ready.update(kept)
+            self.start_time += 3600
+            if self.default_id not in self.ready:
+                self.default_id, self.default_promoted = "", False
+
+    def other_client_load(self, mid: str, size: int | None = None) -> None:
+        """Another client (MLX-Serve.app, a chat window) loads a model behind gpud's back."""
+        with self.lock:
+            self.ready[mid] = size or self.sizes.get(mid) or self.sizes.get(mid.rsplit("/", 1)[-1]) or int(1e9)
 
     # ---- lifecycle
     def start(self) -> "FakeMlxServe":
@@ -173,6 +192,24 @@ class _Handler(BaseHTTPRequestHandler):
             s.requests.append(("GET", self.path, None))
         if self.path == "/health":
             return self._json(200, {"status": "ok"}) if s.health_ok else self._json(503, {"status": "loading"})
+        if self.path == "/metrics":
+            if s.metrics != "text":
+                return self._error(404, "Unknown endpoint", "not_found")
+            text = ("# HELP mlx_serve:requests_running Requests running\n# TYPE mlx_serve:requests_running gauge\n"
+                    "mlx_serve:requests_running 0\n"
+                    "# HELP mlx_serve:process_start_time_seconds Unix time the server process started\n"
+                    "# TYPE mlx_serve:process_start_time_seconds gauge\n"
+                    f"mlx_serve:process_start_time_seconds {s.start_time}\n").encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(text)))
+            self.end_headers()
+            self.wfile.write(text)
+            return
+        if self.path == "/metrics.json":
+            if s.metrics == "none":
+                return self._error(404, "Unknown endpoint", "not_found")
+            return self._json(200, {"gauges": {"process_start_time_seconds": s.start_time, "requests_running": 0}})
         if self.path == "/api/ps":
             with s.lock:
                 models = [{"name": f"{k}:latest", "model": f"{k}:latest", "size": v, "size_vram": v,
@@ -269,6 +306,8 @@ class _Handler(BaseHTTPRequestHandler):
             behaviour = s.script[path].popleft() if s.script[path] else "ok"
         if behaviour == "http500":
             return self._error(500, "generation failed", "server_error")
+        if behaviour == "http400":
+            return self._error(400, "steps must be between 1 and 100")
         self._sse_start()
         video = path.endswith("video/generations")
         total = s.steps

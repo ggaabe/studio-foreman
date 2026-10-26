@@ -86,6 +86,24 @@ def json_call(base_url: str, method: str, path: str, body=None, timeout: float =
         raise ValueError(f"{method} {path}: response is not JSON ({e})") from None
 
 
+def text_call(base_url: str, path: str, timeout: float = 2.0, limit: int = 1 << 20) -> tuple:
+    """GET a plain-text resource (a Prometheus /metrics page): (status, text). A non-2xx answer
+    is returned as its status with the body text, not raised; OSError when unreachable in time."""
+    req = urllib.request.Request(base_url.rstrip("/") + path, method="GET", headers={"Accept": "text/plain"})
+    try:
+        with _OPENER.open(req, timeout=timeout) as resp:
+            return resp.status, resp.read(limit).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        try:
+            raw = e.read(1 << 16)
+        except Exception:
+            raw = b""
+        return e.code, raw.decode("utf-8", "replace")
+    except urllib.error.URLError as e:
+        reason = e.reason if isinstance(e.reason, BaseException) else OSError(str(e.reason))
+        raise reason from None
+
+
 def split_url(base_url: str):
     u = urllib.parse.urlsplit(base_url)
     if u.scheme != "http":

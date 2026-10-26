@@ -86,6 +86,10 @@ class Policy:
     max_clock_step_s: float = 30.0         # wall-clock jump treated as a step (no monotonic source)
     page_backoff_max_s: float = 60.0       # pager retry backoff ceiling
     unload_foreign: bool = True            # False: models outside the catalog are pinned, never unloaded
+    # Provenance: gpud records every model it loads (Supervisor, table model_owners). A catalog model
+    # resident without gpud having loaded it is someone else's: never unloaded, always counted.
+    use_foreign_brains: bool = True        # someone else's resident brain may serve gpud's brain jobs (read-only)
+    foreign_models: tuple = ()             # catalog models that are always someone else's: never loaded or unloaded
     idle_media_unload_s: float | None = None  # unload gpud's idle media models after the queue is empty this long
     load_defer_s: float = 15.0             # a media load the engine deferred (free memory) is retried after this,
     load_defer_max_backoff_s: float = 300.0  # ... doubling up to this,

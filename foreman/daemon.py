@@ -101,7 +101,8 @@ class Gpud:
             level = logging.WARNING if e["kind"] in (
                 "page_human", "safe_mode_entered", "engine_declared_lost", "lease_expired", "human_review",
                 "supervisor_error", "job_fault", "insufficient_memory", "insufficient_slots", "planner_suspended",
-                "plan_invalid", "plan_error", "template_paused", "template_error") else logging.INFO
+                "plan_invalid", "plan_error", "template_paused", "template_error", "unload_refused",
+                "engine_instance_changed", "model_size_observed") else logging.INFO
             log.log(level, "event %s", e["kind"], extra={"fields": {
                 "event": e["kind"], "event_id": e["id"], "job_id": e["job_id"], "at": e["at"], "data": e["data"]}})
 

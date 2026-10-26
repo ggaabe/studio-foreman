@@ -1,10 +1,12 @@
 """The scoreboard (`python3 -m foreman.cli report`): what the planner's work earned against what it
 cost. Markdown, written under $FOREMAN_HOME/reports/ (never into the repository).
 
-Per template: produced, passed by the brain, accepted and rejected by the owner, shipped, dollars,
-review minutes, GPU-hours, P(ship). Then GPU-hours and the idle share, the biggest GPU sinks that
-nobody used, rejections by reason code, templates paused by the kill criteria, and the planner's
-ideas for new templates.
+Per template: produced, passed by the brain, accepted and rejected by the owner, failed (split
+into infrastructure and content failures: only content failures count against the caps), shipped,
+dollars, review minutes, GPU-hours, P(ship). Then GPU-hours and the idle share, the biggest GPU
+sinks that nobody used (items still awaiting a verdict or still in flight are not sinks yet),
+rejections by reason code, templates paused by the kill criteria, and the planner's ideas for new
+templates.
 """
 from __future__ import annotations
 
@@ -56,8 +58,8 @@ def build(store, templates: dict, now: float, wall: float, days: float = 7.0, cf
             f"- tokens on {pst['tokens_day'] or '-'}: {pst['tokens_used']}", ""]
     out += ["## Templates", "",
             "| template | admitted | produced | brain ok | accepted | rejected | shipped | usd | review min | "
-            "GPU h | P(ship) | status |",
-            "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+            "GPU h | P(ship) | status | failed infra/content |",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for tid in sorted(stats):
         s = stats[tid][key]
         ps = paused.get(tid) or {}
@@ -66,9 +68,14 @@ def build(store, templates: dict, now: float, wall: float, days: float = 7.0, cf
                   "not loaded" if t is None else "active" if t.active else "inactive")
         out.append(f"| {_cell(tid)} | {s['admitted']} | {s['produced']} | {s['brain_accepted']} | {s['accepted']} | "
                    f"{s['rejected']} | {s['shipped']} | {s['usd']:.2f} | {s['review_min']:g} | {s['gpu_h']:.2f} | "
-                   f"{stats[tid]['p_ship'] if stats[tid]['p_ship'] is not None else '-'} | {_cell(status)} |")
+                   f"{stats[tid]['p_ship'] if stats[tid]['p_ship'] is not None else '-'} | {_cell(status)} | "
+                   f"{s['failed_infra']}/{s['failed_content']} |")
     if not stats:
-        out.append("| (no templates and no items yet) | | | | | | | | | | | |")
+        out.append("| (no templates and no items yet) | | | | | | | | | | | | |")
+    uncounted = sum(stats[t][key]["uncounted"] for t in stats)
+    if uncounted:
+        out += ["", f"{uncounted} infrastructure failure(s) in the window did not count against their template's "
+                    f"caps or review minutes (see `review --all` for each item's count note)."]
     total_usd = sum(stats[t][key]["usd"] for t in stats)
     total_min = sum(stats[t][key]["review_min"] for t in stats)
     out += ["", f"Shipped value ${total_usd:.2f} for {total_min:g} review minutes"
@@ -80,8 +87,8 @@ def build(store, templates: dict, now: float, wall: float, days: float = 7.0, cf
             f"- idle share: {idle:.0%} of the {span / 3600.0:.1f} h observed (idle is a correct outcome)", ""]
     sinks = []
     for it in all_items:
-        if it["state"] in ("accepted", "shipped"):
-            continue
+        if it["state"] in ("accepted", "shipped", "review", "queued"):
+            continue  # used, or not judged yet: awaiting the owner's verdict or still in flight
         s = gpu["by_root"].get(it["job_id"], 0.0)
         if s > 0:
             sinks.append((s, it))

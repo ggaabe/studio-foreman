@@ -37,6 +37,9 @@ class Poll:
     artifact: dict | None = None
     error: str | None = None
     log_tail: tuple[str, ...] = field(default_factory=tuple)
+    # Why a failed run failed, when the engine knows: "rejected" means the server refused the
+    # request itself (an HTTP 4xx for its parameters), a content failure. None: gpud records "crash".
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -77,5 +80,12 @@ class Engine(Protocol):
         """Graceful process stop (SIGTERM analog); launchd restarts it. False if it did not exit."""
 
     # Optional: def model_size_gb(self, model: str) -> float | None
-    #   Resident footprint of a model the catalog does not know (loaded by another client). Without
-    #   it gpud assumes such a model fills the host, so it is unloaded before anything is planned.
+    #   Resident footprint of a model as the server reports it (the largest seen since the server
+    #   started). For a model the catalog does not know (loaded by another client) it is the only
+    #   size gpud has; without it such a model is assumed to fill the host. For a catalog model gpud
+    #   plans with the larger of the catalog size and this reading.
+    #
+    # Optional: def instance_id(self) -> str | None
+    #   Identity of the running server process (mlx-serve: its process start time from /metrics).
+    #   A change means the server restarted: every model gpud loaded on it is gone, and whatever is
+    #   resident now was loaded by someone else. None when unknown; must not raise.

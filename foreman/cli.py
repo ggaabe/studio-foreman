@@ -88,6 +88,7 @@ def cmd_status(cfg, live: bool) -> None:
         jobs = sup.store.jobs()
         pst = planner.status(sup.store, sup._now())
         review_n = len(ledger.review_queue(sup.store))
+        owners = sup.store.owners()
     finally:
         sup.close()
     by_state: dict = {}
@@ -95,7 +96,10 @@ def cmd_status(cfg, live: bool) -> None:
         by_state[j.state] = by_state.get(j.state, 0) + 1
     print(f"db               {cfg.db_path}")
     print(f"mode             {st['mode']}" + (f"  SAFE: {st['safe_reason']}" if st["safe"] else ""))
-    print(f"resident         {', '.join(_short(m) for m in sorted(st['known_resident'] or {})) or '-'}")
+    resident = sorted(st["known_resident"] or {})
+    print("resident         " + (", ".join(
+        f"{_short(m)} ({'gpud' if (owners.get(m) or {}).get('state') == 'owned' else 'loading' if m in owners else 'not gpud'})"
+        for m in resident) or "-"))
     if st["loading"]:
         ld = st["loading"]
         print(f"loading          {_short(ld.get('model'))} (for job {ld.get('for_job')})")
@@ -199,6 +203,8 @@ def cmd_review(cfg, show_all: bool) -> None:
         extra = it.get("verdict_note") or it.get("fail_reason") or ""
         print(f"  [{it['state']:<8}] job {it['job_id']:<5} {_p(it['template_id'], 80)}: {_p(it['brief'], 80)}"
               + (f"  ({_p(extra, 80)})" if extra else ""))
+        if it["state"] == "failed" and it.get("count_note"):
+            print(f"             {it.get('fail_class') or '?'} failure; {_p(it['count_note'], 200)}")
 
 
 def cmd_verdict(cfg, job_id: int, verdict: str, minutes, note) -> None:

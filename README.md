@@ -19,7 +19,7 @@ test suite makes no network calls outside 127.0.0.1 and starts no real model ser
 
 ```bash
 cd foreman
-python3 -m unittest discover -s tests -v     # 271 tests (plus subtests), about 45 to 60 seconds
+python3 -m unittest discover -s tests -v     # 307 tests (plus subtests), about 70 to 90 seconds
 python3 -m foreman.demo                       # narrated timeline: render hangs, brain recovers
 python3 -m foreman.demo --fault crash         # also: garbage, wedged, none
 ```
@@ -63,7 +63,7 @@ pager outage; they now assert the opposite. See [Inverted red-team tests](#inver
 | `tests/test_planner.py` | P1 to P14: templates, parser, every validator reason, EV ordering, budgets across many ticks, no model loads, backoff, suspension, tokens, idempotency, verdicts and kills, retention, untrusted inbound text, CLI and wiring |
 | `tests/test_planner_adversarial.py` | The planner red team's 46 attacks (A to U), all passing unchanged |
 | `tests/test_planner_fixes.py` | X1 to X12: regression tests for the design concerns the planner red team raised |
-| `tests/test_live_fixes.py` | LV1 to LV5: regressions from the planner's first live run (deferred media loads, retracting a verdict) |
+| `tests/test_live_fixes.py` | LV1 to LV13: regressions from the planner's first live run (deferred media loads, retracting a verdict, model provenance, calibrated memory plans, infrastructure failures that do not use caps) |
 
 ## How the brain comes back
 
@@ -177,11 +177,11 @@ because the bad input was persisted and `recover()` walked into it again. Now:
 | I1 | A brainless job without both continuations, or without the goal and expected duration the brief needs, is rejected, including when the brain submits it. Malformed requests (wrong types, prose numbers, an unconfigured engine) are rejected and recorded, never fatal | `I1Admission`, `A1` malformed decisions, unconfigured engine |
 | I2 | After any terminal outcome (success, crash, engine-process crash, hang, slow past hard timeout, garbage, unprobeable output, cancel while running or queued, media load failure, hang or flap, exclusive DeepSeek job, engine lost), exactly one continuation is enqueued, a brain comes back, and the continuation starts within `brain_return_sla_s` + brain load time once a brain can be loaded | `I2ExactlyOnceAndBrainReturn`, `A1`, `A3`, `H7` |
 | I3 | No progress or a hard timeout leads to graceful cancel, then unload, then terminate only if needed, and never a force-kill. The job is marked `failed(timeout)`. A slow but progressing job is not killed, including a few-step model (the progress timeout is per job: the largest of the 120 s floor, 40 % of the expected duration, and 2 declared progress intervals, capped at the hard timeout) and including wall-clock steps | `I3LeaseExpiry`, `A1` cancel raises, `A5`, `A10` |
-| I4 | Killing the supervisor at each of 13 named crash points, at random ticks with downtime, mid-render, between "job finished" and "continuation enqueued", and during `recover()` itself loses no job and never duplicates a continuation. A second gpud on the same DB cannot resurrect a terminal job | `I4SupervisorCrashRecovery`, `A6`, `H3` |
+| I4 | Killing the supervisor at each of 14 named crash points, at random ticks with downtime, mid-render, between "job finished" and "continuation enqueued", and during `recover()` itself loses no job and never duplicates a continuation. A second gpud on the same DB cannot resurrect a terminal job | `I4SupervisorCrashRecovery`, `A6`, `H3` |
 | I5 | Primary retried once, then fallback, then page + SAFE. No load loop (a flapping brain counts as a failed load), and the ladder survives restarts. Every way into SAFE pages a human | `I5BrainLoadLadder`, `A3`, `A7`, `P2` |
 | I6 | Max attempts leads to quarantine + `human_review`, and a request cannot raise `max_attempts`. Identical resubmissions without `retry_of` are counted. The per-lineage failure budget bounds varied resubmissions. A poisoned brain job is quarantined, and the depth limit ends infinite chains. gpud's own deaths are not charged | `I6Poison`, `A4`, `H5` |
 | I7 | The brain is never away longer than `max_brainless_s` when brain loads take their nominal time, even when every chunk of a split batch runs into its hard timeout, even when callers set priorities, and even across wall-clock steps. If loads fail, see the gap below | `I7MaxBrainless`, `A2`, `A5`, `A9` |
-| I8 | Autonomous eviction of an idle, busy, or co-resident brain is detected and the brain is reloaded when needed. Models gpud does not know are sized by the adapter (or assumed to fill the host) and unloaded before planning | `I8Eviction`, `A1` foreign model, `H8` |
+| I8 | Autonomous eviction of an idle, busy, or co-resident brain is detected and the brain is reloaded when needed. Models gpud does not know are sized by the adapter (or assumed to fill the host) and unloaded before planning (simulation default; the Studio pins them). A catalog model gpud did not load itself is someone else's: never unloaded, always counted (see [Which models are gpud's](#which-models-are-gpuds)) | `I8Eviction`, `A1` foreign model, `H8`, `LV6` to `LV8` |
 | I9 | Every resume brief is complete. A stateless brain can rebuild the retry from the brief alone. Artifacts written before a failure, or finished during the cancel grace, are in the brief | `I9ResumeBrief`, `A11`, checks on every continuation in `assert_invariants` |
 | I10 | No adapter exception, malformed adapter result, validator error, malformed decision, pager outage or gpud fault on one job escapes `tick()`. Each becomes a recorded outcome | `A1`, `H1`, `H6`, `H9` (seeded chaos with random gpud kills) |
 
@@ -243,25 +243,69 @@ only `/usr/bin/python3` (3.9 or newer) and the model packs under `~/.mlx-serve/m
 
 ### The Studio deployment (`foreman/studio.py`)
 
-| Role | Model (mlx-serve id) | Plan GB | Notes |
-|---|---|---|---|
-| primary brain, vision | `ddalcu/Qwen3.8-27B-MLX-Serve-4bit` | 24 | qwen3_5 with a vision tower: reviews get sampled frames |
-| fallback brain | `ddalcu/Qwen3.8-Flash-Next-MLX-Serve-iQ-MLX-4.7bpw` | 74 | text only |
-| speech | `ddalcu/Kokoro-82M-MLX-Serve` | 1 | `/v1/audio/speech`, WAV |
-| music | `ddalcu/ACE-Step-1.5-XL-Turbo-MLX-Serve-4bit` | 8 | `/v1/audio/music-generations`, 10 to 600 s |
-| video | `ddalcu/LTX-2.5-MLX-Serve-4bit` | 60 | `/v1/video/generations`, rgb8 frames + pcm audio, 24 fps |
+| Role | Model (mlx-serve id) | Measured resident | Plan GB | Measured load | Plan load s | Notes |
+|---|---|---|---|---|---|---|
+| primary brain, vision | `ddalcu/Qwen3.8-27B-MLX-Serve-4bit` | 18.2 GB (load-model reports 16.95) | 20 | 2 to 6 s, up to 9 | 10 | qwen3_5 with a vision tower: reviews get sampled frames |
+| fallback brain | `ddalcu/Qwen3.8-Flash-Next-MLX-Serve-iQ-MLX-4.7bpw` | 75.3 GB | 77 | not measured | 70 | text only |
+| speech | `ddalcu/Kokoro-82M-MLX-Serve` | about 0.4 GB | 1 | about 1 s | 3 | `/v1/audio/speech`, WAV |
+| music | `ddalcu/ACE-Step-1.5-XL-Turbo-MLX-Serve-4bit` | about 4 GB pack | 6 | 1 to 2 s | 5 | `/v1/audio/music-generations`, 10 to 600 s |
+| video | `ddalcu/LTX-2.5-MLX-Serve-4bit` | 33.1 GB, 35.6 GB during a 5 s 1280x704 render | 40 | 3 to 5 s | 10 | `/v1/video/generations`, rgb8 frames + pcm audio, 24 fps |
 
 Model names are the ids mlx-serve's `--model-dir` discovery gives the packs (`<org>/<repo>`).
 Packs downloaded after the server started are not discovered until a rescan, so the adapter then
 loads them by absolute path, which registers them under the directory basename; both names map
 back to the catalog. FastH3-Omni (MiniMax-H3 derived; its license excludes US users) is not in
-the catalog, and the adapter refuses to load or run anything matching it. Plan sizes are on-disk
-size plus activation headroom; they are estimates, not measurements.
+the catalog, and the adapter refuses to load or run anything matching it.
 
-The policy reserves 96 GB of the 256 GB (macOS, other inference services that live outside
-mlx-serve, and a 40 GB margin), so 160 GB are planned. Models in mlx-serve that are not in the
-catalog (anything the user loaded) are **pinned**: they count against memory and model slots and
-are never unloaded (`Policy.unload_foreign=False`).
+**Plan sizes are calibrated.** The sizes are what mlx-serve's `/api/ps` reported as `size_vram`
+on the Studio (2026-10-26), and for LTX the peak seen during a live render, plus a modest margin;
+load times are the measured wall times with room to spare (gpud counts a load as failed after 3x
+its plan time). The earlier estimates (brain 24 GB / 25 s, LTX 60 GB / 45 s, Flash-Next 74 GB /
+70 s) were too loose: LTX's 60 GB plus the 40 GB headroom made renders wait up to an hour while
+88 to 110 GB were free. A model can still be bigger than its plan (a longer clip, another
+quantization): gpud and the adapter's preflight both plan with the largest size mlx-serve reported
+for the model since the server started whenever that exceeds the catalog number (`model_size_observed`
+is logged when it does), and forget those readings when the server restarts.
+
+The policy reserves 96 GB of the 256 GB (macOS 16 GB, other inference services that live outside
+mlx-serve 40 GB, and the `min_headroom_gb` margin, 40 GB by default), so 160 GB are planned: the
+27B, LTX and someone else's Flash-Next fit together (20 + 40 + 77 GB). `min_headroom_gb` (config,
+or `FOREMAN_MIN_HEADROOM_GB`) sets both the adapter's free-memory preflight and the policy's
+reserve. Models in mlx-serve that gpud did not load (anything the user or another app loaded,
+catalog models included) are **pinned**: they count against memory and model slots and are never
+unloaded (next section).
+
+### Which models are gpud's
+
+gpud records every model it loads itself, durably, in the `model_owners` table, together with
+the mlx-serve server instance it loaded it on (`mlx_serve:process_start_time_seconds` from
+`/metrics`, which changes only when the server restarts; `/metrics.json` is the fallback). A
+resident model gpud did not load is **someone else's**, even when it is in the catalog: it is
+never unloaded or evicted by any gpud path (make room, the model-slot cap, idle release, the
+cleanup after a timeout, an aborted ladder load, the engine-lost orphan cleanup), and it always
+counts in the memory and slot plan. On the Studio this is MLX-Serve.app's default model, which is
+the catalog's fallback brain.
+
+- **Intent first.** Before the load request is sent, gpud commits a `loading` intent. If gpud dies
+  with the request in flight, the next gpud claims the model when it appears on the same server
+  instance within the load's timeout plus 60 s (`model_claimed`); otherwise the intent expires.
+  A load the engine answered as failed (or refused before sending) ends its intent at once, so a
+  copy another client loads right after is theirs.
+- **Ownership ends** when gpud unloads the model, when it observes the model gone
+  (`ownership_dropped`), or when the server instance changes (`engine_instance_changed`): after a
+  restart nothing resident was loaded by gpud, even a model with the same name. A model that comes
+  back without a gpud load is someone else's.
+- **Someone else's brain** may serve gpud's brain jobs read-only (`use_foreign_brains`, on by
+  default; the planner may then plan on it too). gpud never loads a second copy of a model that is
+  resident already, so a media job whose model someone else has loaded runs on their copy, read-only;
+  a timeout's cleanup then skips the unload (`cleanup: foreign`).
+- **Owner override.** `"foreign_models": [...]` in `config.json` lists catalog models that are
+  always someone else's: gpud never loads, unloads or claims them (it may still use a resident one
+  as a brain). Leaving the fallback brain out of the ladder this way means a failing primary ends
+  in SAFE mode instead.
+- **Upgrade.** A database from before provenance is seeded once from its event log: a resident
+  model whose latest event is gpud's own `model_loaded` is gpud's, any other is someone else's
+  (`ownership_seeded`). `status` marks each resident model `gpud` or `not gpud`.
 
 By default the 27B vision brain stays resident while LTX renders: it fits beside LTX (about
 18 + 36 GB), a review starts with no reload, and mlx-serve's GenYield lets it answer chat
@@ -275,7 +319,8 @@ Seven small supervisor features back this deployment. None changes the simulatio
 original tests are untouched): the policy and adapter ones are off by default, and no scripted
 brain returns `human_review` or defers a load.
 
-- `Policy.unload_foreign=False` pins every resident model outside the catalog.
+- `Policy.unload_foreign=False` pins every resident model outside the catalog. Catalog models gpud
+  did not load are pinned whatever this says (provenance, above).
 - `ModelSpec.evicts_brain` (set on LTX by `video_exclusive`) makes the planner unload a brain
   even when it would fit, and never plan a co-resident brain for that model.
 - An adapter may expose `max_resident_models`. The planner then unloads gpud's own idle models
@@ -335,7 +380,9 @@ fields in `foreman/studio.py`, for example `{"video_exclusive": false}`), enviro
 (`FOREMAN_HOME`, `FOREMAN_DB`, `FOREMAN_MLX_URL`, `FOREMAN_MODEL_DIR`, `FOREMAN_VIDEO_EXCLUSIVE`,
 `FOREMAN_MIN_HEADROOM_GB`, `FOREMAN_MAX_RESIDENT_MODELS`, `FOREMAN_FAULT_STALL_AFTER`,
 `FOREMAN_FAULT_KINDS`, `FOREMAN_PROGRESS_TIMEOUT_S`, `FOREMAN_KEEP_RAW_FRAMES`, `FOREMAN_PLANNER`,
-`FOREMAN_PLANNER_INTERVAL_S`, ...), then command-line flags.
+`FOREMAN_PLANNER_INTERVAL_S`, ...), then command-line flags. Provenance has two keys:
+`foreign_models` (catalog models that are always someone else's) and `use_foreign_brains`
+(default true); `min_headroom_gb` (default 40) is the free memory kept beside every load.
 
 The adapter refuses to load a pack whose directory still holds partial download files
 (`*.partial`, `*.partial.parts`, ...): MLX-Serve.app downloads in place, and on the Studio the
@@ -484,20 +531,28 @@ leave gpud stopped.
 - An unload that waits behind a generation is retried each tick. The adapter's `UnloadPending`
   carries `pending = True`, so the supervisor records one `engine_busy` note per wait instead of
   marking the engine down (live: about 12 s while LTX reached its next step boundary).
-- A model loaded by absolute path is matched to the catalog by directory basename. Someone else
-  loading the same pack under the same basename would be taken for Foreman's.
+- A model loaded by absolute path is matched to the catalog by directory basename. That only
+  names it: whether it is Foreman's is decided by provenance, so someone else's copy under the
+  same basename is still someone else's.
+- Provenance cannot tell two loads of the same model apart. If another client loads a model while
+  gpud's own load intent for it is open (the request in flight, or gpud just restarted mid-load),
+  gpud takes that copy for its own. If the server restarts between gpud's once-a-tick instance check
+  and a load request, gpud treats its own load as someone else's: it never unloads it (the safe
+  side). Without `/metrics` the instance is unknown, and only a model observed gone ends ownership.
 - If the user's own models fill every mlx-serve slot, gpud cannot load a brain. It records
   `insufficient_slots` and waits rather than unload them, and it does not page for this.
-- Plan sizes and load times in `foreman/studio.py` are still estimates (they are generous: the
-  measured loads below are 1 to 9 s). The video `expected_s` and the decode budget are now
-  calibrated on the Studio, with other inference services sharing the GPU; heavier contention
-  than that slows renders further.
+- Plan sizes and load times in `foreman/studio.py` are calibrated on the Studio (table above);
+  Flash-Next's load time was not measured and keeps its 70 s estimate. The video `expected_s` and
+  the decode budget are calibrated too, with other inference services sharing the GPU; heavier
+  contention than that slows renders further.
 - A run that a gpud restart interrupts comes back as `failed(interrupted)` and the brain's retry
   counts as an attempt (only a job the engine never saw is requeued uncharged). Three restarts in
   the middle of the same task's renders quarantine it.
 - mlx-serve answers a request that fails validation (for example `steps` outside [1, 100]) with
-  HTTP 400 before any SSE event. The adapter fails the run with the server's message, and the
-  supervisor records it with the generic reason `crash`; the message is in the brief's detail.
+  HTTP 400 before any SSE event. The adapter reports it as `Poll.reason = "rejected"` and the
+  supervisor records reason `rejected` (a content failure for the ledger); the message is in the
+  brief's detail. 404, 408, 409, 423, 429 and the "does not support this modality" answer (a
+  request that reached mlx-serve's default model) are not rejections: they stay `crash`.
 - mlx-serve writes a media stream's headers only when the job reaches its inference thread. A
   request queued behind another client's long generation shows no progress, so it can hit the
   no-progress timeout (at least 120 s) before it starts.
@@ -598,7 +653,9 @@ off) and does nothing until an active template exists in `$FOREMAN_HOME/template
    about 170 MB for 5 s at 768x512), because the disk reading is cached for 10 minutes. Each
    admitted proposal is a gpud job whose priority comes from its EV inside the
    band -99..-1: behind the owner's own CLI submissions and the brain's retries (priority 0), and
-   far behind continuations (100).
+   far behind continuations (100). The caps and the day's review minutes count items queued or in
+   flight, items produced, and items that failed for **content** reasons; an item that failed for
+   **infrastructure** reasons does not count, within a daily budget (next section).
 8. **Errors.** Three invalid ticks in a row (unparseable or schema-violating output, a reply
    whose application raised (`plan_error`), or a plan job that timed out or failed while its
    brain stayed resident) suspend the planner for 1 h and page a human (`planner_suspended`).
@@ -646,9 +703,11 @@ retract` puts an accepted (not yet shipped) or rejected (not yet pruned) item ba
 queue; P(ship) and the kill criteria are computed from the items, so they forget the verdict, and
 a `verdict_retracted` event follows the original one in the log. The scoreboard
 lists, per template, what was admitted, produced, passed by the brain, accepted, rejected and
-shipped, with dollars, review minutes, GPU-hours and P(ship); then GPU-hours and the idle share,
-the five biggest GPU sinks nobody used, rejections by reason code, paused templates and the
-planner's ideas.
+shipped, with dollars, review minutes, GPU-hours, P(ship) and failures split
+infrastructure/content (and how many infrastructure failures did not count); then GPU-hours and
+the idle share, the five biggest GPU sinks nobody used (items still awaiting a verdict, or still
+in flight, are not sinks yet), rejections by reason code, paused templates and the planner's
+ideas.
 
 **Kill criteria (code).** A template is paused, logged as `template_paused` and listed in the
 report, when its acceptance is below 25 % after at least 20 verdicts, when nothing it produced
@@ -669,6 +728,33 @@ the timing estimates and the template's own tunable params inside its bounds (vo
 speech, bpm and instrumental for music, steps for video), and at most `max_attempts` (3) media
 jobs in all. A new kind of job, other words, another model or a longer clip would be work that
 never went through a template, its caps, the review budget or P(ship).
+
+### Infrastructure failures do not use caps
+
+When a planned item's lineage ends without output for review, the ledger classifies the failure
+from its jobs (`ledger.failure_class`):
+
+| Class | Failures | Counts against caps and review minutes |
+|---|---|---|
+| infra | the load failed, or was refused for memory until its deferral expired (`load_failed`); the engine was unreachable or lost (`engine_unreachable`, `engine_lost`, `engine_error`, `engine_unconfigured`); a gpud restart interrupted it (`interrupted`); gpud raised on it (`supervisor_error`); the run crashed or stalled server-side (`crash`, `timeout`); gpud cancelled it while draining or switching modes (`cancelled` with `cancelled_by: gpud`); the brain's review of good output could not run | no, within the template's daily budget |
+| content | a validator failed (black, frozen or silent output: `validator`); the server rejected the request's parameters with a 4xx (`rejected`); the brain's review turned the output down; the owner (or a paused template) cancelled it; anything not listed above | yes |
+
+A lineage with any content failure is content. Weekly caps (`per_week`), `max_stock` and
+`two_week_use` (which count only items queued, awaiting review or accepted anyway) and the day's
+review minutes leave an infrastructure failure out; its GPU time still counts toward the
+speculative and filler shares, for the time it actually ran (a load that failed ran nothing).
+
+**Bounded.** At most `infra_budget_per_day` infrastructure failures per template per day (planner
+option; 0, the default, means the template's own `per_week`, i.e. at most one week's slots handed
+back per day) go uncounted; beyond that they count again, so a persistently failing environment
+fills the week's cap instead of recycling it. Each planned item also keeps gpud's retry limits (at
+most `max_attempts` media jobs per lineage). Every failed item records `fail_class`, whether it
+`counted`, and why (`count_note`, also on the `item_failed` event); `review --all` prints it.
+
+**Restoring slots after an upgrade.** Items the previous version settled carry no
+classification. gpud's next upkeep classifies them from their lineages, oldest failure first, with
+the same rule and budget (`item_classified`). On the Studio this hands back the six ad-clip slots
+the live run's load cascade (jobs 70 to 75) used up before the memory fix: no database edit.
 
 ### Templates and goals
 
@@ -775,7 +861,7 @@ unknown or malformed options stop gpud at startup with the list of known ones.
 | PL1 | Only active, unpaused, owner-written templates produce work. Inbound text, goals and replies cannot add templates or change caps; a plan decision's `submit` is ignored; no request or brain decision can submit a plan job; a paused template's queued work does not start and its retries are refused; inside a planned lineage the brain may only retry the planned job | `P1`, `P4`, `P13`, adversarial `E`, `R`, `X3`, `X4`, `X5` |
 | PL2 | Planning never causes a model load: no resident brain means no tick, a `plan` job never loads a model, and the load/unload sequence of a scenario is identical with and without the planner | `P6`, adversarial `L`, `R` |
 | PL3 | Every rejected proposal is recorded with a reason code from `REASONS`, in `plan_rejections` and the event log; a proposal can only reject itself, never the rest of its tick | `P3`, `assert_logged`, adversarial `A`, `I` |
-| PL4 | Weekly caps, stock, the review budget (with reserved hard-deadline slots) and the speculative and filler shares hold across many ticks; when nothing qualifies, nothing runs | `P5` |
+| PL4 | Weekly caps, stock, the review budget (with reserved hard-deadline slots) and the speculative and filler shares hold across many ticks; when nothing qualifies, nothing runs. Infrastructure failures do not use the caps or the review minutes, within a per-template daily budget; content failures do | `P5`, `LV10`, `LV11` |
 | PL5 | Admission is in EV order, EV <= 0 is never admitted, and planned work queues behind the owner's own submissions | `P4` |
 | PL6 | Backoff doubles after 3 empty ticks up to the cap and resets on an admission; 3 invalid ticks (a reply that crashes its own application included) suspend and page while the queue keeps running; an engine-side loss is not an invalid tick; the daily token budget holds, whatever the reply's length and whatever the wall clock does | `P7`, `P8`, `P9`, adversarial `A`, `P`, `X1`, `X2`, `X6`, `X10` |
 | PL7 | No duplicate job from a re-run tick, a crash inside the application, a fresh gpud, invisible or fullwidth characters, or numerically equal params | `P10`, adversarial `B`, `K` |
@@ -819,18 +905,15 @@ unknown or malformed options stop gpud at startup with the list of known ones.
   and its error is logged.
 - The tests use `ScriptedPlanner` and `FakeEngine` (the adapter test `FakeMlxServe`); the live
   run below is the only check against the real Qwen3.8-27B.
-- `per_week` and the day's review minutes count every item admitted, including one that failed
-  before its media job ever ran. That keeps a template whose jobs keep failing from being
-  re-admitted every few minutes, but an infrastructure failure (the live run's load cascade,
-  before the fix) uses up the week's cap with nothing made. The owner can raise `per_week` in
-  the template file for the week.
+- The failure classification is by reason code. A `timeout` or `crash` is taken for the
+  environment's, so work that deterministically hangs or crashes the engine is retried until the
+  template's daily budget of uncounted failures is used (then it counts). A duplicate brief is
+  still refused after an infrastructure failure: the planner has to propose new content.
 - Proposals are admitted in EV order, so a speculative proposal is measured against the week's
   GPU time before the cheaper committed work admitted later in the same tick is counted; it may
   be refused for its share in one tick and admitted in the next.
-- A model in the catalog that someone else loaded (mlx-serve shows it without gpud having loaded
-  it) counts as gpud's own: it can serve gpud's brain jobs and, if the memory plan ever needs the
-  room, be unloaded. On the Studio this happened to the fallback brain, which another client
-  loaded as mlx-serve's default; the plan has never needed its room.
+- Someone else's resident brain (the Studio's MLX-Serve.app default) can serve planning and
+  reviews read-only (`use_foreign_brains`); turn that off to keep gpud's jobs on its own brains.
 
 ### Planner live on the Studio (2026-10-26)
 
@@ -853,6 +936,12 @@ brain with 0 s wait; no model was loaded for any of them, and no brain was loade
 the run. Each tick cost 2 to 68 s of brain time and 1.9 to 2.8k prompt tokens (23k tokens for the
 day). Renders kept only the MP4, PNG samples, WAV and video.json: 0.5 to 3 MB per clip instead of
 about 330 MB of raw frames.
+
+The run left three issues, fixed since (`LV6` to `LV13`): the cascade's failed loads used up the
+ad clips' weekly cap (they are infrastructure failures now and stop counting on gpud's first
+upkeep after the upgrade); LTX's 60 GB plan kept renders waiting while 88 to 110 GB were free (40
+GB now, from the measured 33 to 36 GB); and the fallback brain someone else had loaded counted as
+gpud's (provenance now records what gpud loads).
 
 ## Known gaps
 
@@ -893,8 +982,10 @@ about 330 MB of raw frames.
   `max_clock_step_s`) is treated as a clock step, so up to that much time is not counted, and a
   backward wall step during downtime means the downtime is not counted. Use `SystemClock`. On
   macOS `time.monotonic()` does not advance during system sleep, and neither do the engines.
-- Memory planning uses catalog sizes. Activation and KV-cache growth are not modeled, and the sizes
-  and load times in `policy.py` are estimates, not measurements.
+- Memory planning uses catalog sizes, or the largest size an engine reported for a model since it
+  started when that is bigger. Activation and KV-cache growth beyond what was already observed are
+  not modeled. The Studio's sizes and load times are measured (`studio.py`); the simulation's in
+  `policy.py` are estimates.
 - Batch checkpoints count toward `max_continuation_depth` (default 32), so very long batches need a
   higher limit.
 - In simulation the validators read simulated metadata. With mlx-serve they read what

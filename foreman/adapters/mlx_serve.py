@@ -51,7 +51,7 @@ import time
 
 from .. import media, retention
 from ..engine import LoadStatus, Poll, RunSpec
-from ..httpio import Cancelled, HttpError, Silence, StreamConn, error_message, json_call, split_url
+from ..httpio import Cancelled, HttpError, Silence, StreamConn, error_message, json_call, split_url, text_call
 from ..policy import CATALOG, ModelSpec, number
 from .sse import Base64FileSink, SseError, SseReader
 
@@ -80,6 +80,22 @@ class RunFailed(Exception):
     """The engine answered, and the answer was a failure."""
 
 
+class RequestRejected(RunFailed):
+    """The server refused the request itself (an HTTP 4xx for its parameters, or a request the
+    adapter cannot even build): a content failure, reported to gpud as Poll.reason 'rejected'."""
+
+
+# 4xx answers that say "not now" or "not this server state" rather than "not these parameters".
+NOT_REJECTIONS = (404, 408, 409, 423, 429)
+
+
+def rejected_status(status: int, message: str) -> bool:
+    """A 4xx that refuses the request's parameters. Not a 404/408/409/423/429, and not the
+    "does not support this modality" answer mlx-serve gives when a request reaches its default
+    model because the target is not resident (an eviction between the check and the request)."""
+    return 400 <= status < 500 and status not in NOT_REJECTIONS and "modality" not in (message or "").lower()
+
+
 class UnloadPending(RuntimeError):
     """The unload request is still draining server-side; gpud retries on a later tick. `pending`
     tells the supervisor this is work in progress, not an engine outage."""
@@ -96,6 +112,25 @@ def video_frames_for(duration_s: float, fps: int = VIDEO_FPS) -> int:
     """LTX wants 8k+1 frames: the closest such count to duration_s at fps (at least 9)."""
     k = max(1, int(round(duration_s * fps / 8.0)))
     return 8 * k + 1
+
+
+def parse_start_time(text: str) -> float | None:
+    """`mlx_serve:process_start_time_seconds <unix seconds>` (or any metric ending in
+    process_start_time_seconds) from a Prometheus text exposition, or None."""
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        name = parts[0].split("{", 1)[0]
+        if name.endswith("process_start_time_seconds") and len(parts) >= 2:
+            try:
+                value = float(parts[1])
+            except ValueError:
+                continue
+            if number(value) is not None and value > 0:
+                return value
+    return None
 
 
 def vm_stat_available_gb(timeout: float = 2.0) -> float | None:
@@ -155,6 +190,7 @@ class _Run:
         self.decode_grace = 0.0
         self.stall_after = None
         self.stalled = False
+        self.reason = None      # 'rejected' for a request the server refused (Poll.reason)
         self.terminal = None    # None | 'complete' | 'error' (the last SSE event seen)
         self.error_msg = None
         self.complete = None    # (fields, streamed) of the complete event
@@ -256,8 +292,10 @@ class MlxServeEngine:
         self._runs: dict[str, _Run] = {}
         self._by_run: dict[str, str] = {}
         self._server_ids: dict[str, str] = {}     # catalog name -> id the server uses for it
-        self._sizes: dict[str, float] = {}        # model -> resident GB (from /api/ps)
+        self._sizes: dict[str, float] = {}        # model -> largest resident GB seen on this server instance
         self._resident: set[str] = set()          # last /api/ps reading, mapped
+        self._instance: str | None = None         # the server's process start time (/metrics)
+        self._instance_retry_at = 0.0             # /metrics unavailable: do not ask again before this
         host = split_url(base_url)[0]
         self._local = host in ("127.0.0.1", "localhost", "::1")
         if self.stall_after is not None:
@@ -329,13 +367,66 @@ class MlxServeEngine:
                 ids[name] = sid
         with self._lock:
             self._resident = current
-            self._sizes.update(sizes)
+            for name, gb in sizes.items():
+                self._note_size(name, gb)
             self._server_ids.update(ids)
         return current
 
+    def _note_size(self, model: str, gb: float) -> None:
+        """Keep the largest size seen (a render grows LTX by a few GB over its resident weights)."""
+        if gb > self._sizes.get(model, 0.0):
+            self._sizes[model] = gb
+
     def model_size_gb(self, model: str) -> float | None:
+        """The largest resident size mlx-serve reported for `model` on this server instance."""
         with self._lock:
             return self._sizes.get(model)
+
+    def plan_gb(self, model: str, spec: ModelSpec) -> float:
+        """Size for the memory preflight: the catalog size, or the largest size observed on this
+        server instance when that is bigger."""
+        with self._lock:
+            return max(spec.size_gb, self._sizes.get(model, 0.0))
+
+    def instance_id(self) -> str | None:
+        """The server process's identity: `mlx_serve:process_start_time_seconds` from /metrics
+        (the Unix time it started; it changes only on a restart), else the same gauge from
+        /metrics.json. A new value means mlx-serve restarted, so the sizes seen on the old
+        process are forgotten. None (never an exception) when neither endpoint gives it; a
+        server without them is not asked again for a minute."""
+        now = time.monotonic()
+        if now < self._instance_retry_at:
+            return self._instance
+        value, missing = None, False
+        try:
+            status, body = self._metrics_text()
+            if status == 200:
+                value = parse_start_time(body)
+            missing = status in (404, 501) or value is None
+        except Exception as e:  # unreachable: say "unknown"; resident_models reports the outage
+            log.debug("could not read /metrics: %s", e)
+            return None
+        if value is None:
+            try:
+                obj = self._get("/metrics.json", timeout=min(2.0, self.call_timeout_s)) or {}
+                gauges = obj.get("gauges") if isinstance(obj, dict) else None
+                value = number((gauges or {}).get("process_start_time_seconds"))
+            except Exception:
+                value = None
+        if value is None:
+            if missing:
+                self._instance_retry_at = now + 60.0
+            return None
+        inst = f"start:{value:.0f}"
+        with self._lock:
+            if self._instance is not None and inst != self._instance:
+                log.warning("mlx-serve restarted (process start %s -> %s)", self._instance, inst)
+                self._sizes.clear()
+            self._instance = inst
+        return inst
+
+    def _metrics_text(self) -> tuple:
+        return text_call(self.base_url, "/metrics", timeout=min(2.0, self.call_timeout_s))
 
     def health(self) -> dict:
         return self._get("/health", timeout=min(3.0, self.call_timeout_s)) or {}
@@ -428,8 +519,9 @@ class MlxServeEngine:
         avail = self.available_gb()
         if avail is None:
             return "cannot measure free memory (vm_stat and /v1/models machine.free_mib both unavailable)", False
-        if avail - spec.size_gb < self.min_headroom_gb:
-            return (f"insufficient headroom: {avail:.1f} GB free, {model} needs ~{spec.size_gb:g} GB and "
+        need = self.plan_gb(model, spec)
+        if avail - need < self.min_headroom_gb:
+            return (f"insufficient headroom: {avail:.1f} GB free, {model} needs ~{need:g} GB and "
                     f"{self.min_headroom_gb:g} GB must stay free"), True
         return None, False
 
@@ -501,7 +593,7 @@ class MlxServeEngine:
                 self._server_ids[op.model] = sid
                 size = number(entry.get("bytes_resident"))
                 if size:
-                    self._sizes[op.model] = size / 1e9
+                    self._note_size(op.model, size / 1e9)
                 if op.state == "loading":
                     op.state = "ready"
                     self._resident.add(op.model)
@@ -563,8 +655,7 @@ class MlxServeEngine:
             raise UnloadPending(f"unload of {model} still draining after {waited:.0f}s")
         with self._lock:
             self._unloads.pop(model, None)
-            if job.ok:
-                self._sizes.pop(model, None)
+            if job.ok:  # the largest size seen stays: it plans the next load of this model
                 self._resident.discard(model)
         if job.unreachable:
             raise ConnectionError(job.error or "mlx-serve unreachable")
@@ -646,7 +737,7 @@ class MlxServeEngine:
                 beat = EVENT_CAP + (DECODE_TOP - EVENT_CAP) * frac
                 if beat > run.progress:
                     run.progress = beat
-            return Poll(run.status, run.progress, run.artifact, run.error, tuple(run.log)[-8:])
+            return Poll(run.status, run.progress, run.artifact, run.error, tuple(run.log)[-8:], run.reason)
 
     def cancel(self, handle: str) -> None:
         with self._lock:
@@ -685,11 +776,12 @@ class MlxServeEngine:
 
     # ---- run threads
 
-    def _finish(self, run: _Run, status: str, artifact=None, error: str | None = None) -> None:
+    def _finish(self, run: _Run, status: str, artifact=None, error: str | None = None,
+                reason: str | None = None) -> None:
         with self._lock:
             if run.status != "running":
                 return
-            run.status, run.artifact, run.error = status, artifact, error
+            run.status, run.artifact, run.error, run.reason = status, artifact, error, reason
             if status == "done":
                 run.progress = 1.0
             run.note(f"{status}" + (f": {error}" if error else ""))
@@ -709,7 +801,7 @@ class MlxServeEngine:
         except Cancelled:
             self._finish(run, "cancelled", error="cancelled (HTTP connection closed)")
         except RunFailed as e:
-            self._finish(run, "failed", error=str(e))
+            self._finish(run, "failed", error=str(e), reason="rejected" if isinstance(e, RequestRejected) else None)
         except Exception as e:
             if run.cancel.is_set():
                 self._finish(run, "cancelled", error="cancelled (HTTP connection closed)")
@@ -758,20 +850,20 @@ class MlxServeEngine:
         if family == "tts":
             text = p.get("input") or p.get("text")
             if not isinstance(text, str) or not text.strip():
-                raise RunFailed("speech job has no 'input' text")
+                raise RequestRejected("speech job has no 'input' text")
             body["input"] = text
         elif family == "music":
             if "duration_seconds" not in body and number(p.get("duration_s")):
                 body["duration_seconds"] = int(round(number(p.get("duration_s"))))
             if not isinstance(body.get("prompt"), str) or not body["prompt"].strip():
-                raise RunFailed("music job has no 'prompt'")
+                raise RequestRejected("music job has no 'prompt'")
         elif family == "video":
             if "num_frames" not in body:
                 body["num_frames"] = video_frames_for(number_or(p.get("duration_s"), 5.0))
             body.setdefault("width", 768)
             body.setdefault("height", 512)
             if not isinstance(body.get("prompt"), str) or not body["prompt"].strip():
-                raise RunFailed("video job has no 'prompt'")
+                raise RequestRejected("video job has no 'prompt'")
         body["model"] = self.server_id(spec.model)
         body["stream"] = True
         return body
@@ -797,7 +889,10 @@ class MlxServeEngine:
                               {"Content-Type": "application/json", "Accept": "text/event-stream"},
                               header_timeout=self.max_silence_s)
         if status != 200:
-            raise RunFailed(f"HTTP {status}: {error_message(conn.read_body(1 << 20))}")
+            message = error_message(conn.read_body(1 << 20))
+            if rejected_status(status, message):
+                raise RequestRejected(f"HTTP {status}: {message}")
+            raise RunFailed(f"HTTP {status}: {message}")
         ctype = conn.headers.get("content-type", "")
         if "text/event-stream" not in ctype:
             raise RunFailed(f"expected an SSE stream, got {ctype!r}: {error_message(conn.read_body(1 << 20))}")

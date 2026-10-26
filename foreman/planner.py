@@ -165,6 +165,10 @@ class PlannerConfig:
     inbox_chars: int = 2000
     recent_outputs: int = 30
     utc: bool = False                      # day boundaries and deadlines in UTC (tests) instead of local time
+    # Infrastructure failures (ledger.INFRA_REASONS) do not count against a template's caps and the
+    # day's review minutes, up to this many per template per day (0: the template's own per_week,
+    # i.e. at most one week's slots handed back per day). Beyond it they count again.
+    infra_budget_per_day: int = 0
 
     @classmethod
     def from_dict(cls, data, **base) -> "PlannerConfig":
@@ -450,7 +454,7 @@ class Planner:
     def _cancel_stale_plans(self, sup, now: float) -> None:
         for job in sup.store.jobs("queued"):
             if job.kind == PLAN_KIND and now - job.created_at >= self.cfg.stale_plan_s:
-                sup._record_terminal(job, {"status": "failed", "reason": "cancelled",
+                sup._record_terminal(job, {"status": "failed", "reason": "cancelled", "cancelled_by": "planner",
                                            "detail": "planner: no brain was resident to run it",
                                            "log_tail": ["planner: stale plan job cancelled (no model is ever "
                                                         "loaded for planning)"]}, now)
@@ -476,6 +480,7 @@ class Planner:
                 continue
             why = f"template {r['template_id']} is paused ({p.get('reason')})"
             sup._record_terminal(job, {"status": "failed", "reason": "cancelled", "detail": why,
+                                       "cancelled_by": "template_paused",
                                        "log_tail": [f"planner: {why}; queued work of a paused template does not start"]},
                                  now)
 
@@ -525,15 +530,40 @@ class Planner:
             raise AdmissionError(f"planned work (template {tid}) already ran {n} media jobs (at most "
                                  f"{sup.p.max_attempts})")
 
+    def infra_budget(self, t) -> int:
+        """Infrastructure failures of template `t` per day that do not count against its caps."""
+        return int(self.cfg.infra_budget_per_day or t.per_week)
+
+    def _count_failure(self, store, it: dict, fail_class: str, why: str, finished_at: float, templates: dict):
+        """(counted, note) for a failed item: a content failure counts; an infrastructure failure
+        does not, while the template's budget for that day (infra_budget) lasts. None for counted
+        when the template is not loaded (decided once it loads; until then the item counts)."""
+        if fail_class != "infra":
+            return 1, f"counted: content failure ({why})"[:300]
+        t = templates.get(it["template_id"])
+        if t is None:
+            return None, f"infrastructure failure ({why}); counted until template {it['template_id']} loads"[:300]
+        budget, day = self.infra_budget(t), self.day_key(finished_at)
+        used = sum(1 for i in ledger.items(store, "failed", template=it["template_id"])
+                   if i["id"] != it["id"] and i.get("fail_class") == "infra" and i.get("counted") == 0
+                   and i.get("finished_at") is not None and self.day_key(i["finished_at"]) == day)
+        if used < budget:
+            return 0, (f"not counted: infrastructure failure ({why}); {used + 1} of {budget} uncounted for "
+                       f"{it['template_id']} on {day}")[:300]
+        return 1, (f"counted: infrastructure failure ({why}), but the {budget} uncounted infrastructure failures "
+                   f"for {it['template_id']} on {day} are used up")[:300]
+
     def sync_items(self, sup, now: float) -> None:
         store = sup.store
         paused = None
+        templates = None
         for it in ledger.items(store, "queued"):
             res = ledger.settle(store, it)
             if res is None:
                 continue
             cols = dict(res)
             state = cols.pop("state")
+            why = cols.pop("fail_why", None)
             if state == "review":
                 paused = ledger.paused_ids(store) if paused is None else paused
                 p = paused.get(it["template_id"])
@@ -541,13 +571,52 @@ class Planner:
                     state = "failed"
                     cols["fail_reason"] = (f"produced after template {it['template_id']} was paused "
                                            f"({p.get('reason')}); not queued for review")[:300]
+                    cols["fail_class"], why = "content", "produced after its template was paused"
             if state == "review":
-                cols["produced_at"] = now
+                cols.update(produced_at=now, counted=1, count_note="counted: produced")
+            else:
+                templates = self.templates()[0] if templates is None else templates
+                cols["counted"], cols["count_note"] = self._count_failure(
+                    store, it, cols.get("fail_class") or "content", why or cols.get("fail_reason") or "", now, templates)
             with store.tx():
                 if ledger.update_item(store, it["id"], expect_state="queued", state=state, finished_at=now, **cols):
-                    store.event(now, "item_ready_for_review" if state == "review" else "item_failed", it["job_id"],
-                                item=it["id"], template=it["template_id"], brain_verdict=res.get("brain_verdict"),
+                    data = dict(item=it["id"], template=it["template_id"], brain_verdict=res.get("brain_verdict"),
                                 reason=res.get("fail_reason"))
+                    if state != "review":
+                        data.update(fail_class=cols.get("fail_class"), counted=cols.get("counted") != 0,
+                                    count_note=cols.get("count_note"))
+                    store.event(now, "item_ready_for_review" if state == "review" else "item_failed", it["job_id"],
+                                **data)
+        self.classify_failed(sup, now, templates)
+
+    def classify_failed(self, sup, now: float, templates=None) -> None:
+        """Failed items settled before failures were classified (or while their template was not
+        loaded) are classified from their lineage now, oldest failure first, with the same rule:
+        an infrastructure failure stops counting against the template's caps and review minutes
+        (within the day's budget). This is how the live run's load-failure cascade hands its weekly
+        slots back without anyone editing the database."""
+        store = sup.store
+        todo = store.conn.execute(
+            "SELECT id FROM plan_items WHERE state = 'failed' AND (fail_class IS NULL OR counted IS NULL) "
+            "ORDER BY COALESCE(finished_at, created_at), id").fetchall()
+        if not todo:
+            return
+        templates = self.templates()[0] if templates is None else templates
+        for row in todo:
+            it = ledger.item(store, row["id"])
+            if it is None:
+                continue
+            cls, why = it.get("fail_class"), None
+            if cls is None:
+                cls, why = ledger.failure_class(store, ledger.lineage_media(store, it))
+            finished = it.get("finished_at") if it.get("finished_at") is not None else it["created_at"]
+            n, note = self._count_failure(store, it, cls, why or it.get("fail_reason") or "", finished, templates)
+            if n is None and it.get("fail_class") == cls:
+                continue  # its template is still not loaded: decided once it is
+            with store.tx():
+                if ledger.update_item(store, it["id"], expect_state="failed", fail_class=cls, counted=n, count_note=note):
+                    store.event(now, "item_classified", it["job_id"], item=it["id"], template=it["template_id"],
+                                fail_class=cls, counted=n != 0, count_note=note)
 
     # ------------------------------------------------------------------ the tick
 
@@ -699,7 +768,8 @@ class Planner:
                 spec_s += measured + pending
             if flags.get("filler"):
                 filler_s += measured + pending
-            if it["created_at"] >= now - 7 * DAY:
+            uncounted = not ledger.counted(it)  # an infrastructure failure inside its template's budget
+            if it["created_at"] >= now - 7 * DAY and not uncounted:
                 week[it["template_id"]] += 1
             if it["state"] in ledger.STOCK_STATES:
                 stock[it["template_id"]] += 1
@@ -709,7 +779,7 @@ class Planner:
                     reserved_awaiting += 1
                 else:
                     awaiting += 1
-            if it.get("created_day") == today:
+            if it.get("created_day") == today and not uncounted:
                 if reserved:
                     reserved_today += 1
                 else:

@@ -15,6 +15,17 @@ same file) see the same numbers. Item state changes are compare-and-set, like jo
 
 P(ship) per template is Beta(prior.alpha + accepts, prior.beta + rejects): only the owner's
 verdicts move it, never the brain's review and never the planner.
+
+A failed item is classified (fail_class). `infra`: the environment failed it (a load failed or
+was refused for memory past its deferral, the engine was unreachable or lost, a gpud restart
+interrupted it, gpud raised on it, the run crashed or timed out server-side, gpud cancelled it
+while draining). `content`: the work itself did not pass (a validator: black, frozen or silent
+output; the server rejected the request's parameters with a 4xx; the brain's review rejected
+it; the owner or a paused template cancelled it). Weekly caps and the day's review minutes
+count queued items, produced items and content failures; an infrastructure failure does not
+count, up to a per-template budget per day (planner.infra_budget), after which it counts again
+so a persistently failing environment cannot recycle the same slots forever. Each failed item
+records whether it counted and why (counted, count_note).
 """
 from __future__ import annotations
 
@@ -25,6 +36,11 @@ from .policy import number
 from .store import TERMINAL, Job
 
 ITEM_JSON = ("params", "flags", "artifacts", "artifact_dirs")
+# Failure reasons of a media job that are the environment's, not the work's (see the module docstring).
+INFRA_REASONS = frozenset({"load_failed", "engine_unreachable", "engine_lost", "engine_error", "engine_unconfigured",
+                           "interrupted", "supervisor_error", "timeout", "crash"})
+# ... and those that are the work's: anything not listed above counts as content (fail closed).
+CONTENT_REASONS = frozenset({"validator", "rejected", "cancelled"})
 STOCK_STATES = ("queued", "review", "accepted")
 LIVE = ("queued", "starting", "running", "cancelling")
 DAY = 86400.0
@@ -204,8 +220,57 @@ def artifact_paths(job: Job) -> list:
     return out
 
 
+def _decision(job: Job) -> dict:
+    art = (job.outcome or {}).get("artifact") if isinstance(job.outcome, dict) else None
+    return art.get("decision") if isinstance(art, dict) and isinstance(art.get("decision"), dict) else {}
+
+
+def failure_class(store, media: list) -> tuple:
+    """('infra' | 'content', why) for an item whose lineage ended without output for review.
+    Content if any media job failed for a content reason, or produced output that the brain's
+    review turned down or a human was handed; infra if every failure was the environment's (a
+    review that could not run is the environment's too)."""
+    content, infra = [], []
+    for j in media:
+        o = j.outcome if isinstance(j.outcome, dict) else {}
+        if j.state == "succeeded":
+            cont = store.continuation(j.id)
+            child = store.job(cont["fired_job_id"]) if cont and cont.get("fired_job_id") else None
+            if child is None or child.state in LIVE:
+                continue
+            if child.requires == "human":
+                content.append(f"job {j.id}'s output was handed to a human")
+            elif child.state != "succeeded":
+                r = (child.outcome or {}).get("reason") if isinstance(child.outcome, dict) else None
+                infra.append(f"the brain's review of job {j.id} could not run ({child.state}: {r})")
+            else:
+                verdict = _decision(child).get("verdict")
+                if verdict not in ("accept", "human_review"):
+                    content.append(f"the brain's review of job {j.id} said {verdict}")
+            continue
+        reason = o.get("reason")
+        if reason == "cancelled" and o.get("cancelled_by") == "gpud":
+            infra.append(f"job {j.id} cancelled by gpud")
+        elif reason in INFRA_REASONS:
+            infra.append(f"job {j.id} {reason}")
+        else:
+            content.append(f"job {j.id} {reason or j.state}")
+    if content:
+        return "content", "; ".join(content)[:300]
+    if infra:
+        return "infra", "; ".join(infra)[:300]
+    return "content", "no media job failed"
+
+
+def counted(it: dict) -> bool:
+    """Does this item count against its template's caps and the day's review minutes? Everything
+    does (queued, produced, judged, content failures) except an uncounted infrastructure failure."""
+    return it.get("counted") != 0
+
+
 def settle(store, it: dict) -> dict | None:
-    """Where an admitted item's lineage ended up, or None while it is still in progress."""
+    """Where an admitted item's lineage ended up, or None while it is still in progress. A failed
+    item also carries its fail_class (failure_class)."""
     rows = store.conn.execute("SELECT * FROM jobs WHERE root_id = ? ORDER BY id", (it["job_id"],)).fetchall()
     media = [j for j in (Job(r) for r in rows) if j.brainless]
     if not media:
@@ -236,9 +301,23 @@ def settle(store, it: dict) -> dict | None:
         why = f"{latest.state} ({o.get('reason')}): {str(o.get('detail') or '')[:160]}"
     elif child.requires == "human":
         why = f"handed to a human: {str((child.payload or {}).get('reason') or '')[:160]}"
+    elif child.state != "succeeded":
+        o = child.outcome if isinstance(child.outcome, dict) else {}
+        why = f"the brain's review could not run ({child.state}: {o.get('reason')})"
     else:
         why = f"the brain's review said {verdict}: {(note or '')[:160]}"
-    return dict(common, state="failed", fail_reason=why[:300], artifacts=artifact_paths(latest))
+    cls, cls_why = failure_class(store, media)
+    return dict(common, state="failed", fail_reason=why[:300], artifacts=artifact_paths(latest),
+                fail_class=cls, fail_why=cls_why)
+
+
+def lineage_media(store, it: dict) -> list:
+    rows = store.conn.execute("SELECT * FROM jobs WHERE root_id = ? ORDER BY id", (it["job_id"],)).fetchall()
+    media = [j for j in (Job(r) for r in rows) if j.brainless]
+    if not media:
+        job = store.job(it["job_id"])
+        media = [job] if job is not None else []
+    return media
 
 
 def review_queue(store) -> list:
@@ -348,7 +427,12 @@ def template_stats(store, templates: dict, now: float, gpu_by_root: dict | None 
             produced = [i for i in its if i.get("produced_at") is not None and i["produced_at"] >= lo]
             judged = [i for i in its if i.get("verdict_at") is not None and i["verdict_at"] >= lo]
             shipped = [i for i in its if i.get("shipped_at") is not None and i["shipped_at"] >= lo]
+            failed = [i for i in its if i["state"] == "failed" and i.get("finished_at") is not None
+                      and i["finished_at"] >= lo]
             return {"admitted": sum(1 for i in its if i["created_at"] >= lo), "produced": len(produced),
+                    "failed_infra": sum(1 for i in failed if i.get("fail_class") == "infra"),
+                    "failed_content": sum(1 for i in failed if i.get("fail_class") != "infra"),
+                    "uncounted": sum(1 for i in its if i["created_at"] >= lo and not counted(i)),
                     "brain_accepted": sum(1 for i in produced if i.get("brain_verdict") == "accept"),
                     "accepted": sum(1 for i in judged if i["verdict"] == "accept"),
                     "rejected": sum(1 for i in judged if i["verdict"] == "reject"),
@@ -360,7 +444,7 @@ def template_stats(store, templates: dict, now: float, gpu_by_root: dict | None 
         post = posterior(t, its) if t is not None else None
         out[tid] = {"7d": window(7), "28d": window(28),
                     "stock": sum(1 for i in its if i["state"] in STOCK_STATES),
-                    "week": sum(1 for i in its if i["created_at"] >= now - 7 * DAY),
+                    "week": sum(1 for i in its if i["created_at"] >= now - 7 * DAY and counted(i)),
                     "awaiting_review": sum(1 for i in its if i["state"] == "review"),
                     "p_ship": round(post[2], 4) if post else None,
                     "verdicts": sum(1 for i in its if i.get("verdict"))}

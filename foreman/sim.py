@@ -59,7 +59,7 @@ class CrashAt:
 
 @dataclass(frozen=True)
 class Behaviour:
-    mode: str = "success"         # success | hang | slow | crash | garbage
+    mode: str = "success"         # success | hang | slow | crash | garbage | reject
     at: float = 0.4               # progress fraction where a hang or crash happens
     factor: float = 1.0           # slow: duration multiplier (still reports progress)
     artifact: dict = field(default_factory=dict)  # garbage: artifact overrides
@@ -85,6 +85,12 @@ def crash_mid_job(at: float = 0.5, restart_engine: bool = False) -> Behaviour:
 
 def garbage(**artifact) -> Behaviour:
     return Behaviour("garbage", artifact=artifact)
+
+
+def reject() -> Behaviour:
+    """The server refuses the request's parameters at once (mlx-serve: an HTTP 400 before any
+    event), reported as Poll.reason 'rejected'."""
+    return Behaviour("reject")
 
 
 _GARBAGE = {"video": {"black_frame_ratio": 1.0}, "music": {"silence_ratio": 1.0},
@@ -174,6 +180,7 @@ class _Run:
     error: str | None = None
     cancel_at: float | None = None
     lost: bool = False
+    reason: str | None = None
     log: list = field(default_factory=list)
 
 
@@ -197,6 +204,7 @@ class FakeEngine:
         self.terminate_fails = False
         self.restarts = 0
         self.artifacts_dir: str | None = None  # set: media runs write small real files under it
+        self.observed_gb: dict[str, float] = {}  # model -> real resident size, when it differs from the catalog
 
     # ---- test-side scripting ----
     def script_jobs(self, kind: str, *behaviours: Behaviour) -> None:
@@ -206,6 +214,23 @@ class FakeEngine:
         """Queue load outcomes for a model: 'ok', 'fail', 'hang' or 'defer' (refused for now, as
         mlx-serve's adapter does when the host lacks free memory: LoadStatus.deferred)."""
         self._load_scripts[model].extend(outcomes)
+
+    def load_as_other_client(self, model: str) -> None:
+        """Someone else (another app, the server's own default model) loads `model` now, behind
+        gpud's back: it is resident at once and gpud never asked for it."""
+        self._sync()
+        self.calls.append((self.clock.now(), "other_client_load", model))
+        self._models.add(model)
+
+    def server_restart(self) -> None:
+        """The server process restarts by itself (an update, a crash, its app relaunching it):
+        everything resident is gone and a new instance id is reported."""
+        self.calls.append((self.clock.now(), "server_restart", ""))
+        self._restart("server restarted")
+
+    def instance_id(self) -> str:
+        """Optional Engine extension: the server process identity (changes on every restart)."""
+        return f"{self.name}-boot-{self.restarts}"
 
     def evict(self, model: str) -> None:
         """The engine drops a model on its own (memory pressure, idle TTL, ...)."""
@@ -223,14 +248,19 @@ class FakeEngine:
         self._restart("operator force restart")
 
     def model_size_gb(self, model: str) -> float | None:
-        """Optional Engine extension: footprint of a model gpud's catalog may not know."""
+        """Optional Engine extension: the resident footprint the server reports for a model."""
+        if model in self.observed_gb:
+            return self.observed_gb[model]
         spec = self.catalog.get(model)
         return spec.size_gb if spec else None
 
+    def _real_gb(self, model: str) -> float:
+        return self.observed_gb.get(model, self.catalog[model].size_gb)
+
     def memory_gb(self) -> float:
         self._sync()
-        loading = sum(self.catalog[l.model].size_gb for l in self._loads.values() if l.state == "loading")
-        return sum(self.catalog[m].size_gb for m in self._models) + loading
+        loading = sum(self._real_gb(l.model) for l in self._loads.values() if l.state == "loading")
+        return sum(self._real_gb(m) for m in self._models) + loading
 
     # ---- Engine interface ----
     def resident_models(self) -> set[str]:
@@ -246,7 +276,7 @@ class FakeEngine:
         self.calls.append((now, "load", model))
         self._seq += 1
         ticket = f"{self.name}-load-{self._seq}"
-        size = self.catalog[model].size_gb
+        size = self._real_gb(model)
         if self.host.used_gb() + size > self.host.capacity_gb:
             self.host.oom.append((now, self.name, model))
             op = _Load(ticket, model, now, now, "oom", state="failed", error="out of memory")
@@ -298,6 +328,9 @@ class FakeEngine:
         run = _Run(handle, spec, behaviour, now, duration)
         if spec.model not in self._models:
             run.state, run.error = "failed", f"model {spec.model} not loaded"
+        elif behaviour.mode == "reject":
+            run.state, run.reason = "failed", "rejected"
+            run.error = "HTTP 400: steps must be between 1 and 100 (simulated)"
         self._runs[handle] = run
         self._by_run[spec.run_id] = handle
         return handle
@@ -311,7 +344,7 @@ class FakeEngine:
         run = self._runs.get(handle)
         if run is None or run.lost:
             return Poll("lost", log_tail=tuple(run.log[-5:]) if run else ())
-        return Poll(run.state, run.progress, run.artifact, run.error, tuple(run.log[-5:]))
+        return Poll(run.state, run.progress, run.artifact, run.error, tuple(run.log[-5:]), run.reason)
 
     def cancel(self, handle: str) -> None:
         self._sync()

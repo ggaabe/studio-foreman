@@ -14,7 +14,7 @@ from contextlib import contextmanager
 TERMINAL = ("succeeded", "failed", "quarantined")
 ACTIVE = ("starting", "running", "cancelling")
 _JOB_JSON = ("payload", "outcome", "pending_outcome")
-_STATE_JSON = ("ladder", "loading", "known_resident", "engine_health", "orphans")
+_STATE_JSON = ("ladder", "loading", "known_resident", "engine_health", "orphans", "instances", "observed_gb")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -109,9 +109,29 @@ CREATE TABLE IF NOT EXISTS supervisor_state (
   boot_count      INTEGER NOT NULL DEFAULT 0,     -- also the leader epoch (fencing token)
   t_now           REAL,                           -- last supervisor time
   t_wall          REAL,                           -- wall clock at t_now
-  t_mono          REAL                            -- monotonic source reading at t_now
+  t_mono          REAL,                           -- monotonic source reading at t_now
+  instances       TEXT NOT NULL DEFAULT '{}',     -- {engine: server instance id} (a change = restart)
+  observed_gb     TEXT NOT NULL DEFAULT '{}',     -- {model: {gb, engine, instance}}: largest size seen
+  owners_init     INTEGER NOT NULL DEFAULT 0      -- model_owners was seeded (once, from the event log)
 );
 INSERT OR IGNORE INTO supervisor_state (id) VALUES (1);
+
+-- Provenance: every model gpud itself loaded. A resident catalog model with no row here was
+-- loaded by someone else (another client, the server's own default): gpud never unloads it.
+-- The intent ('loading') is written before the load request is sent, so a gpud that dies with
+-- the request in flight can still claim the model when it appears; ownership ends when gpud
+-- unloads the model, observes it gone, or sees the server restart (its instance changed).
+CREATE TABLE IF NOT EXISTS model_owners (
+  model     TEXT PRIMARY KEY,
+  engine    TEXT NOT NULL,
+  state     TEXT NOT NULL,                        -- loading (request about to be / being sent) | owned
+  instance  TEXT,                                 -- the engine's server instance when recorded
+  boot      INTEGER,                              -- gpud leader epoch that sent the load request
+  since     REAL NOT NULL,                        -- supervisor time the intent was recorded
+  owned_at  REAL,
+  job_id    INTEGER,
+  note      TEXT
+);
 
 -- The planner (foreman/planner.py). Its own state is persisted here so a restarted gpud (or a
 -- fresh Planner object) carries on with the same schedule, backoff, budget and suspension.
@@ -163,6 +183,9 @@ CREATE TABLE IF NOT EXISTS plan_items (
   hard_deadline   INTEGER NOT NULL DEFAULT 0,
   reserved_slot   INTEGER NOT NULL DEFAULT 0,    -- admitted into a reserved hard-deadline review slot
   rationale       TEXT,
+  fail_class      TEXT,                          -- a failed item: infra (the environment) | content
+  counted         INTEGER,                       -- 0: not counted against caps and review minutes (NULL counts)
+  count_note      TEXT,                          -- why it did or did not count
   created_at      REAL NOT NULL,
   created_wall    REAL,
   created_day     TEXT,
@@ -217,9 +240,12 @@ _MIGRATIONS = {
     "supervisor_state": [("safe_engine", "TEXT"), ("brainless_epoch", "INTEGER NOT NULL DEFAULT 0"),
                          ("engine_health", "TEXT NOT NULL DEFAULT '{}'"),
                          ("orphans", "TEXT NOT NULL DEFAULT '[]'"),
-                         ("t_now", "REAL"), ("t_wall", "REAL"), ("t_mono", "REAL")],
+                         ("t_now", "REAL"), ("t_wall", "REAL"), ("t_mono", "REAL"),
+                         ("instances", "TEXT NOT NULL DEFAULT '{}'"), ("observed_gb", "TEXT NOT NULL DEFAULT '{}'"),
+                         ("owners_init", "INTEGER NOT NULL DEFAULT 0")],
     "planner_state": [("engine_fail_streak", "INTEGER NOT NULL DEFAULT 0")],
-    "plan_items": [("reserved_slot", "INTEGER NOT NULL DEFAULT 0")],
+    "plan_items": [("reserved_slot", "INTEGER NOT NULL DEFAULT 0"), ("fail_class", "TEXT"), ("counted", "INTEGER"),
+                   ("count_note", "TEXT")],
 }
 
 
@@ -493,6 +519,20 @@ class Store:
         if isinstance(d["known_resident"], list):  # pre-migration format: a bare list of models
             d["known_resident"] = {m: None for m in d["known_resident"]}
         return d
+
+    # ---- model provenance (models gpud itself loaded)
+    def owners(self) -> dict:
+        return {r["model"]: dict(r) for r in self.conn.execute("SELECT * FROM model_owners ORDER BY model")}
+
+    def set_owner(self, model: str, **cols) -> None:
+        cols["model"] = model
+        names, marks = ", ".join(cols), ", ".join("?" * len(cols))
+        sets = ", ".join(f"{k} = excluded.{k}" for k in cols if k != "model")
+        self.conn.execute(f"INSERT INTO model_owners ({names}) VALUES ({marks}) "
+                          f"ON CONFLICT(model) DO UPDATE SET {sets}", tuple(cols.values()))
+
+    def drop_owner(self, model: str) -> bool:
+        return self.conn.execute("DELETE FROM model_owners WHERE model = ?", (model,)).rowcount == 1
 
     def set_state(self, **cols) -> None:
         for key in _STATE_JSON:
