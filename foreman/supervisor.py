@@ -180,7 +180,7 @@ def _load_status(result) -> LoadStatus:
     if state not in ("loading", "ready", "failed"):
         raise TypeError(f"poll_load() returned {result!r}")
     err = getattr(result, "error", None)
-    return LoadStatus(state, None if err is None else str(err))
+    return LoadStatus(state, None if err is None else str(err), getattr(result, "deferred", False) is True)
 
 
 def _poll(result) -> Poll:
@@ -940,14 +940,18 @@ class Supervisor:
                 return self._load_failed(load, "engine reported the load ready but the model is not resident", now)
             ladder = st["ladder"]
             ladder.get("failures", {}).pop(model, None)
+            waited = ladder.get("deferred", {}).pop(model, None)
             known = self._known(st)
             known[model] = name
+            extra = {"deferred_s": round(now - float(waited.get("since", now)), 1)} if waited else {}
             with self.store.tx():
                 self.store.set_state(loading=None, ladder=ladder, known_resident=known)
                 self.store.event(now, "model_loaded", load.get("for_job"), model=model, engine=name,
-                                 took_s=now - load["started_at"])
+                                 took_s=now - load["started_at"], **extra)
             self._resident[model] = name
             return
+        if status.state == "failed" and status.deferred and not self._is_brain(model):
+            return self._load_deferred(load, status.error or "the engine deferred the load", now)
         if status.state == "loading" and now - load["started_at"] <= limit:
             return
         reason = status.error or f"load did not finish within {limit:.0f}s"
@@ -973,6 +977,44 @@ class Supervisor:
             if load:
                 self.store.set_state(loading=None)
                 self.store.event(now, "load_abandoned", load.get("for_job"), model=load.get("model"), reason=reason)
+
+    def _load_deferred(self, load: dict, reason: str, now: float) -> None:
+        """The engine refused a media model's load for now (LoadStatus.deferred: the host lacks
+        free memory beside its other tenants, or a model slot). That is not a failed load: the job
+        waiting on it stays queued, and the model is not tried again before a backoff
+        (Policy.load_defer_s, doubling up to load_defer_max_backoff_s). Without this a transient
+        memory dip failed every queued job of that model in turn, seconds apart, and each retry
+        unloaded and reloaded other models around it. A wait longer than load_defer_max_s fails
+        the job the load was for (its on_failure fires), one job per such wait. A brain's refusal
+        is a failed load as before, so the ladder moves to a brain that fits."""
+        model = load["model"]
+        st = self.store.state()
+        ladder = st["ladder"]
+        waits = ladder.setdefault("deferred", {})
+        w = waits.get(model) if isinstance(waits.get(model), dict) else {}
+        since = number(w.get("since"))
+        since = now if since is None else since
+        n = int(number(w.get("n")) or 0) + 1
+        waited = max(0.0, now - since)
+        delay = min(self.p.load_defer_max_backoff_s, self.p.load_defer_s * 2 ** min(n - 1, 20))
+        for_job = load.get("for_job")
+        with self.store.tx():
+            if waited >= self.p.load_defer_max_s:
+                waits.pop(model, None)  # the next job that needs the model waits afresh
+                self.store.set_state(loading=None, ladder=ladder)
+                self.store.event(now, "load_failed", for_job, model=model, attempt=n, reason=reason[:300],
+                                 deferred_s=round(waited, 1))
+                job = self.store.job(for_job) if for_job else None
+                if job and job.state == "queued":
+                    self._record_terminal(job, failed(
+                        "load_failed", f"{model}: deferred for {waited:.0f}s: {reason}",
+                        [f"supervisor: {model} could not be loaded for {waited:.0f}s ({reason})"]), now)
+                return
+            waits[model] = {"since": since, "n": n, "until": now + delay, "reason": str(reason)[:300]}
+            self.store.set_state(loading=None, ladder=ladder)
+            if n & (n - 1) == 0:  # 1st, 2nd, 4th, 8th, ...: a long wait is logged on a log scale
+                self.store.event(now, "load_deferred", for_job, model=model, deferrals=n, retry_in_s=delay,
+                                 waited_s=round(waited, 1), reason=str(reason)[:300])
 
     def _load_failed(self, load: dict, reason: str, now: float) -> None:
         """Retry each model once; a brain that fails twice is skipped (the ladder moves down);
@@ -1762,6 +1804,9 @@ class Supervisor:
             return True
         if not self._avail(name):
             return False
+        wait = ((st.get("ladder") or {}).get("deferred") or {}).get(model)
+        if isinstance(wait, dict) and model not in self._resident and now < (number(wait.get("until")) or 0.0):
+            return False  # the engine deferred this model's load (free memory): wait out the backoff, unload nothing
         target, co_brain = self._plan_media(model, now, st)
         if co_brain is None and st["brainless_since"] is not None:
             away, est = now - st["brainless_since"], self._brainless_estimate(job, model)

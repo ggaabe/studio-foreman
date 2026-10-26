@@ -19,7 +19,7 @@ test suite makes no network calls outside 127.0.0.1 and starts no real model ser
 
 ```bash
 cd foreman
-python3 -m unittest discover -s tests -v     # 204 tests (plus subtests), about 45 to 60 seconds
+python3 -m unittest discover -s tests -v     # 270 tests (plus subtests), about 45 to 60 seconds
 python3 -m foreman.demo                       # narrated timeline: render hangs, brain recovers
 python3 -m foreman.demo --fault crash         # also: garbage, wedged, none
 ```
@@ -63,6 +63,7 @@ pager outage; they now assert the opposite. See [Inverted red-team tests](#inver
 | `tests/test_planner.py` | P1 to P14: templates, parser, every validator reason, EV ordering, budgets across many ticks, no model loads, backoff, suspension, tokens, idempotency, verdicts and kills, retention, untrusted inbound text, CLI and wiring |
 | `tests/test_planner_adversarial.py` | The planner red team's 46 attacks (A to U), all passing unchanged |
 | `tests/test_planner_fixes.py` | X1 to X12: regression tests for the design concerns the planner red team raised |
+| `tests/test_live_fixes.py` | LV1 to LV4: regressions from the planner's first live run (deferred media loads) |
 
 ## How the brain comes back
 
@@ -270,9 +271,9 @@ resident against 68-82 s with it unloaded, and the review started 0 s after the 
 brain-return path each time (that is how the live scenarios below were run) or frees memory on
 a smaller machine.
 
-Six small supervisor features back this deployment. None changes the simulation (its 104
+Seven small supervisor features back this deployment. None changes the simulation (its 104
 original tests are untouched): the policy and adapter ones are off by default, and no scripted
-brain returns `human_review`.
+brain returns `human_review` or defers a load.
 
 - `Policy.unload_foreign=False` pins every resident model outside the catalog.
 - `ModelSpec.evicts_brain` (set on LTX by `video_exclusive`) makes the planner unload a brain
@@ -285,6 +286,12 @@ brain returns `human_review`.
   in mlx-serve's slots and memory.
 - An adapter exception with `pending = True` (the mlx-serve adapter's `UnloadPending`) means
   "still working on it": the caller retries next tick and the engine stays healthy.
+- A load whose `LoadStatus` is `deferred` (the adapter's memory or slot refusal) keeps a media
+  job queued: the model is retried after `Policy.load_defer_s` (15 s), doubling up to
+  `load_defer_max_backoff_s` (5 min), nothing is unloaded for it in between, other models' jobs
+  run meanwhile, and only a wait over `load_defer_max_s` (1 h) fails the job it was for, one job
+  per such wait. A brain's deferred load is a failed load, so the ladder still moves. Found live:
+  a memory dip below LTX's headroom failed seven queued renders in 40 s (see below).
 
 ### Run it
 
@@ -371,9 +378,13 @@ Checked against the v26.10.3 source and, read-only, against the live server:
   with `POST /v1/load-model {"model": <yours>, "default": true}`. That pins it, so later loads
   cannot take it again. Turn this off with `preserve_default=False`.
 - `load()`: `POST /v1/load-model` blocks until the model is ready, so it runs on a thread
-  behind a ticket. Before sending it, the adapter refuses the load (a failed ticket, which moves
-  the brain ladder or fails the media job) when free memory minus the model's size would drop
-  below 40 GB, or when mlx-serve already holds `--max-resident-models` (3) models. Free memory
+  behind a ticket. Before sending it, the adapter refuses the load when free memory minus the
+  model's size would drop below 40 GB, or when mlx-serve already holds `--max-resident-models`
+  (3) models. Such a refusal says "not now", so its ticket is marked `deferred`: a brain's
+  deferred load is a failed load (the ladder moves to a brain that fits), but a media job keeps
+  waiting in the queue and gpud tries the load again after 15 s, doubling up to 5 min, without
+  unloading anything in between; only a wait over 1 h fails the job (`Policy.load_defer_*`). An
+  incomplete pack or an unreadable memory probe is refused outright (a failed load). Free memory
   is `vm_stat` free + inactive + speculative pages x page size, and the server's own
   `machine.free_mib`; the smaller wins. gpud's planner also reads `max_resident_models` and frees
   a slot itself, unloading its own idle models (media first), so mlx-serve's LRU never picks a

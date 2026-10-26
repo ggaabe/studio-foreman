@@ -43,6 +43,9 @@ class Poll:
 class LoadStatus:
     state: str           # loading | ready | failed
     error: str | None = None
+    # failed only for now: the engine refused the load because the host lacks free memory (or a
+    # model slot) at the moment. gpud keeps a media job waiting instead of failing it.
+    deferred: bool = False
 
 
 class Engine(Protocol):

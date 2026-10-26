@@ -123,6 +123,7 @@ class _Load:
     def __init__(self, ticket: str, model: str, timeout_s: float):
         self.ticket, self.model, self.timeout_s = ticket, model, timeout_s
         self.state, self.error = "loading", None
+        self.deferred = False   # refused for now (free memory, a model slot): gpud retries later
         self.conn: StreamConn | None = None
         self.started = time.monotonic()
 
@@ -385,13 +386,13 @@ class MlxServeEngine:
                     return op.ticket
             ticket = f"{self.name}-load-{next(self._seq)}-{self._boot}"
         op = _Load(ticket, model, max(60.0, spec.load_s * self.load_timeout_factor + 60.0))
-        problem = None if model in resident else self._preload_problem(model, spec, resident)
+        problem, deferred = (None, False) if model in resident else self._preload_problem(model, spec, resident)
         with self._lock:
             self._loads[ticket] = op
             if problem:
-                op.state, op.error = "failed", problem
+                op.state, op.error, op.deferred = "failed", problem, deferred
         if problem:
-            log.warning("load of %s refused: %s", model, problem)
+            log.warning("load of %s %s: %s", model, "deferred" if deferred else "refused", problem)
             return ticket
         threading.Thread(target=self._load_main, args=(op,), name=f"foreman-load-{model}", daemon=True).start()
         return ticket
@@ -412,22 +413,25 @@ class MlxServeEngine:
         return (f"{model} is still downloading ({len(partial)} partial file(s) in {self.model_path(model)}, "
                 f"e.g. {partial[0]}); refusing to load an incomplete pack")
 
-    def _preload_problem(self, model: str, spec: ModelSpec, resident: set) -> str | None:
+    def _preload_problem(self, model: str, spec: ModelSpec, resident: set) -> tuple:
+        """(reason to refuse the load, deferred) or (None, False). `deferred` marks a refusal that
+        says "not now" rather than "not this model": too little free memory beside the host's other
+        tenants, or every mlx-serve slot taken. gpud then keeps a media job waiting and retries."""
         partial = self.incomplete_pack(model)
         if partial:
-            return partial
+            return partial, False
         cap = self.max_resident_models
         if cap and len(resident) >= cap:
             return (f"mlx-serve already holds {len(resident)} models (--max-resident-models {cap}); loading "
                     f"{model} would make it LRU-evict one, possibly a model Foreman does not own: "
-                    f"{sorted(resident)}")
+                    f"{sorted(resident)}"), True
         avail = self.available_gb()
         if avail is None:
-            return "cannot measure free memory (vm_stat and /v1/models machine.free_mib both unavailable)"
+            return "cannot measure free memory (vm_stat and /v1/models machine.free_mib both unavailable)", False
         if avail - spec.size_gb < self.min_headroom_gb:
             return (f"insufficient headroom: {avail:.1f} GB free, {model} needs ~{spec.size_gb:g} GB and "
-                    f"{self.min_headroom_gb:g} GB must stay free")
-        return None
+                    f"{self.min_headroom_gb:g} GB must stay free"), True
+        return None, False
 
     def _load_target(self, model: str) -> str:
         """The id to send to /v1/load-model: the discovered id if the server lists one, else the
@@ -524,7 +528,7 @@ class MlxServeEngine:
             op = self._loads.get(ticket)
             if op is None:
                 return LoadStatus("failed", "unknown load ticket (issued by an earlier gpud process)")
-            return LoadStatus(op.state, op.error)
+            return LoadStatus(op.state, op.error, op.deferred)
 
     # ------------------------------------------------------------------ unload / terminate
 

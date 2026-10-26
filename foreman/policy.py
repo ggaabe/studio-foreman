@@ -87,6 +87,9 @@ class Policy:
     page_backoff_max_s: float = 60.0       # pager retry backoff ceiling
     unload_foreign: bool = True            # False: models outside the catalog are pinned, never unloaded
     idle_media_unload_s: float | None = None  # unload gpud's idle media models after the queue is empty this long
+    load_defer_s: float = 15.0             # a media load the engine deferred (free memory) is retried after this,
+    load_defer_max_backoff_s: float = 300.0  # ... doubling up to this,
+    load_defer_max_s: float = 3600.0       # ... and the job waiting on it fails once the wait exceeds this
 
     @property
     def usable_gb(self) -> float:

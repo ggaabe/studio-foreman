@@ -155,7 +155,7 @@ class _Load:
     model: str
     started: float
     done_at: float
-    outcome: str                  # ok | fail | hang | oom
+    outcome: str                  # ok | fail | hang | oom | defer
     state: str = "loading"
     error: str | None = None
 
@@ -203,7 +203,8 @@ class FakeEngine:
         self._job_scripts[kind].extend(behaviours)
 
     def script_loads(self, model: str, *outcomes: str) -> None:
-        """Queue load outcomes for a model: 'ok', 'fail' or 'hang'."""
+        """Queue load outcomes for a model: 'ok', 'fail', 'hang' or 'defer' (refused for now, as
+        mlx-serve's adapter does when the host lacks free memory: LoadStatus.deferred)."""
         self._load_scripts[model].extend(outcomes)
 
     def evict(self, model: str) -> None:
@@ -251,6 +252,11 @@ class FakeEngine:
             op = _Load(ticket, model, now, now, "oom", state="failed", error="out of memory")
         else:
             outcome = self._load_scripts[model].popleft() if self._load_scripts[model] else "ok"
+            if outcome == "defer":
+                op = _Load(ticket, model, now, now, outcome, state="failed",
+                           error="insufficient headroom (scripted): not enough free memory right now")
+                self._loads[ticket] = op
+                return ticket
             load_s = self.catalog[model].load_s * (0.5 if outcome == "fail" else 1.0)
             op = _Load(ticket, model, now, now + load_s, outcome)
         self._loads[ticket] = op
@@ -261,7 +267,7 @@ class FakeEngine:
         op = self._loads.get(ticket)
         if op is None:
             return LoadStatus("failed", "unknown ticket")
-        return LoadStatus(op.state, op.error)
+        return LoadStatus(op.state, op.error, op.outcome == "defer")
 
     def unload(self, model: str) -> bool:
         self._sync()
