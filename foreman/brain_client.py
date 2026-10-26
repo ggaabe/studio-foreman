@@ -218,6 +218,11 @@ class BrainClient:
         vision = bool(getattr(ctx.spec, "vision", False)) if ctx is not None else \
             bool(getattr(self.catalog.get(model), "vision", False))
         messages = self.messages(kind, brief, vision)
+        if ctx is not None:
+            content = messages[-1].get("content")
+            n = sum(1 for part in content if isinstance(part, dict) and part.get("type") == "image_url") \
+                if isinstance(content, list) else 0
+            ctx.log(f"asking {ctx.server_model} ({'vision' if vision else 'text'}) with {n} image(s) attached")
         raw = self.chat(model, messages, ctx)
         reply = parse_json_object(raw)
         decision = decide(reply, brief, self.catalog, raw)

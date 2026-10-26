@@ -154,6 +154,11 @@ class _Run:
         self.complete = None    # (fields, streamed) of the complete event
         self.dir = None
         self._progress_line = False
+        self.t0 = time.monotonic()
+        self.timings: dict = {}  # stage -> seconds since start when it was first seen
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self.t0
 
     def note(self, line: str, progress: bool = False) -> None:
         """Append to the log tail; consecutive progress lines of one stage replace each other."""
@@ -775,6 +780,9 @@ class MlxServeEngine:
             raise ConnectionError(f"stream ended after {run.events} progress events without a complete or "
                                   f"error event")
         artifact = self._artifact(run)
+        run.timings["artifact"] = round(run.elapsed(), 1)
+        artifact["timings_s"] = dict(run.timings)
+        log.info("run %s timings %s", run.spec.run_id, run.timings)
         self._finish(run, "done", artifact=artifact)
 
     def _bump(self, run: _Run, mapped: float) -> None:
@@ -796,7 +804,10 @@ class MlxServeEngine:
                 frac = step / total if step is not None and total else None
                 self._bump(run, 0.9 * max(0.0, min(1.0, frac)) if frac is not None else 0.0)
                 line = f"{stage} {int(step) if step is not None else '?'}/{int(total) if total else '?'}"
-                run.note(line, progress=run.stage == stage)
+                if stage != run.stage:
+                    run.timings.setdefault(stage or "?", round(run.elapsed(), 1))
+                    log.info("run %s: %s at +%.1fs", run.spec.run_id, line, run.elapsed())
+                run.note(f"{line} (+{run.elapsed():.1f}s)", progress=run.stage == stage)
                 if stage != run.stage and stage.lower().startswith("decoding") and run.family == "video":
                     run.decode_at = time.monotonic()
                     run.progress = max(run.progress, EVENT_CAP)
@@ -811,7 +822,8 @@ class MlxServeEngine:
             with self._lock:
                 run.complete = (fields, streamed)
                 run.terminal = "complete"
-                run.note("complete event received")
+                run.timings["complete"] = round(run.elapsed(), 1)
+                run.note(f"complete event received (+{run.elapsed():.1f}s)")
         elif kind == "error":
             with self._lock:
                 run.terminal, run.error_msg = "error", str(fields.get("message") or "generation failed")

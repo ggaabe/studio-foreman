@@ -940,6 +940,10 @@ class M7Process(TmpCase):
         self.assertFalse(studio.catalog(False)[LTX].evicts_brain)
         self.assertTrue(studio.catalog()[LTX].evicts_brain)
         self.assertNotIn("ddalcu/FastH3-Omni-MLX-Serve-8bit", studio.catalog())
+        self.assertEqual(cfg.policy().progress_timeout_s, 120.0)
+        tight = studio.load_config(path, env={"FOREMAN_HOME": self.tmp, "FOREMAN_PROGRESS_TIMEOUT_S": "45"})
+        self.assertEqual(tight.policy().progress_timeout_s, 45.0)
+        self.assertEqual(tight.policy().text_ladder, studio.policy().text_ladder)
         with open(path, "w") as f:
             json.dump({"nonsense": 1}, f)
         with self.assertRaises(ValueError):

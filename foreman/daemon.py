@@ -85,7 +85,7 @@ class Gpud:
             brain = BrainClient(cfg.base_url, catalog=catalog)
             engine = studio.build_engine(cfg, brain=brain)
         self.engine = engine
-        self.sup = Supervisor(cfg.db_path, {studio.ENGINE: engine}, clock or SystemClock(), studio.policy(),
+        self.sup = Supervisor(cfg.db_path, {studio.ENGINE: engine}, clock or SystemClock(), cfg.policy(),
                               catalog=catalog, pager=Pager(os.path.join(cfg.home, "pages.jsonl")))
         self.stop = threading.Event()
         self._tick_started: float | None = None
@@ -116,7 +116,8 @@ class Gpud:
         log.info("gpud starting", extra={"fields": {
             "pid": os.getpid(), "db": self.cfg.db_path, "mlx": self.cfg.base_url, "leader": self.sup.leader,
             "video_exclusive": self.cfg.video_exclusive, "boot_count": st["boot_count"],
-            "fault_stall_after": self.cfg.stall_after}})
+            "fault_stall_after": self.cfg.stall_after, "fault_kinds": self.cfg.stall_kinds,
+            "progress_timeout_s": self.sup.p.progress_timeout_s}})
         if not self.sup.leader:
             log.warning("another gpud holds %s.lock: standing by until it exits", self.cfg.db_path)
         if self.cfg.watchdog_s and not once:

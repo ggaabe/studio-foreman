@@ -82,7 +82,15 @@ class Config:
     watchdog_s: float = 300.0         # a tick stuck this long: exit and let launchd restart gpud
     stall_after: int | None = None    # fault injection (FOREMAN_FAULT_STALL_AFTER)
     stall_kinds: tuple | None = None  # ... limited to these job kinds (FOREMAN_FAULT_KINDS)
+    progress_timeout_s: float | None = None  # override Policy.progress_timeout_s, the lease's no-progress
+                                             # floor (FOREMAN_PROGRESS_TIMEOUT_S; default 120 s)
     log_level: str = "INFO"
+
+    def policy(self) -> Policy:
+        overrides = {}
+        if self.progress_timeout_s:
+            overrides["progress_timeout_s"] = float(self.progress_timeout_s)
+        return policy(**overrides)
 
     def finish(self) -> "Config":
         self.home = os.path.expanduser(self.home or _home())
@@ -99,6 +107,7 @@ _ENV = {
     "FOREMAN_MODEL_DIR": ("model_dir", str), "FOREMAN_MIN_HEADROOM_GB": ("min_headroom_gb", float),
     "FOREMAN_MAX_RESIDENT_MODELS": ("max_resident_models", int), "FOREMAN_TICK_S": ("tick_s", float),
     "FOREMAN_WATCHDOG_S": ("watchdog_s", float), "FOREMAN_FAULT_STALL_AFTER": ("stall_after", int),
+    "FOREMAN_PROGRESS_TIMEOUT_S": ("progress_timeout_s", float),
     "FOREMAN_LOG_LEVEL": ("log_level", str),
 }
 
