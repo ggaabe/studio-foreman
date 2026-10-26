@@ -1,0 +1,20 @@
+{
+  "id": "narration.weekly-update.v1",
+  "kind": "speak",
+  "family": "tts",
+  "consumer": "weekly team update video",
+  "revenue_line": "internal_communications",
+  "value_usd": 15,
+  "prior": {"alpha": 8, "beta": 2},
+  "caps": {"per_week": 2, "max_stock": 2, "two_week_use": 2},
+  "params": {
+    "voice": {"allowed": ["af_heart", "am_michael"], "default": "af_heart"},
+    "speed": {"min": 0.85, "max": 1.15, "default": 1.0}
+  },
+  "style_prefix": "",
+  "brief_max_chars": 900,
+  "flags": {"speculative": false, "filler": false, "commercial": false, "private": true},
+  "review_minutes": 2,
+  "active": false,
+  "notes": "The brief is the exact script to read (about 60-90 seconds). The owner edits the script before it is used. Set active to true once this consumer is real."
+}

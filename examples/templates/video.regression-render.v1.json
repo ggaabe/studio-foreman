@@ -1,0 +1,21 @@
+{
+  "id": "video.regression-render.v1",
+  "kind": "render_video",
+  "family": "video",
+  "consumer": "engine upgrade regression check",
+  "revenue_line": "internal_tooling",
+  "value_usd": 6,
+  "prior": {"alpha": 9, "beta": 1},
+  "caps": {"per_week": 1, "max_stock": 1, "two_week_use": 1},
+  "params": {
+    "seconds": {"min": 2, "max": 2, "default": 2},
+    "size": {"allowed": ["768x512"], "default": "768x512"},
+    "seed": {"min": 42, "max": 42, "default": 42}
+  },
+  "style_prefix": "",
+  "brief_max_chars": 200,
+  "flags": {"speculative": false, "filler": true, "commercial": false, "private": false},
+  "review_minutes": 1,
+  "active": false,
+  "notes": "A fixed short render compared by eye with the last one after an engine upgrade. Filler: capped at 15% of weekly GPU-hours."
+}

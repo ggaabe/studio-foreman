@@ -1,0 +1,21 @@
+{
+  "id": "video.pitch-broll.v1",
+  "kind": "render_video",
+  "family": "video",
+  "consumer": "pitch deck for Example Prospect (replace with the named prospect)",
+  "revenue_line": "new_business",
+  "value_usd": 300,
+  "prior": {"alpha": 1, "beta": 19},
+  "caps": {"per_week": 2, "max_stock": 3, "two_week_use": 2},
+  "params": {
+    "seconds": {"min": 3, "max": 5, "default": 5},
+    "size": {"allowed": ["768x512", "1280x704"], "default": "768x512"},
+    "seed": {"min": 0, "max": 2147483647}
+  },
+  "style_prefix": "Cinematic b-roll, natural light, steady camera:",
+  "brief_max_chars": 500,
+  "flags": {"speculative": true, "filler": false, "commercial": true, "private": false},
+  "review_minutes": 4,
+  "active": false,
+  "notes": "Option value: samples for one named prospect while the pitch is open. Speculative work is capped at 20% of weekly GPU-hours."
+}

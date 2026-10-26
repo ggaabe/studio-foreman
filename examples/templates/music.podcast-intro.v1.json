@@ -1,0 +1,22 @@
+{
+  "id": "music.podcast-intro.v1",
+  "kind": "compose_music",
+  "family": "music",
+  "consumer": ["Example Client podcast (replace with your client's show)"],
+  "revenue_line": "client_work",
+  "value_usd": 60,
+  "prior": {"alpha": 8, "beta": 2},
+  "caps": {"per_week": 3, "max_stock": 3, "two_week_use": 3},
+  "params": {
+    "seconds": {"min": 10, "max": 30, "default": 20},
+    "instrumental": {"allowed": [true], "default": true},
+    "bpm": {"min": 70, "max": 120},
+    "seed": {"min": 0, "max": 2147483647}
+  },
+  "style_prefix": "Short podcast intro sting, clean mix, ends on a resolved chord:",
+  "brief_max_chars": 400,
+  "flags": {"speculative": false, "filler": false, "commercial": true, "private": true, "hard_deadline": true},
+  "review_minutes": 3,
+  "active": false,
+  "notes": "Commissioned work under a signed agreement. Commercial: only models cleared for commercial use. The owner picks one take and delivers it by hand."
+}

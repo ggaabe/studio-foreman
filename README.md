@@ -10,14 +10,16 @@ The supervisor core is proven in simulation: a virtual clock, fake engines with 
 and a scripted stand-in for the LLM. On top of that core, `foreman/adapters/mlx_serve.py` drives a
 real [mlx-serve](https://github.com/ddalcu/mlx-serve) server and `foreman/brain_client.py` makes
 the LLM decisions through it (see [Running on a Mac with mlx-serve](#running-on-a-mac-with-mlx-serve)).
-Everything uses only the Python standard library (3.9 or newer; tested on 3.9.6 and 3.12). The
+A [planner](#planner) lets the resident brain propose what to make from owner-written templates;
+code validates and prices every proposal, and the owner's verdicts are the only feedback it learns
+from. Everything uses only the Python standard library (3.9 or newer; tested on 3.9.6 and 3.12). The
 test suite makes no network calls outside 127.0.0.1 and starts no real model server.
 
 ## Run it
 
 ```bash
 cd foreman
-python3 -m unittest discover -s tests -v     # 159 tests (plus subtests), about 30 seconds
+python3 -m unittest discover -s tests -v     # 204 tests (plus subtests), about 45 to 60 seconds
 python3 -m foreman.demo                       # narrated timeline: render hangs, brain recovers
 python3 -m foreman.demo --fault crash         # also: garbage, wedged, none
 ```
@@ -44,12 +46,20 @@ pager outage; they now assert the opposite. See [Inverted red-team tests](#inver
 | `foreman/brain_client.py` | `BrainClient`: chat-completion decisions from the resume brief, with sampled frames for vision |
 | `foreman/studio.py` | The Mac Studio deployment: catalog, policy, config loading |
 | `foreman/daemon.py` | `python3 -m foreman.daemon`: gpud itself (lock, recover, 1 s ticks, JSON logs, SIGTERM) |
-| `foreman/cli.py` | `python3 -m foreman.cli`: submit speech/music/video, status, jobs, events, cancel, clear-safe |
+| `foreman/cli.py` | `python3 -m foreman.cli`: submit speech/music/video, status, jobs, events, cancel, clear-safe; the owner's loop: review, verdict, ship, resolve, templates, planner, report |
+| `foreman/planner.py` | `Planner`: tick cadence and backoff inside gpud, the input snapshot and prompt, the strict plan parser, the validator (reason codes in `REASONS`), EV and priority, suspension and the token budget |
+| `foreman/templates.py` | Template schema and loader (helpful errors), banned classes, goals.md and the inbox, request building from a proposal |
+| `foreman/ledger.py` | The value ledger: planner items, the review queue, verdicts and shipments, Beta posteriors, 7/28-day stats, kill criteria, page resolution |
+| `foreman/retention.py` | Raw-frame deletion after the MP4 mux, pruning of rejected and unreviewed items, the disk guard |
+| `foreman/report.py` | The Markdown scoreboard behind `cli report` |
+| `foreman/media_requests.py` | Speech, music and video request builders (with their batons), shared by the CLI and the planner |
+| `examples/` | A generic `goals.md` and four inactive example templates (no real client names) |
 | `deploy/`, `scripts/` | LaunchAgent template and install/uninstall scripts (no sudo) |
 | `tests/test_brain_return.py` | Invariants I1 to I9 (the original 48 tests, unchanged) |
 | `tests/test_adversarial.py` | The red team's 37 attacks (two inverted to require no crash; see below) |
 | `tests/test_hardening.py` | Regression tests for the hardening, including a seeded chaos test |
 | `tests/test_mlx_serve_adapter.py` | The adapter, brain client, media analysis, CLI and daemon against a local fake mlx-serve (`tests/fake_mlx_serve.py`) |
+| `tests/test_planner.py` | P1 to P14: templates, parser, every validator reason, EV ordering, budgets across many ticks, no model loads, backoff, suspension, tokens, idempotency, verdicts and kills, retention, untrusted inbound text, CLI and wiring |
 
 ## How the brain comes back
 
@@ -290,6 +300,9 @@ python3 -m foreman.cli cancel 12                    # graceful: gpud closes the 
 python3 -m foreman.cli clear-safe                   # a human leaving SAFE mode
 ```
 
+The owner's side of the planner (`review`, `verdict`, `ship`, `resolve`, `templates`, `planner`,
+`report`) is described in [Planner](#planner).
+
 Each submission carries its baton: speech and music finish with `review_audio` (the vision
 brain sees the waveform and the measured WAV statistics) or `recover_audio` / `recover_music`;
 video finishes with `review_render` (2 to 4 sampled frames attached) or `recover_render`. The CLI
@@ -298,16 +311,20 @@ apply and it never takes gpud's lock.
 
 State lives in `~/.foreman/`: `foreman.db` (plus `foreman.db.lock`), `logs/gpud.log` (JSON lines,
 rotated; every supervisor event is mirrored there), `pages.jsonl` (one line per page to a human)
-and `artifacts/<run id>-<process>/`. Audio runs leave `output.wav` and `waveform.png`. Video runs
-leave `frames.rgb` (raw rgb8), `video.json` (width, height, fps, frame count, measured stats),
-`frame_NNNN.png` samples, `audio.wav`, and `output.mp4` when ffmpeg is found (see Known gaps for
-the `ffmpeg` setting). Artifacts are never deleted automatically; a 5 s 720p clip is about 330 MB raw.
+and `artifacts/<run id>-<process>/`. The planner adds `templates/`, `goals.md`, `inbox/` and
+`reports/` (see [Planner](#planner)). Audio runs leave `output.wav` and `waveform.png`. Video runs
+leave `video.json` (width, height, fps, frame count, measured stats), `frame_NNNN.png` samples,
+`audio.wav`, and `output.mp4` when ffmpeg is found (see Known gaps for the `ffmpeg` setting). The
+raw rgb8 frames (`frames.rgb`, about 330 MB for a 5 s 704p clip) are deleted once the MP4 mux
+succeeds, unless `keep_raw_frames` is set; without ffmpeg, or when the mux fails, they stay. Other
+artifacts are deleted only for planner items, on the retention schedule in [Planner](#retention).
 
 Configuration, later sources winning: defaults, `~/.foreman/config.json` (keys are the `Config`
 fields in `foreman/studio.py`, for example `{"video_exclusive": false}`), environment variables
 (`FOREMAN_HOME`, `FOREMAN_DB`, `FOREMAN_MLX_URL`, `FOREMAN_MODEL_DIR`, `FOREMAN_VIDEO_EXCLUSIVE`,
 `FOREMAN_MIN_HEADROOM_GB`, `FOREMAN_MAX_RESIDENT_MODELS`, `FOREMAN_FAULT_STALL_AFTER`,
-`FOREMAN_FAULT_KINDS`, `FOREMAN_PROGRESS_TIMEOUT_S`, ...), then command-line flags.
+`FOREMAN_FAULT_KINDS`, `FOREMAN_PROGRESS_TIMEOUT_S`, `FOREMAN_KEEP_RAW_FRAMES`, `FOREMAN_PLANNER`,
+`FOREMAN_PLANNER_INTERVAL_S`, ...), then command-line flags.
 
 The adapter refuses to load a pack whose directory still holds partial download files
 (`*.partial`, `*.partial.parts`, ...): MLX-Serve.app downloads in place, and on the Studio the
@@ -475,6 +492,237 @@ leave gpud stopped.
   imageio-ffmpeg` and link its binary to `~/.foreman/bin/ffmpeg`. Muxing uses Apple's
   `h264_videotoolbox` encoder and falls back to `libx264`.
 
+## Planner
+
+gpud's scheduler decides **when and where** work runs. The planner, an LLM on whatever brain is
+already resident, only proposes **what** to make, and only as instances of templates the owner
+wrote. Code decides whether a proposal is admitted, what it is worth and where it queues. The two
+loops share nothing but the database: the planner cannot load a model, start a job, set a
+priority, raise a cap or add a template, and an admitted proposal is an ordinary gpud job with
+its review and recover batons. Idle is a correct outcome; the prompt says so, and the scoreboard
+reports the idle share without trying to raise it.
+
+The planner is on by default (`"planner": false` in `config.json` or `FOREMAN_PLANNER=0` turns it
+off) and does nothing until an active template exists in `$FOREMAN_HOME/templates/`.
+
+### How it decides
+
+1. **When a tick runs.** Every `interval_s` (30 min); sooner on events: a media job finished, a
+   verdict or shipment was recorded, a template was unpaused, a page was resolved, or the review
+   queue dropped below 10 (event ticks at most every 5 min); and on `planner plan-now`. After the
+   third tick in a row that admits nothing the interval doubles, and it doubles again with each
+   further empty tick, up to 4 h; one admission resets it to 30 min. A fresh database ticks 60 s
+   after gpud starts.
+2. **When it does not.** A due tick waits while the owner paused the planner, while it is
+   suspended, in SAFE mode, while the GPU is busy (a load or a job is running), while a
+   continuation is queued, and **while no brain is resident: the planner never causes a model
+   load.** The plan job is a brain job marked `resident_only`: the scheduler starts it on the
+   resident brain or not at all, and one still queued after 5 min is cancelled. A tick is used up
+   without asking the brain when no template is active and unpaused, when the disk guard holds,
+   or when the day's token budget is spent. Each skip reason is logged once when it starts, so an
+   idle planner adds nothing to the event log.
+3. **What it sees.** Every tick rebuilds its input from the database and files; no conversation
+   is kept. `<goals>` (goals.md), `<templates>` (the active ones: consumers, value, review
+   minutes, param bounds, P(ship), caps left this week, stock against max_stock and two weeks of
+   use), `<recent_outputs>` (the last 30 briefs, to avoid repeats), `<ledger>` (7 and 28 days per
+   template: admitted, produced, brain-accepted, accepted, rejected, shipped, dollars, review
+   minutes, GPU-hours), `<state>` (local time and weekday, review items and minutes left today,
+   GPU-hours and the speculative and filler shares), then one `<untrusted>` block per inbox note.
+   Data is escaped so no text can close or open a tag.
+4. **What it may answer.** One JSON object, nothing else:
+   `{"proposals": [{"template_id", "consumer", "brief", "params", "deadline"?, "value_adj"?,
+   "rationale"?}], "new_template_ideas": [up to 3 strings]}`. Any other top-level key, a non-list
+   `proposals`, prose around the JSON (a code fence is tolerated) or an empty reply makes the
+   whole tick invalid. Any other
+   key inside a proposal rejects that proposal (`unknown_field`). Ideas are kept for the owner
+   (URLs stripped) and shown in the report; they never become templates.
+5. **Validation (code).** Each proposal is checked in order and rejected with the first reason
+   code that applies (`foreman.planner.REASONS`): unknown, inactive or paused template; no
+   consumer, a generic one ("anyone", "youtube", ...) or one the template does not list; no brief,
+   a brief over the template's `brief_max_chars`, a brief with a URL, or one in a banned class;
+   a param the template does not declare, of the wrong type or outside its bounds or whitelist;
+   a deadline that is not a date or has passed; a `value_adj` that is not a number; no model of
+   the template's family, or a commercial template routed to a model off the commercial-use list
+   (`studio.COMMERCIAL_OK`); a content hash already proposed; EV of zero or less; more than 20
+   proposals in one tick.
+6. **Value (code, never the LLM).**
+   `EV = value_usd x P(ship) x urgency x value_adj - $2/min x review_minutes - $0.25/h x GPU time`.
+   P(ship) is the mean of Beta(prior.alpha + accepts, prior.beta + rejects): only the owner's
+   verdicts move it, never the brain's review and never the planner. Urgency is 2 for a deadline
+   within a day, 1.5 within 3 days, 1.25 within 7, else 1. `value_adj` is clamped to 0.5..2. GPU
+   time is the media job's expected duration plus its review.
+7. **Budgets, in EV order.** The valid proposals are sorted by EV and admitted while they fit:
+   the template's `per_week` cap (items admitted in the last 7 days), `max_stock` and
+   `two_week_use` (items queued, awaiting review or accepted but not yet shipped), at most 15
+   items queued or awaiting the owner, at most 30 review minutes created per day, speculative
+   work at most 20 % and filler at most 15 % of the week's GPU time (measured, plus the estimates
+   of work still queued). A template flagged `hard_deadline` whose proposal is due within 7 days
+   gets 3 reserved review slots and is exempt from the daily minutes. The disk guard is checked
+   again here. Each admitted proposal is a gpud job whose priority comes from its EV inside the
+   band -99..-1: behind the owner's own CLI submissions and the brain's retries (priority 0), and
+   far behind continuations (100).
+8. **Errors.** Three invalid ticks in a row (unparseable or schema-violating output, or a plan
+   job that crashed or timed out) suspend the planner for 1 h and page a human
+   (`planner_suspended`). gpud keeps running the queue meanwhile; the suspension ends by itself,
+   or with `planner resume`. A plan job that was cancelled, interrupted by a gpud restart or lost
+   with its engine does not count, and an interrupted one is retried 2 min later. The token
+   budget is 2M per local day, estimated as characters / 4 of the prompt plus the reply; a tick
+   starts only if its prompt plus the longest reply it allows (3000 tokens) still fits.
+
+### The review queue and the owner's verdicts
+
+An admitted item follows its gpud lineage (the job, the brain's retries, the brain's review).
+When the media succeeded and the brain's review accepted it or asked for a human, the item
+enters the **review queue**; any other ending marks it failed with the reason. The owner then
+gives a verdict, which is the only thing that teaches the planner anything:
+
+```bash
+python3 -m foreman.cli review [--all]                     # items awaiting a verdict: brief, brain note, MP4/WAV/PNG paths
+python3 -m foreman.cli verdict 41 accept --minutes 3      # or reject; --note TEXT; minutes default to the template's estimate
+python3 -m foreman.cli ship 41 --usd 60                   # you used it (usd defaults to the template's value_usd)
+python3 -m foreman.cli resolve                            # list open pages; resolve 12 13 --note "old scenario tests"
+python3 -m foreman.cli templates                          # stats, caps, stock, P(ship), paused; templates pause|unpause ID
+python3 -m foreman.cli planner status                     # or pause [--note] | resume | plan-now
+python3 -m foreman.cli report [--days 7] [--out PATH]     # Markdown scoreboard, default $FOREMAN_HOME/reports/
+```
+
+A verdict on an item the brain flagged `human_review` also resolves that page. The scoreboard
+lists, per template, what was admitted, produced, passed by the brain, accepted, rejected and
+shipped, with dollars, review minutes, GPU-hours and P(ship); then GPU-hours and the idle share,
+the five biggest GPU sinks nobody used, rejections by reason code, paused templates and the
+planner's ideas.
+
+**Kill criteria (code).** A template is paused, logged as `template_paused` and listed in the
+report, when its acceptance is below 25 % after at least 20 verdicts, when nothing it produced
+was accepted or shipped in 30 days, or when shipped value per review minute stayed below $2 over
+2 weeks. They are checked every minute inside gpud and after each verdict. `templates unpause ID`
+brings a template back and restarts the history the criteria judge.
+
+### Templates and goals
+
+Templates are JSON files in `$FOREMAN_HOME/templates/` (one per file), written by the owner and
+read-only to everything else. A template that fails validation is not loaded; `templates` and
+gpud's log name the file and every problem, with "did you mean" hints for misspelt keys, so a
+typo cannot silently weaken a limit. `examples/templates/` has four generic ones, all inactive:
+copy one, name your real consumer, then set `active` to true.
+
+```json
+{
+  "id": "narration.weekly-update.v1",
+  "kind": "speak",
+  "family": "tts",
+  "consumer": "weekly team update video",
+  "revenue_line": "internal_communications",
+  "value_usd": 15,
+  "prior": {"alpha": 8, "beta": 2},
+  "caps": {"per_week": 2, "max_stock": 2, "two_week_use": 2},
+  "params": {
+    "voice": {"allowed": ["af_heart", "am_michael"], "default": "af_heart"},
+    "speed": {"min": 0.85, "max": 1.15, "default": 1.0}
+  },
+  "style_prefix": "",
+  "brief_max_chars": 900,
+  "flags": {"speculative": false, "filler": false, "commercial": false, "private": true},
+  "review_minutes": 2,
+  "active": false,
+  "notes": "The brief is the exact script to read."
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `id` | 2 to 64 characters of `a-z 0-9 . _ -` |
+| `kind`, `family` | `speak`/`tts`, `compose_music`/`music` or `render_video`/`video`; `model` optionally pins a catalog model of that family |
+| `consumer` | Who uses the output: a string or a list. A proposal must name one of them exactly. Generic audiences are refused |
+| `revenue_line`, `value_usd` | What the work is for, and what one accepted item is worth |
+| `prior` | Beta prior on P(ship), for example 0.8 (8, 2) for committed client work, 0.5 for pitch samples, 0.3 for ad variants, 0.05 (1, 19) for speculative media |
+| `caps` | `per_week`, `max_stock` (integers) and `two_week_use` (expected use in two weeks) |
+| `params` | What a proposal may vary, each with bounds: `speak` voice, speed, seed; `compose_music` seconds, seed, instrumental, bpm; `render_video` seconds, size (`WxH` whitelist), steps, seed. Bounds must lie inside what the engine accepts; music and video need a default length (and size) |
+| `style_prefix` | Prepended to the brief to form the model prompt |
+| `brief_max_chars` | Longest brief a proposal may carry (default 600, at most 2000) |
+| `flags` | `speculative` and `filler` (GPU shares), `commercial` (license gate), `hard_deadline` (reserved review slots), `private` (recorded; Foreman has no cloud lane, so nothing leaves the Mac anyway) |
+| `review_minutes` | The owner's minutes to review one item: its cost in EV and the daily review budget |
+| `active`, `notes` | Only active templates are offered to the planner; notes are shown to it |
+
+`$FOREMAN_HOME/goals.md` is the owner's plain-words statement of what matters this month
+(`examples/goals.md` is a generic starting point). `$FOREMAN_HOME/inbox/` holds inbound notes
+(`.txt`, `.md`, `.json`; the newest 10, 2000 characters each), for example a client's brief. They
+reach the prompt only as `<untrusted>` data.
+
+### Safety rules
+
+- **Templates are the only source of work.** Nothing in a reply, the goals or the inbox can add a
+  template, activate one, or change a cap, prior, value or bound: those come only from the
+  owner's files, and the validator checks every proposal against them.
+- **Banned outright.** No template may exist, and no brief may be admitted, for platform-payout
+  content farms, uncommissioned media with no named consumer, mass SEO pages, AI-to-AI
+  promotion, autonomous outreach, or anything outward-facing. A template with keys such as
+  `publish_to`, `upload`, `send` or `webhook` does not load. Foreman makes files for a human to
+  review; nothing in it posts, uploads, sends or spends.
+- **Untrusted inbound text** is escaped, wrapped and labelled as data; it can tell the planner
+  what someone needs, never what it is allowed to do.
+- **No model loads, no outward actions, no spending**; one GPU job at a time, as before.
+- **License gate.** A template flagged `commercial` is admitted only on a model listed in
+  `studio.COMMERCIAL_OK` (Kokoro, ACE-Step, LTX-2.5 here). Re-check that list when a model or its
+  license changes (LTX-2.x needs a paid license above its revenue threshold).
+- **Idempotent.** Each tick is a job keyed `plan-tick:<n>`; each admitted proposal is keyed by
+  its content hash (template, normalised brief, merged params), unique in the ledger and as the
+  job's idempotency key. A crash while a plan is applied rolls the whole application back, and
+  the re-run admits each proposal once without asking the brain again.
+
+### Retention
+
+- After a successful MP4 mux the adapter deletes `frames.rgb` and keeps `output.mp4`, the sampled
+  PNGs, `audio.wav` and `video.json` (which records the deletion), unless `keep_raw_frames` is
+  true (`FOREMAN_KEEP_RAW_FRAMES=1`). A failed or missing mux keeps the raw frames.
+- The run directories of rejected items are pruned 7 days after the verdict. Items that waited 14
+  days in the review queue expire and are pruned; failed items are pruned 14 days after they
+  ended. Deletion is confined to directories strictly inside the artifacts root (resolved, never
+  a symlink), so a path in the database cannot point it anywhere else.
+- **Disk guard.** The planner admits nothing, and logs why, while the internal disk has less than
+  300 GB free or the artifacts directory holds more than `artifacts_cap_gb` (150 GB). A probe that
+  fails blocks too. The reading is cached for 10 minutes.
+
+Planner settings go in `config.json` under `planner_options` (fields of
+`foreman.planner.PlannerConfig`), for example
+`{"planner_options": {"interval_s": 3600, "token_budget": 1000000, "artifacts_cap_gb": 100}}`;
+unknown or malformed options stop gpud at startup with the list of known ones.
+
+### Planner invariants
+
+| | Invariant | Tests |
+|---|---|---|
+| PL1 | Only active, unpaused, owner-written templates produce work. Inbound text, goals and replies cannot add templates or change caps; a plan decision's `submit` is ignored | `P1`, `P4`, `P13` |
+| PL2 | Planning never causes a model load: no resident brain means no tick, and the load/unload sequence of a scenario is identical with and without the planner | `P6` |
+| PL3 | Every rejected proposal is recorded with a reason code from `REASONS`, in `plan_rejections` and the event log | `P3`, `assert_logged` |
+| PL4 | Weekly caps, stock, the review budget (with reserved hard-deadline slots) and the speculative and filler shares hold across many ticks; when nothing qualifies, nothing runs | `P5` |
+| PL5 | Admission is in EV order, EV <= 0 is never admitted, and planned work queues behind the owner's own submissions | `P4` |
+| PL6 | Backoff doubles after 3 empty ticks up to the cap and resets on an admission; 3 invalid ticks suspend and page while the queue keeps running; the daily token budget holds | `P7`, `P8`, `P9` |
+| PL7 | No duplicate job from a re-run tick, a crash inside the application, or a fresh gpud | `P10` |
+| PL8 | Only human verdicts move P(ship); the kill criteria pause a template | `P11` |
+| PL9 | Raw frames are deleted only after a successful mux; pruning follows the schedule and stays inside the artifacts root; the disk guard blocks admission | `P12` |
+
+### Known gaps of the planner
+
+- The tests prove that whatever the brain answers is parsed, validated and priced strictly, not
+  that its proposals are good. Their quality depends on the templates, the goals and the model.
+- The banned-class check on briefs is a keyword filter. It catches the plain phrasings, not a
+  determined paraphrase; the real guard is that templates are the owner's and that nothing in
+  Foreman can act outside the Mac.
+- GPU shares count every GPU job of the week (brain reviews and plan ticks included), measured
+  for finished work and estimated for queued work. On a fresh system with no other GPU use, any
+  speculative or filler item would be 100 % of the week, so none is admitted until committed
+  work has run.
+- The daily review budget counts the estimated minutes of items admitted that day, not the
+  minutes the owner actually spent (those are recorded with the verdict and used by the kill
+  criteria and the report).
+- The plan job runs at continuation priority, so a continuation created while it runs waits for
+  it (up to its 300 s hard timeout).
+- Only planner items are in the ledger. Work submitted by hand is outside the review queue,
+  P(ship) and the kill criteria.
+- Deadlines and days are local time. A template file edited while gpud runs is picked up within
+  a minute (by name, size and mtime); one that stops validating drops out and its error is logged.
+
 ## Known gaps
 
 - **Cap overshoot when brain loads fail.** The brainless budget reserves one nominal brain load
@@ -521,5 +769,6 @@ leave gpud stopped.
 - In simulation the validators read simulated metadata. With mlx-serve they read what
   `foreman.media` measured on the files (sampled pixels and 50 ms audio windows, not a full
   ffprobe-style blackdetect / silencedetect).
-- Pages are delivered at least once and may repeat after a crash. `human_review` and
-  `engine_lost` jobs have no resolve API yet; only `clear_safe()` exists.
+- Pages are delivered at least once and may repeat after a crash. `cli resolve` closes a page
+  (`human_review`, `engine_lost`, `planner_suspended`, ...) and records the note; it does not
+  undo or retry anything, and SAFE mode still needs `clear-safe`.

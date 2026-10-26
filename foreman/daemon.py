@@ -76,7 +76,7 @@ class Pager:
 
 
 class Gpud:
-    def __init__(self, cfg: studio.Config, engine=None, clock=None):
+    def __init__(self, cfg: studio.Config, engine=None, clock=None, planner=None):
         self.cfg = cfg
         os.makedirs(cfg.home, exist_ok=True)
         os.makedirs(cfg.artifacts_dir, exist_ok=True)
@@ -85,8 +85,11 @@ class Gpud:
             brain = BrainClient(cfg.base_url, catalog=catalog)
             engine = studio.build_engine(cfg, brain=brain)
         self.engine = engine
+        if planner is None and cfg.planner:
+            planner = studio.build_planner(cfg)
         self.sup = Supervisor(cfg.db_path, {studio.ENGINE: engine}, clock or SystemClock(), cfg.policy(),
-                              catalog=catalog, pager=Pager(os.path.join(cfg.home, "pages.jsonl")))
+                              catalog=catalog, pager=Pager(os.path.join(cfg.home, "pages.jsonl")),
+                              planner=planner)
         self.stop = threading.Event()
         self._tick_started: float | None = None
         self._last_event = self.sup.store.last_event_id()
@@ -97,7 +100,8 @@ class Gpud:
             self._last_event = e["id"]
             level = logging.WARNING if e["kind"] in (
                 "page_human", "safe_mode_entered", "engine_declared_lost", "lease_expired", "human_review",
-                "supervisor_error", "job_fault", "insufficient_memory", "insufficient_slots") else logging.INFO
+                "supervisor_error", "job_fault", "insufficient_memory", "insufficient_slots", "planner_suspended",
+                "plan_invalid", "plan_error", "template_paused", "template_error") else logging.INFO
             log.log(level, "event %s", e["kind"], extra={"fields": {
                 "event": e["kind"], "event_id": e["id"], "job_id": e["job_id"], "at": e["at"], "data": e["data"]}})
 
@@ -117,7 +121,8 @@ class Gpud:
             "pid": os.getpid(), "db": self.cfg.db_path, "mlx": self.cfg.base_url, "leader": self.sup.leader,
             "video_exclusive": self.cfg.video_exclusive, "boot_count": st["boot_count"],
             "fault_stall_after": self.cfg.stall_after, "fault_kinds": self.cfg.stall_kinds,
-            "progress_timeout_s": self.sup.p.progress_timeout_s}})
+            "progress_timeout_s": self.sup.p.progress_timeout_s, "planner": self.sup.planner is not None,
+            "keep_raw_frames": self.cfg.keep_raw_frames}})
         if not self.sup.leader:
             log.warning("another gpud holds %s.lock: standing by until it exits", self.cfg.db_path)
         if self.cfg.watchdog_s and not once:

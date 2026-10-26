@@ -7,12 +7,16 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import json
+import os
+import struct
+import zlib
 from dataclasses import dataclass, field
 
 from .engine import LoadStatus, Poll, RunSpec
 from .policy import CATALOG, Policy
 from .store import ACTIVE
-from .supervisor import Supervisor
+from .supervisor import PLAN_KIND, Supervisor
 
 TIGHT_HOST_GB = 176.0  # 160 GB usable: the video model fits, video + any brain does not
 
@@ -88,9 +92,40 @@ _GARBAGE = {"video": {"black_frame_ratio": 1.0}, "music": {"silence_ratio": 1.0}
 _EXT = {"video": "mp4", "music": "wav", "tts": "wav", "image": "png", "llm": "txt"}
 
 
-def _artifact(family: str, spec: RunSpec, behaviour: Behaviour) -> dict:
+def _tiny_png() -> bytes:
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"\x00\x80\x80\x80")) + chunk(b"IEND", b""))
+
+
+def _write_files(art: dict, family: str, spec: RunSpec, root: str) -> None:
+    """FakeEngine.artifacts_dir: put small real files on disk the way the mlx-serve adapter lays
+    a run out (<root>/<run id>-sim/...), so retention can be tested against a real tree."""
+    d = os.path.join(root, f"{spec.run_id}-sim")
+    os.makedirs(d, exist_ok=True)
+    main = os.path.join(d, "output.mp4" if family == "video" else f"output.{_EXT.get(family, 'bin')}")
+    with open(main, "wb") as f:
+        f.write(b"\x00" * 4096)
+    paths = []
+    if family == "video":
+        for name, data in (("video.json", json.dumps({"run_id": spec.run_id}).encode()), ("audio.wav", b"\x00" * 512),
+                           ("frame_0000.png", _tiny_png()), ("frame_0001.png", _tiny_png())):
+            with open(os.path.join(d, name), "wb") as f:
+                f.write(data)
+            paths.append(os.path.join(d, name))
+    elif family in ("music", "tts"):
+        with open(os.path.join(d, "waveform.png"), "wb") as f:
+            f.write(_tiny_png())
+        paths.append(os.path.join(d, "waveform.png"))
+    art.update(path=main, paths=paths)
+
+
+def _artifact(family: str, spec: RunSpec, behaviour: Behaviour, root: str | None = None) -> dict:
     p = spec.payload
     art = {"path": f"/sim/out/{spec.run_id}.{_EXT.get(family, 'bin')}", "exists": True}
+    if root:
+        _write_files(art, family, spec, root)
     if family == "video":
         art.update(duration_s=p.get("duration_s", 5.0), black_frame_ratio=0.0)
     elif family in ("music", "tts"):
@@ -161,6 +196,7 @@ class FakeEngine:
         self.calls: list[tuple[float, str, str]] = []  # state-changing calls, for assertions
         self.terminate_fails = False
         self.restarts = 0
+        self.artifacts_dir: str | None = None  # set: media runs write small real files under it
 
     # ---- test-side scripting ----
     def script_jobs(self, kind: str, *behaviours: Behaviour) -> None:
@@ -354,7 +390,7 @@ class FakeEngine:
                 return
             run.artifact = {"decision": decision, "model": model}
         else:
-            run.artifact = _artifact(family, run.spec, run.behaviour)
+            run.artifact = _artifact(family, run.spec, run.behaviour, self.artifacts_dir)
         run.state = "done"
         run.log.append(f"[{model}] done -> {run.artifact.get('path', 'decision')}")
 
@@ -403,13 +439,46 @@ class ScriptedBrain:
         return {"verdict": "ack"}
 
 
+class ScriptedPlanner(ScriptedBrain):
+    """Stands in for the planner LLM (and, for every other job kind, for the ScriptedBrain). For
+    a plan job it answers the next scripted reply: a dict (sent as JSON text, like a model's
+    reply), a raw string (to exercise the strict parser), a callable(snapshot) returning either,
+    or an exception to raise (a crashed brain). With the script used up it calls `policy` if one
+    is given, else proposes nothing. `plans` (test-side only) records what each tick saw."""
+
+    def __init__(self, *script, policy=None, **kw):
+        super().__init__(**kw)
+        self.script = collections.deque(script)
+        self.policy = policy
+        self.plans: list[dict] = []
+
+    def __call__(self, spec: RunSpec, model: str) -> dict:
+        if spec.kind != PLAN_KIND:
+            return super().__call__(spec, model)
+        snap = spec.payload.get("snapshot") or {}
+        self.plans.append({"job_id": spec.job_id, "model": model, "snapshot": snap,
+                           "prompt": spec.payload.get("prompt") or {}})
+        if self.script:
+            out = self.script.popleft()
+        elif self.policy is not None:
+            out = self.policy
+        else:
+            out = {"proposals": [], "new_template_ideas": []}
+        if callable(out) and not isinstance(out, BaseException):
+            out = out(snap)
+        if isinstance(out, BaseException):
+            raise out
+        raw = out if isinstance(out, str) else json.dumps(out)
+        return {"verdict": "plan", "raw": raw, "model": model}
+
+
 # ---------------------------------------------------------------- harness
 
 class Sim:
     """Clock + host + two engines + a supervisor that can be killed and respawned (launchd)."""
 
     def __init__(self, db_path: str, capacity_gb: float = 256.0, policy: Policy | None = None,
-                 brain: ScriptedBrain | None = None):
+                 brain: ScriptedBrain | None = None, planner=None, artifacts_dir: str | None = None):
         self.clock = VirtualClock()
         self.host = SimHost(capacity_gb)
         self.policy = dataclasses.replace(policy or Policy(), host_memory_gb=capacity_gb)
@@ -417,6 +486,8 @@ class Sim:
         self.mlx = FakeEngine("mlx-serve", self.clock, self.host, brain=self.brain)
         self.omlx = FakeEngine("omlx", self.clock, self.host, brain=self.brain)
         self.engines = {"mlx-serve": self.mlx, "omlx": self.omlx}
+        self.mlx.artifacts_dir = artifacts_dir
+        self.planner = planner  # a foreman.planner.Planner; restart() hands the new gpud this attribute
         self.db_path = db_path
         self.pages: list[dict] = []
         self.restarts = 0
@@ -427,7 +498,8 @@ class Sim:
         self.sup.recover()
 
     def _spawn(self) -> Supervisor:
-        return Supervisor(self.db_path, self.engines, self.clock, self.policy, pager=self.pages.append)
+        return Supervisor(self.db_path, self.engines, self.clock, self.policy, pager=self.pages.append,
+                          planner=self.planner)
 
     @property
     def store(self):

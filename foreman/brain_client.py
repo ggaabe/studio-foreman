@@ -34,6 +34,7 @@ from . import media
 from .adapters.sse import SseReader
 from .httpio import Cancelled, error_message, json_call
 from .policy import number
+from .supervisor import PLAN_KIND
 
 log = logging.getLogger("foreman.brain")
 
@@ -215,6 +216,8 @@ class BrainClient:
             return {"verdict": "continue", "note": "checkpoint: continue the batch", "submit": [nxt] if nxt else []}
         if kind == "brain_checkpoint":   # gpud brought the brain back between brainless jobs
             return {"verdict": "ack", "note": "brain checkpoint between brainless jobs", "submit": []}
+        if kind == PLAN_KIND:            # the planner: gpud built the prompt; its code parses the reply
+            return self.plan(payload, model, ctx)
         vision = bool(getattr(ctx.spec, "vision", False)) if ctx is not None else \
             bool(getattr(self.catalog.get(model), "vision", False))
         messages = self.messages(kind, brief, vision)
@@ -229,6 +232,21 @@ class BrainClient:
         self.transcript = (self.transcript + [{"kind": kind, "model": model, "reply": raw[:2000],
                                                "decision": decision}])[-10:]
         return decision
+
+    def plan(self, payload: dict, model: str, ctx=None) -> dict:
+        """A planner tick. The prompt (system rules + the snapshot, inbound text wrapped as
+        <untrusted>) was rendered by foreman.planner when gpud created the job; the reply is
+        returned raw, and the planner parses and validates it strictly in gpud. Nothing here can
+        turn the reply into a job."""
+        prompt = payload.get("prompt") if isinstance(payload.get("prompt"), dict) else {}
+        messages = [{"role": "system", "content": str(prompt.get("system") or "")},
+                    {"role": "user", "content": str(prompt.get("user") or "")}]
+        max_tokens = int(number(payload.get("max_tokens")) or self.max_tokens)
+        if ctx is not None:
+            ctx.log(f"planning with {ctx.server_model} (prompt ~{payload.get('prompt_tokens')} tokens)")
+        raw = self.chat(model, messages, ctx, max_tokens=max_tokens)
+        self.transcript = (self.transcript + [{"kind": PLAN_KIND, "model": model, "reply": raw[:2000]}])[-10:]
+        return {"verdict": "plan", "raw": raw[:64000], "reply_chars": len(raw), "model": model}
 
     # ---- prompt
     def messages(self, kind: str, brief: dict, vision: bool) -> list:
@@ -303,8 +321,9 @@ class BrainClient:
             return ctx.server_model
         return self.server_ids.get(model, model)
 
-    def chat(self, model: str, messages: list, ctx=None) -> str:
-        body = {"model": self._server_model(model, ctx), "messages": messages, "max_tokens": self.max_tokens,
+    def chat(self, model: str, messages: list, ctx=None, max_tokens: int | None = None) -> str:
+        body = {"model": self._server_model(model, ctx), "messages": messages,
+                "max_tokens": int(max_tokens or self.max_tokens),
                 "temperature": self.temperature, "enable_thinking": False,
                 "response_format": {"type": "json_object"}}
         if ctx is None:
@@ -337,7 +356,7 @@ class BrainClient:
                 if isinstance(delta, dict) and isinstance(delta.get("content"), str):
                     parts.append(delta["content"])
                     tokens[0] += 1
-                    ctx.progress(min(1.0, tokens[0] / float(self.max_tokens)))
+                    ctx.progress(min(1.0, tokens[0] / float(body.get("max_tokens") or self.max_tokens)))
 
         try:
             status = conn.request("POST", "/v1/chat/completions", json.dumps(body).encode(),

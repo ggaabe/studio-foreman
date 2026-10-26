@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   kind                TEXT NOT NULL,
   requires            TEXT NOT NULL,              -- 'brain' | a media model | 'human'
   state               TEXT NOT NULL,              -- queued starting running cancelling succeeded
-                                                  -- failed quarantined awaiting_human
+                                                  -- failed quarantined awaiting_human resolved
   payload             TEXT NOT NULL DEFAULT '{}',
   outcome             TEXT,
   parent_id           INTEGER REFERENCES jobs(id),
@@ -112,6 +112,96 @@ CREATE TABLE IF NOT EXISTS supervisor_state (
   t_mono          REAL                            -- monotonic source reading at t_now
 );
 INSERT OR IGNORE INTO supervisor_state (id) VALUES (1);
+
+-- The planner (foreman/planner.py). Its own state is persisted here so a restarted gpud (or a
+-- fresh Planner object) carries on with the same schedule, backoff, budget and suspension.
+CREATE TABLE IF NOT EXISTS planner_state (
+  id               INTEGER PRIMARY KEY CHECK (id = 1),
+  paused           INTEGER NOT NULL DEFAULT 0,   -- the owner paused it (CLI)
+  paused_note      TEXT,
+  suspended_until  REAL,                         -- supervisor time; set after repeated invalid ticks
+  suspensions      INTEGER NOT NULL DEFAULT 0,
+  invalid_streak   INTEGER NOT NULL DEFAULT 0,
+  empty_streak     INTEGER NOT NULL DEFAULT 0,   -- consecutive ticks that admitted nothing
+  interval_s       REAL,                         -- current interval (base, doubled by backoff)
+  next_due_at      REAL,
+  last_tick_at     REAL,
+  tick_seq         INTEGER NOT NULL DEFAULT 0,   -- plan job idempotency: plan:<seq>
+  force            INTEGER NOT NULL DEFAULT 0,   -- plan-now from the CLI
+  trigger          TEXT,                         -- pending event trigger
+  last_event_id    INTEGER NOT NULL DEFAULT 0,   -- events scanned for triggers
+  last_review_size INTEGER,
+  tokens_day       TEXT,                         -- local day the token count belongs to
+  tokens_used      INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO planner_state (id) VALUES (1);
+
+-- One row per admitted proposal: the value ledger. job_id is the gpud job it became (the root of
+-- its lineage: retries and the brain's reviews share root_id). Times are supervisor time; the
+-- *_wall / created_day columns are for humans and daily budgets.
+CREATE TABLE IF NOT EXISTS plan_items (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  plan_job_id     INTEGER,
+  template_id     TEXT NOT NULL,
+  consumer        TEXT NOT NULL,
+  brief           TEXT NOT NULL,
+  params          TEXT NOT NULL DEFAULT '{}',
+  content_hash    TEXT NOT NULL UNIQUE,
+  job_id          INTEGER UNIQUE,
+  state           TEXT NOT NULL,                 -- queued review accepted rejected shipped failed expired
+  flags           TEXT NOT NULL DEFAULT '{}',
+  value_usd       REAL,
+  p_ship          REAL,
+  urgency         REAL,
+  value_adj       REAL,
+  ev              REAL,
+  priority        INTEGER,
+  est_gpu_s       REAL,
+  review_minutes  REAL,
+  deadline_wall   REAL,
+  hard_deadline   INTEGER NOT NULL DEFAULT 0,
+  rationale       TEXT,
+  created_at      REAL NOT NULL,
+  created_wall    REAL,
+  created_day     TEXT,
+  produced_at     REAL,                          -- media succeeded and the brain's review passed it on
+  output_job_id   INTEGER,
+  review_job_id   INTEGER,
+  brain_verdict   TEXT,
+  brain_note      TEXT,
+  artifacts       TEXT NOT NULL DEFAULT '[]',
+  artifact_dirs   TEXT NOT NULL DEFAULT '[]',
+  finished_at     REAL,
+  fail_reason     TEXT,
+  verdict         TEXT,                          -- the owner's: accept | reject
+  verdict_at      REAL,
+  verdict_minutes REAL,
+  verdict_note    TEXT,
+  shipped_at      REAL,
+  usd             REAL,
+  pruned_at       REAL
+);
+CREATE INDEX IF NOT EXISTS plan_items_state ON plan_items(state);
+CREATE INDEX IF NOT EXISTS plan_items_template ON plan_items(template_id);
+
+CREATE TABLE IF NOT EXISTS plan_rejections (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  plan_job_id INTEGER,
+  at          REAL NOT NULL,
+  template_id TEXT,
+  reason      TEXT NOT NULL,                     -- a planner.REASONS code
+  detail      TEXT
+);
+CREATE INDEX IF NOT EXISTS plan_rejections_at ON plan_rejections(at);
+
+CREATE TABLE IF NOT EXISTS template_state (
+  template_id TEXT PRIMARY KEY,
+  paused      INTEGER NOT NULL DEFAULT 0,
+  reason      TEXT,                              -- owner | kill_low_acceptance | kill_unused_30d | kill_low_value
+  detail      TEXT,
+  at          REAL,
+  since       REAL                               -- kill criteria only count history after this
+);
 """
 
 # Columns added after the first schema; _migrate() adds them to an older database file.

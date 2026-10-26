@@ -65,6 +65,10 @@ NUMERIC_PAYLOAD_KEYS = ("expected_s", "p90_s", "duration_s", "progress_interval_
 # Outcomes caused by infrastructure rather than by the job: not charged to max_attempts
 # (bounded separately by Policy.max_interruptions).
 INFRA_REASONS = ("engine_unreachable",)
+# The planner's brain job (foreman/planner.py). It runs only on a brain that is already resident
+# (payload.resident_only), is never retried and never pages on failure: its decision is a list of
+# proposals the planner validates, never requests gpud admits as they are.
+PLAN_KIND = "plan"
 
 
 class AdmissionError(ValueError):
@@ -209,9 +213,10 @@ class Supervisor:
                  catalog: Mapping[str, ModelSpec] | None = None,
                  pager: Callable[[dict], None] | None = None,
                  crash: Callable[[str], None] | None = None,
-                 monotonic: Callable[[], float] | None = None, lead: bool = True):
+                 monotonic: Callable[[], float] | None = None, lead: bool = True, planner=None):
         """lead=False makes a pure client (a CLI that only submits or cancels): it never takes
-        the single-instance lock, so it cannot keep the real gpud out while it runs."""
+        the single-instance lock, so it cannot keep the real gpud out while it runs. `planner`
+        (a foreman.planner.Planner) adds the planner phases to tick()."""
         self.store = Store(db_path)
         self.store.wall_clock = clock.now
         self.engines = dict(engines)
@@ -220,6 +225,7 @@ class Supervisor:
         self.catalog = dict(catalog or CATALOG)
         self.pager = pager or (lambda page: log.warning("PAGE HUMAN: %s", page))
         self.crash_hook = crash or (lambda point: None)
+        self.planner = planner
         self._mono = monotonic or getattr(clock, "monotonic", None)
         self._tb: tuple[float, float, float | None] | None = None  # (T, wall, mono) last read here
         self._tick_t: float | None = None
@@ -331,6 +337,9 @@ class Supervisor:
         self._phase("engines", self._check_engines, now)
         self._phase("fire", self._fire_continuations, now)
         self._phase("orphans", self._clean_orphans, now)
+        if self.planner is not None:
+            self._phase("planner_upkeep", lambda t: self.planner.upkeep(self, t), now)
+            self._phase("planner", lambda t: self.planner.maybe_plan(self, t), now)
         self._phase("schedule", self._schedule, now)
         self._phase("page", self._page_humans, now)
         self._phase("observe", self._observe, now)
@@ -1414,6 +1423,8 @@ class Supervisor:
         the same row up to max_attempts, then quarantined for a human. Infrastructure failures
         (engine unreachable) are requeued without charging an attempt, up to max_interruptions."""
         reset = dict(pending_outcome=None, cancel_stage=None, cancel_requested_at=None)
+        if cur.kind == PLAN_KIND:
+            return self._finish_plan_job(cur, outcome, now, reset)
         requeue = dict(state="queued", handle=None, run_id=None, engine=None, model=None, started_at=None, **reset)
         if outcome["status"] == "succeeded":
             outcome = self._apply_decision_safely(cur, outcome, now)
@@ -1436,6 +1447,28 @@ class Supervisor:
             self._human_review(cur, f"brain job '{cur.kind}' failed {cur.attempt} times "
                                     f"(last: {reason})", now, idem=f"review:{cur.id}",
                                brief=cur.payload.get("brief"))
+        return state
+
+    def _finish_plan_job(self, cur: Job, outcome: dict, now: float, reset: dict) -> str:
+        """A plan job ends once, either way: no retry (the next tick plans afresh) and no page (the
+        planner counts invalid ticks and suspends itself). Its proposals are validated and admitted
+        by the planner inside this transaction, in a savepoint: a planner bug is recorded, never
+        fatal, and a decision's `submit` is never admitted for a plan job."""
+        ok = outcome["status"] == "succeeded"
+        try:
+            with self.store.savepoint():
+                if self.planner is None:
+                    summary = {"ignored": "no planner is attached to this gpud"}
+                elif ok:
+                    summary = self.planner.apply_plan(self, cur, outcome, now)
+                else:
+                    summary = self.planner.plan_failed(self, cur, outcome, now)
+        except Exception as e:
+            log.exception("could not apply plan job %s", cur.id)
+            summary = {"error": f"{type(e).__name__}: {e}"}
+            self.store.event(now, "plan_error", cur.id, error=summary["error"])
+        state = "succeeded" if ok else "failed"
+        self.store.update_job(cur.id, state=state, outcome=dict(outcome, plan=summary), finished_at=now, **reset)
         return state
 
     def _apply_decision_safely(self, cur: Job, outcome: dict, now: float) -> dict:
@@ -1688,6 +1721,8 @@ class Supervisor:
             if brain:
                 self._start(job, brain, now)
                 return True
+            if isinstance(job.payload, dict) and job.payload.get("resident_only"):
+                return False  # never load a model for this job (the planner's): wait for a resident brain
             return self._bring_brain(needs, now, job.id, st)
         model = job.requires
         name = self._engine_name(model)

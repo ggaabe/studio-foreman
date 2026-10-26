@@ -49,7 +49,7 @@ import subprocess
 import threading
 import time
 
-from .. import media
+from .. import media, retention
 from ..engine import LoadStatus, Poll, RunSpec
 from ..httpio import Cancelled, HttpError, Silence, StreamConn, error_message, json_call, split_url
 from ..policy import CATALOG, ModelSpec, number
@@ -220,7 +220,7 @@ class MlxServeEngine:
                  max_silence_s: float = 1800.0, decode_s_per_mpf: float = 0.6, min_decode_grace_s: float = 60.0,
                  sample_frames: int = 4, sample_max_side: int = 512, stall_after: int | None = None,
                  stall_kinds=None, forbidden=FORBIDDEN_PATTERNS, ffmpeg: str | None = "auto",
-                 preserve_default: bool = True):
+                 preserve_default: bool = True, keep_raw_frames: bool = False):
         split_url(base_url)  # validate early
         self.name = name
         self.base_url = base_url.rstrip("/")
@@ -243,6 +243,9 @@ class MlxServeEngine:
         self.forbidden = tuple(forbidden or ())
         self.ffmpeg = shutil.which("ffmpeg") if ffmpeg == "auto" else ffmpeg
         self.preserve_default = preserve_default
+        # After a successful MP4 mux the raw rgb8 frames (~330 MB per 5 s at 704p) are deleted
+        # unless this is set; the MP4, sampled PNGs, audio.wav and video.json stay.
+        self.keep_raw_frames = bool(keep_raw_frames)
         self._mine ={m for m, s in self.catalog.items() if s.engine == name}
         self._boot = secrets.token_hex(4)
         self._seq = itertools.count(1)
@@ -969,7 +972,7 @@ class MlxServeEngine:
         mp4 = self._mux(run, frames_path, width, height, fps, art.get("audio")) if self.ffmpeg else None
         if mp4:
             art.update(path=mp4, format="mp4")
-            art["paths"].append(frames_path)
+            retention.drop_raw_frames(art, self.keep_raw_frames, run.note)
         return art
 
     def _mux(self, run: _Run, frames_path: str, width: int, height: int, fps: float, wav: str | None) -> str | None:

@@ -17,7 +17,7 @@ import dataclasses
 import json
 import os
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .policy import ModelSpec, Policy
 
@@ -30,6 +30,10 @@ LTX = "ddalcu/LTX-2.5-MLX-Serve-4bit"                                   # video 
 # MiniMax-H3 derived; its license excludes US users. Never in the catalog, and the adapter
 # refuses anything matching it even if someone adds it.
 FORBIDDEN = ("FastH3", "MiniMax-H3")
+# Models whose licenses allow commercial use of their output (Kokoro Apache-2.0, ACE-Step MIT,
+# LTX-2.x community license below its revenue threshold). The planner refuses to route a
+# template flagged commercial to any model outside this list (fail closed).
+COMMERCIAL_OK = frozenset({KOKORO, ACE_STEP, LTX})
 
 OTHER_TENANTS_GB = 40.0  # other inference services on the host, outside mlx-serve (never touched)
 OS_RESERVE_GB = 16.0
@@ -88,12 +92,20 @@ class Config:
     progress_timeout_s: float | None = None  # override Policy.progress_timeout_s, the lease's no-progress
                                              # floor (FOREMAN_PROGRESS_TIMEOUT_S; default 120 s)
     log_level: str = "INFO"
+    keep_raw_frames: bool = False     # keep frames.rgb after a successful MP4 mux (FOREMAN_KEEP_RAW_FRAMES)
+    planner: bool = True              # run the planner inside gpud (FOREMAN_PLANNER); it does nothing
+                                      # until an active template exists in $FOREMAN_HOME/templates
+    planner_options: dict = field(default_factory=dict)  # PlannerConfig fields, e.g. {"interval_s": 1800}
 
     def policy(self) -> Policy:
         overrides = {}
         if self.progress_timeout_s:
             overrides["progress_timeout_s"] = float(self.progress_timeout_s)
         return policy(**overrides)
+
+    def planner_config(self):
+        from .planner import PlannerConfig
+        return PlannerConfig.from_dict(self.planner_options)
 
     def finish(self) -> "Config":
         self.home = os.path.expanduser(self.home or _home())
@@ -141,9 +153,17 @@ def load_config(path: str | None = None, env=None, **overrides) -> Config:
         cfg.video_exclusive = _bool(env["FOREMAN_VIDEO_EXCLUSIVE"])
     if env.get("FOREMAN_FAULT_KINDS"):
         cfg.stall_kinds = tuple(k.strip() for k in env["FOREMAN_FAULT_KINDS"].split(",") if k.strip())
+    for var, attr in (("FOREMAN_PLANNER", "planner"), ("FOREMAN_KEEP_RAW_FRAMES", "keep_raw_frames")):
+        if env.get(var) not in (None, ""):
+            setattr(cfg, attr, _bool(env[var]))
+    if env.get("FOREMAN_PLANNER_INTERVAL_S") not in (None, ""):
+        cfg.planner_options = dict(cfg.planner_options or {}, interval_s=float(env["FOREMAN_PLANNER_INTERVAL_S"]))
     for k, v in overrides.items():
         if v is not None:
             setattr(cfg, k, v)
+    if not isinstance(cfg.planner_options, dict):
+        raise ValueError(f"{path}: planner_options must be an object of planner settings")
+    cfg.planner_config()  # fail early on an unknown or malformed planner option
     return cfg.finish()
 
 
@@ -165,4 +185,12 @@ def build_engine(cfg: Config, brain=None, **kw):
     return MlxServeEngine(cfg.base_url, catalog(cfg.video_exclusive), name=ENGINE, model_dir=cfg.model_dir,
                           artifacts_dir=cfg.artifacts_dir, brain=brain, min_headroom_gb=cfg.min_headroom_gb,
                           max_resident_models=cfg.max_resident_models or None, stall_after=cfg.stall_after,
-                          stall_kinds=cfg.stall_kinds, forbidden=FORBIDDEN, **kw)
+                          stall_kinds=cfg.stall_kinds, forbidden=FORBIDDEN, keep_raw_frames=cfg.keep_raw_frames,
+                          **kw)
+
+
+def build_planner(cfg: Config, **kw):
+    """The planner gpud runs: templates, goals and inbox under cfg.home, retention on cfg.artifacts_dir."""
+    from .planner import Planner
+    return Planner(cfg.planner_config(), home=cfg.home, artifacts_dir=cfg.artifacts_dir,
+                   commercial_models=COMMERCIAL_OK, **kw)
