@@ -12,14 +12,16 @@ real [mlx-serve](https://github.com/ddalcu/mlx-serve) server and `foreman/brain_
 the LLM decisions through it (see [Running on a Mac with mlx-serve](#running-on-a-mac-with-mlx-serve)).
 A [planner](#planner) lets the resident brain propose what to make from owner-written templates;
 code validates and prices every proposal, and the owner's verdicts are the only feedback it learns
-from. Everything uses only the Python standard library (3.9 or newer; tested on 3.9.6 and 3.12). The
+from. [Phone approvals](#phone-approvals) put the review queue and the pages on the owner's phone
+through a Telegram bot, as a separate service that cannot affect scheduling. Everything uses only
+the Python standard library (3.9 or newer; tested on 3.9.6 and 3.12). The
 test suite makes no network calls outside 127.0.0.1 and starts no real model server.
 
 ## Run it
 
 ```bash
 cd foreman
-python3 -m unittest discover -s tests -v     # 358 tests (plus subtests), about 75 to 100 seconds
+python3 -m unittest discover -s tests -v     # 417 tests (plus subtests), about 120 to 150 seconds
 python3 -m foreman.demo                       # narrated timeline: render hangs, brain recovers
 python3 -m foreman.demo --fault crash         # also: garbage, wedged, none
 ```
@@ -53,10 +55,12 @@ documented gap instead of demanding a fix. See [Inverted red-team tests](#invert
 | `foreman/ledger.py` | The value ledger: planner items, the review queue, verdicts and shipments, Beta posteriors, 7/28-day stats, kill criteria, page resolution |
 | `foreman/retention.py` | Raw-frame deletion after the MP4 mux, pruning of rejected and unreviewed items, the disk guard |
 | `foreman/report.py` | The Markdown scoreboard behind `cli report` |
+| `foreman/phone.py` | `python3 -m foreman.phone`: phone approvals over Telegram, its own process (Bot API client over urllib, hand-written multipart, secrets, pairing, signed buttons, the outbox, the `cli phone` commands) |
+| `foreman/phone_config.py` | `PhoneConfig` (`phone_options`), apart so gpud validates config.json without importing the phone code |
 | `foreman/text.py` | Text hygiene for untrusted strings: folding (NFKC, invisible characters removed) for hashes and filters, and `printable` for terminal and report output |
 | `foreman/media_requests.py` | Speech, music and video request builders (with their batons), shared by the CLI and the planner |
 | `examples/` | A generic `goals.md` and four inactive example templates (no real client names) |
-| `deploy/`, `scripts/` | LaunchAgent template and install/uninstall scripts (no sudo) |
+| `deploy/`, `scripts/` | LaunchAgent templates (gpud, phone) and install/uninstall scripts (no sudo) |
 | `tests/test_brain_return.py` | Invariants I1 to I9 (the original 48 tests, unchanged) |
 | `tests/test_adversarial.py` | The red team's 37 attacks (two inverted to require no crash; see below) |
 | `tests/test_hardening.py` | Regression tests for the hardening, including a seeded chaos test |
@@ -68,6 +72,7 @@ documented gap instead of demanding a fix. See [Inverted red-team tests](#invert
 | `tests/test_live_fixes_adversarial.py` | The red team's 30 attacks on those three fixes (RP provenance, RC calibration, RF failure classes); one subtest adjusted, see below |
 | `tests/test_live_fixes_round2.py` | LR1 to LR4: regressions for the answers to that red team and its design concerns |
 | `tests/test_live_integration.py` | LI1 to LI2: regressions from verifying those fixes on the Studio (the owner's default is a catalog model; seeded models get their server id) |
+| `tests/test_phone.py` | PH1 to PH12: phone approvals against a local fake Bot API (`tests/fake_telegram.py`): pairing, exactly-once sends, media paths, captions, buttons through the ledger, stale and forged buttons, notes, commands, unauthorized updates, backoff, offsets, the token's secrecy, pages, digest, CLI, LaunchAgent |
 
 ## How the brain comes back
 
@@ -421,7 +426,8 @@ python3 -m foreman.cli clear-safe                   # a human leaving SAFE mode
 ```
 
 The owner's side of the planner (`review`, `verdict`, `ship`, `resolve`, `templates`, `planner`,
-`report`) is described in [Planner](#planner).
+`report`) is described in [Planner](#planner); the same verdicts from a phone in
+[Phone approvals](#phone-approvals).
 
 Each submission carries its baton: speech and music finish with `review_audio` (the vision
 brain sees the waveform and the measured WAV statistics) or `recover_audio` / `recover_music`;
@@ -432,7 +438,8 @@ apply and it never takes gpud's lock.
 State lives in `~/.foreman/`: `foreman.db` (plus `foreman.db.lock`), `logs/gpud.log` (JSON lines,
 rotated; every supervisor event is mirrored there), `pages.jsonl` (one line per page to a human)
 and `artifacts/<run id>-<process>/`. The planner adds `templates/`, `goals.md`, `inbox/` and
-`reports/` (see [Planner](#planner)). Audio runs leave `output.wav` and `waveform.png`. Video runs
+`reports/` (see [Planner](#planner)); the phone service adds `secrets/telegram.json`,
+`logs/phone.log`, `phone.lock` and `phone/tmp/` (see [Phone approvals](#phone-approvals)). Audio runs leave `output.wav` and `waveform.png`. Video runs
 leave `video.json` (width, height, fps, frame count, measured stats), `frame_NNNN.png` samples,
 `audio.wav`, and `output.mp4` when ffmpeg is found (see Known gaps for the `ffmpeg` setting). The
 raw rgb8 frames (`frames.rgb`, about 330 MB for a 5 s 704p clip) are deleted once the MP4 mux
@@ -457,12 +464,14 @@ fallback brain was still downloading while gpud ran.
 `deploy/com.github.ggaabe.foreman.gpud.plist` is a user LaunchAgent template: `KeepAlive` true
 (gpud holds no GPU memory, so restarting it however it exited strands nothing),
 `ThrottleInterval` 30, `ExitTimeOut` 60, `ProcessType` Background, stdout and stderr under
-`~/.foreman/logs`. Nothing installs it automatically.
+`~/.foreman/logs`. Nothing installs it automatically. The phone service has its own template
+(`deploy/com.github.ggaabe.foreman.phone.plist`, see [Phone approvals](#phone-approvals)).
 
 ```bash
 scripts/install-launchagent.sh --dry-run   # print the rendered plist
 scripts/install-launchagent.sh             # render, plutil -lint, launchctl bootstrap gui/$(id -u)
 scripts/uninstall-launchagent.sh           # launchctl bootout, remove the plist (keeps ~/.foreman)
+scripts/install-launchagent.sh phone       # the same for the phone service (uninstall-launchagent.sh phone)
 ```
 
 Neither script uses sudo. On SIGTERM gpud finishes its tick, closes its HTTP streams and exits.
@@ -891,7 +900,7 @@ copy one, name your real consumer, then set `active` to true.
 | `params` | What a proposal may vary, each with bounds: `speak` voice, speed, seed; `compose_music` seconds, seed, instrumental, bpm; `render_video` seconds, size (`WxH` whitelist), steps, seed. Bounds must lie inside what the engine accepts; music and video need a default length (and size) |
 | `style_prefix` | Prepended to the brief to form the model prompt |
 | `brief_max_chars` | Longest brief a proposal may carry (default 600, at most 2000) |
-| `flags` | `speculative` and `filler` (GPU shares), `commercial` (license gate), `hard_deadline` (reserved review slots), `private` (recorded; Foreman has no cloud lane, so nothing leaves the Mac anyway) |
+| `flags` | `speculative` and `filler` (GPU shares), `commercial` (license gate), `hard_deadline` (reserved review slots), `private` (Foreman has no cloud lane; the phone service sends only a notice and the buttons for its drafts, never the brief, the brain's note or a file) |
 | `review_minutes` | The owner's minutes to review one item: its cost in EV and the daily review budget |
 | `active`, `notes` | Only active templates are offered to the planner; notes are shown to it |
 
@@ -909,7 +918,9 @@ reach the prompt only as `<untrusted>` data.
   content farms, uncommissioned media with no named consumer, mass SEO pages, AI-to-AI
   promotion, autonomous outreach, or anything outward-facing. A template with keys such as
   `publish_to`, `upload`, `send` or `webhook` does not load. Foreman makes files for a human to
-  review; nothing in it posts, uploads, sends or spends.
+  review; nothing in it posts, uploads, sends or spends. The one exception is the owner's own
+  [phone service](#phone-approvals), which sends drafts and pages to the single private chat the
+  owner paired, and nowhere else (never a private template's content).
 - **Untrusted inbound text** is escaped, wrapped and labelled as data; it can tell the planner
   what someone needs, never what it is allowed to do. On the way out it is escaped again: the
   CLI and the report never emit a control character from a brief, a note or a file name.
@@ -1042,6 +1053,156 @@ server finished, restarts gpud could not identify, a standby taking over, two gp
 owner overrides written the way mlx-serve shows them, no brain gpud may use, implausible sizes,
 an unbounded headroom, garbage that finished during a timeout's cancel, and auth refusals counted
 as content.
+
+## Phone approvals
+
+`foreman/phone.py` puts the review queue and the pages on the owner's phone through a Telegram
+bot: each draft arrives with its MP4 or audio, and Approve / Reject (then Used it / Undo) record
+the verdict. It is its own process and its own LaunchAgent, not part of gpud. It reads and writes
+the same SQLite file as a non-leader client (WAL, 5 s busy timeout), never takes gpud's lock and
+never talks to an engine, so a Telegram outage, a slow upload or a bug in it cannot delay or crash
+scheduling, and a gpud restart is just another writer on the file. gpud does not even import it
+(`foreman/phone_config.py` holds the settings gpud validates).
+
+Every verdict, retract, shipment, note and page resolution goes through the CLI's own functions
+(`cli.apply_verdict`, `apply_ship`, `apply_note`, `apply_resolve`, `apply_planner`), so a press on
+the phone is a `verdict JOB accept` typed on the Studio: the same validation, the same
+compare-and-set item states, the same events (with `"by": "phone"`), the same posterior and the
+same kill criteria afterwards.
+
+### Setting it up
+
+1. In Telegram, message **@BotFather**, send `/newbot`, choose a display name and a username
+   ending in `bot`, and copy the token it answers with (digits, a colon, about 35 characters).
+2. On the Studio, run `python3 -m foreman.cli phone setup` and paste the token at the hidden
+   prompt (or pipe it in: `pbpaste | python3 -m foreman.cli phone setup`). Setup checks it with
+   `getMe` and saves it in `~/.foreman/secrets/telegram.json` (directory 0700, file 0600).
+3. Setup prints a link, `https://t.me/<your bot>?start=<code>`, and the code. Open the link on
+   the phone and tap **Start** (or send `/pair <code>` to the bot). The code works once, for 15
+   minutes, and only from a private chat. Setup waits and prints `paired` when it arrives.
+4. Install the service: `scripts/install-launchagent.sh phone` (`com.github.ggaabe.foreman.phone`,
+   KeepAlive, logs in `~/.foreman/logs/phone.log`). Then `python3 -m foreman.cli phone test` sends
+   a harmless message.
+
+If the service already runs, `phone setup` leaves the pairing to it (`--no-wait` returns right
+after printing the link). Without a token or a pairing the service idles and looks again every 30 s.
+
+```bash
+python3 -m foreman.cli phone setup [--no-wait] [--timeout S]   # token, getMe, pairing
+python3 -m foreman.cli phone status        # token configured (never shown), paired, service, counts, last error
+python3 -m foreman.cli phone test          # a harmless message to the paired chat
+python3 -m foreman.cli phone resend        # every draft awaiting a verdict and every open page, again
+python3 -m foreman.cli phone unpair [--keep-token]
+scripts/install-launchagent.sh phone [--dry-run]       # scripts/uninstall-launchagent.sh phone
+python3 -m foreman.phone [--once]                      # the service in the foreground
+```
+
+### What arrives
+
+| What | When | How |
+|---|---|---|
+| A draft | an item enters the review queue | The MP4 by `sendVideo` up to 45 MB (`video_max_mb`); a bigger one, or a render without an MP4, sends its middle sampled frame as a document. Speech and music as an AAC M4A made with ffmpeg (the `ffmpeg` setting, as for the mux) for `sendAudio`, else the WAV as a document. Nothing above the Bot API's 50 MB upload limit is ever sent (a WAV that big sends its waveform). A 400 or 413 for a file falls back to the next way, down to text only; files already pruned send the text with a note |
+| A page | `human_review`, `engine_lost`, `safe_mode`, `planner_suspended`, `brain_blocked`, ... | Text with a Resolve button. A page the brain raised about a draft rides on that draft (its verdict resolves it, as on the CLI). Resolving a SAFE-mode page does not leave SAFE mode: that is still `clear-safe` on the Studio |
+| A digest | once a day after `digest_hour`, if `digest` is on (off by default) | Drafts and minutes waiting, open pages, the week's accepts, rejects and uses |
+
+Each draft and page is one row in `phone_messages` (`UNIQUE(item, kind)`), claimed before the send
+and recorded after it, so it goes out once across restarts of either process. A send cut short by
+a crash between the two goes out again once its claim is 30 minutes old: only then can a second
+copy exist (Telegram has no idempotency key).
+
+The caption is plain text and is sent without `parse_mode`, so HTML or Markdown in a brief shows as
+written: the job id and template, the consumer, the brief (at most 360 characters), the brain's
+verdict and note, the review minutes, how the files went out, and "Reply to this message to add a
+note to your verdict." Terminal escape sequences, control characters, line breaks and invisible or
+bidi characters are removed, links in the brief and the brain's note become `[link removed]` (no
+tappable link, and link previews are off), and the caption stays inside Telegram's 1024 characters.
+
+### Buttons, notes and commands
+
+- **Approve / Reject** record `verdict JOB accept|reject` (the review minutes default to the
+  item's estimate, as on the CLI). After Approve the message offers **Used it** (`ship JOB`, at the
+  template's value) and **Undo** (`verdict JOB retract`); after Reject, **Undo**. The answer shows
+  the new P(ship); a template a kill criterion paused is announced in the chat.
+- The message's status line and buttons follow the item: a verdict, retract or pruning done
+  elsewhere (the CLI, retention) redraws it within a minute (`refresh_s`).
+- **A reply to a draft** adds a note: kept until the verdict while the draft waits, added to the
+  verdict (a `verdict_noted` event) within 30 minutes of it (`note_window_s`), refused after.
+- `/queue` sends every draft still awaiting a verdict and every open page again (the older copy
+  loses its buttons). `/status` shows gpud's mode and last tick, the planner, the review queue and
+  the week's caps per template. `/pause` and `/resume` pause or resume the planner only. `/help`
+  lists them. Other text gets one polite pointer to the commands per 10 minutes.
+
+### Security
+
+- **Secrets.** The token, the pairing state and the HMAC key live only in
+  `secrets/telegram.json`, written atomically under a lock; a looser mode is tightened back to
+  0600 / 0700 when it is read. config.json refuses a `phone_options` key or value that looks like a
+  token. The token is removed from every log line (the formatter redacts the whole finished line,
+  tracebacks included), every exception (a Bot API failure is raised without the urllib exception,
+  whose text or URL can carry it), every stored error and the CLI's output. The pairing code is
+  kept only as an HMAC.
+- **Pairing** binds exactly one private chat id and one user id. Five wrong codes, or the right
+  code seen in a group, burn the code; a group or channel can never pair.
+- **Everyone else is ignored.** Messages and button presses from another chat or user, any group,
+  any bot, and every update type other than a message or a button press get no reply and are
+  logged without their content.
+- **Signed buttons.** Button data is about 40 bytes: the action, the draft or page, the message's
+  issue counter and a 96-bit HMAC-SHA256 over them and the chat id, keyed by the pairing (a new key
+  at every pairing and unpairing). Forged or garbled data, data from an earlier pairing, a press on
+  an older copy, a press on an older drawing of the buttons (the counter moved on) or on an item
+  whose state changed meanwhile records nothing: it is answered with what happened and the message
+  is redrawn for the current state. The ledger's compare-and-set states are the last guard, so a
+  double tap or a race with the CLI records one verdict.
+- **Files.** Only regular files strictly inside the artifacts directory are uploaded (resolved;
+  never a symlink, never a file with a second hard link).
+
+**Privacy.** Drafts (the MP4 or audio, the brief, the brain's note), your notes and pages pass
+through Telegram's servers (bot chats are not end-to-end encrypted) and stay in the chat history on
+the phone. A template flagged `private` keeps its work off Telegram: its drafts arrive as a notice
+with the job id and the buttons only (no brief, brain note or file), and pages raised inside its
+lineage carry no details. To keep everything off Telegram, stop the service
+(`scripts/uninstall-launchagent.sh phone`).
+
+**Revoking.** `python3 -m foreman.cli phone unpair` tells the chat it is unpaired, deletes the
+token and the binding (`--keep-token` keeps the token to pair again) and invalidates every button
+already sent. To kill the token itself, send `/revoke` to @BotFather and pick the bot; the service
+then logs that Telegram rejected its token and waits for a new `phone setup`.
+
+### Robustness
+
+- Long polling (`getUpdates`, 20 s). The offset is persisted in `phone_state` after each update is
+  handled, so a restart neither loses nor repeats one. Each update has its own boundary: one that
+  raises is logged and skipped (its offset advances); one that meets a busy database is tried
+  again, up to three times.
+- Network errors back off exponentially (1 s, doubling to 5 min); a 429 waits its `retry_after`;
+  a 409 (someone else reads the updates) waits; a 401 (a revoked token) is logged once and the
+  service waits for a new token. Only a failure to reach Telegram ends a pass early: a bug or a bad
+  row in the outbox never stops the owner's presses being read. A draft that keeps failing for
+  another reason is marked failed after five tries (`phone status`; `/queue` tries it again).
+- A 403 (the owner blocked the bot) stops sending until the chat writes again.
+- A watchdog thread exits the service (status 70; launchd restarts it) when a pass makes no
+  progress for 10 minutes; an upload reports progress for every MB it sends.
+- Memory is bounded: answers are read up to 8 MB, uploads are streamed in 1 MB pieces, and the
+  outbox and the refresh handle a few messages per pass.
+
+Settings go under `phone_options` in config.json (fields of `foreman.phone_config.PhoneConfig`),
+for example `{"phone_options": {"digest": true, "digest_hour": 8, "pages": false}}`;
+`FOREMAN_PHONE_API` overrides the Bot API's base URL. The bot token is never a setting.
+
+### Known gaps of the phone service
+
+- It has not run against the real Telegram API: the tests use `tests/fake_telegram.py`, which
+  follows the Bot API documentation (methods, error shapes, offsets, `retry_after`) but is not
+  Telegram. The first live run should be `phone setup` and `phone test` on the Studio.
+- HTTPS uses the interpreter's CA store (`/usr/bin/python3` reads `/private/etc/ssl/cert.pem`); a
+  proxy configured in the environment or in macOS is used.
+- A crash between a successful send and its record sends that draft again, once, after the claim
+  goes stale (30 min).
+- A note replied before a verdict that is then given on the CLI stays with the phone: it only goes
+  with a verdict given by button.
+- A press is answered after the verdict is recorded; while Telegram is slow the button spins.
+- Telegram turns /commands in plain text into tappable links, so a brief containing "/pause" shows
+  one; tapping it sends the command from the owner's own chat, which is allowed anyway.
 
 ## Known gaps
 

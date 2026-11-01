@@ -389,7 +389,12 @@ def _item_or_raise(store, job_id: int) -> dict:
     return it
 
 
-def resolve_page(store, page_id: int, note: str | None, now: float) -> None:
+def _by(by) -> dict:
+    """Who acted, for the event (the phone service says 'phone'; the CLI leaves it out)."""
+    return {"by": str(by)[:20]} if by else {}
+
+
+def resolve_page(store, page_id: int, note: str | None, now: float, by: str | None = None) -> None:
     job = store.job(page_id)
     if job is None:
         raise LedgerError(f"no job {page_id}")
@@ -399,10 +404,11 @@ def resolve_page(store, page_id: int, note: str | None, now: float) -> None:
         if not store.update_job(page_id, expect_state="awaiting_human", state="resolved", finished_at=now,
                                 outcome={"status": "resolved", "note": note, "resolved_at": now}):
             raise LedgerError(f"page {page_id} is {store.job(page_id).state}, not awaiting a human")
-        store.event(now, "page_resolved", page_id, kind=job.kind, note=note)
+        store.event(now, "page_resolved", page_id, kind=job.kind, note=note, **_by(by))
 
 
-def record_verdict(store, job_id: int, verdict: str, minutes: float | None, note: str | None, now: float) -> dict:
+def record_verdict(store, job_id: int, verdict: str, minutes: float | None, note: str | None, now: float,
+                   by: str | None = None) -> dict:
     if verdict not in ("accept", "reject"):
         raise LedgerError("a verdict is accept or reject")
     if minutes is not None and (number(minutes) is None or minutes < 0 or minutes > 600):
@@ -416,7 +422,7 @@ def record_verdict(store, job_id: int, verdict: str, minutes: float | None, note
                            verdict=verdict, verdict_at=now, verdict_minutes=mins, verdict_note=note):
             raise LedgerError(f"item {it['id']} changed while recording the verdict; try again")
         store.event(now, "verdict_recorded", it["job_id"], item=it["id"], template=it["template_id"],
-                    verdict=verdict, minutes=mins)
+                    verdict=verdict, minutes=mins, **_by(by))
         if it.get("review_job_id"):  # the brain asked for a person about this item: that is this verdict
             for page in store.children(it["review_job_id"]):
                 if page.requires == "human" and page.state == "awaiting_human":
@@ -427,7 +433,7 @@ def record_verdict(store, job_id: int, verdict: str, minutes: float | None, note
     return item(store, it["id"])
 
 
-def retract_verdict(store, job_id: int, note: str | None, now: float) -> dict:
+def retract_verdict(store, job_id: int, note: str | None, now: float, by: str | None = None) -> dict:
     """Undo a verdict given by mistake: the item goes back to the review queue and P(ship) and the
     kill criteria forget the verdict (both are computed from the items). Only an accepted item
     that was not shipped, or a rejected item whose files were not pruned yet, can be retracted.
@@ -444,11 +450,37 @@ def retract_verdict(store, job_id: int, note: str | None, now: float) -> dict:
                            verdict_minutes=None, verdict_note=None):
             raise LedgerError(f"item {it['id']} changed while retracting the verdict; try again")
         store.event(now, "verdict_retracted", it["job_id"], item=it["id"], template=it["template_id"],
-                    retracted=it.get("verdict"), note=note)
+                    retracted=it.get("verdict"), note=note, **_by(by))
     return item(store, it["id"])
 
 
-def record_ship(store, job_id: int, usd: float | None, now: float) -> dict:
+NOTE_MAX = 1000  # characters of verdict_note, at most
+
+
+def annotate_verdict(store, job_id: int, note: str, now: float, window_s: float, by: str | None = None) -> dict:
+    """Add a note to a verdict already given (the phone's reply-to-note), within window_s of the
+    verdict (supervisor time). The verdict itself, P(ship) and the kill criteria are unchanged;
+    a verdict_noted event records it. An earlier note is kept and the new one appended."""
+    if not isinstance(note, str) or not note.strip():
+        raise LedgerError("an empty note")
+    it = _item_or_raise(store, job_id)
+    if it["state"] not in ("accepted", "rejected", "shipped") or not it.get("verdict"):
+        raise LedgerError(f"item {it['id']} (job {it['job_id']}) is {it['state']}: there is no verdict to add a note to")
+    at = it.get("verdict_at")
+    if at is None or number(window_s) is None or now - at > window_s:
+        raise LedgerError(f"the verdict on item {it['id']} (job {it['job_id']}) is older than "
+                          f"{(window_s or 0) / 60:.0f} minutes; a note can no longer be added")
+    old = it.get("verdict_note") or ""
+    text = (f"{old} | {note.strip()}" if old else note.strip())[:NOTE_MAX]
+    with store.tx():
+        if not update_item(store, it["id"], expect_state=it["state"], verdict_note=text):
+            raise LedgerError(f"item {it['id']} changed while adding the note; try again")
+        store.event(now, "verdict_noted", it["job_id"], item=it["id"], template=it["template_id"],
+                    verdict=it.get("verdict"), chars=len(note.strip()), **_by(by))
+    return item(store, it["id"])
+
+
+def record_ship(store, job_id: int, usd: float | None, now: float, by: str | None = None) -> dict:
     if usd is not None and (number(usd) is None or usd < 0 or usd > MAX_USD):
         raise LedgerError(f"--usd must be a finite number in 0..{MAX_USD:g}")
     it = _item_or_raise(store, job_id)
@@ -458,7 +490,7 @@ def record_ship(store, job_id: int, usd: float | None, now: float) -> dict:
     with store.tx():
         if not update_item(store, it["id"], expect_state="accepted", state="shipped", shipped_at=now, usd=usd):
             raise LedgerError(f"item {it['id']} changed while recording the shipment; try again")
-        store.event(now, "item_shipped", it["job_id"], item=it["id"], template=it["template_id"], usd=usd)
+        store.event(now, "item_shipped", it["job_id"], item=it["id"], template=it["template_id"], usd=usd, **_by(by))
     return item(store, it["id"])
 
 

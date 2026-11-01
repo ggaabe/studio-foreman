@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  User LaunchAgent template for Foreman's phone service (Telegram approvals). It is a separate
+  process from gpud on purpose: a Telegram outage, a slow upload or a bug in the phone code can
+  never delay or crash scheduling. It only reads and writes the same SQLite file as a non-leader
+  client, so neither service needs the other to be running.
+
+  scripts/install-launchagent.sh phone replaces __PYTHON__, __REPO__ and __HOME__ and bootstraps
+  it into gui/<uid>. The bot token is NOT in this file: it lives in
+  ~/.foreman/secrets/telegram.json (0600), written by `python3 -m foreman.cli phone setup`.
+  Without a token or a pairing the service idles and looks again every 30 s.
+
+  KeepAlive=true: it holds nothing that a restart would strand (sent messages are recorded in the
+  database before and after each send). ExitTimeOut 45 covers a long poll (20 s) in flight.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.github.ggaabe.foreman.phone</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON__</string>
+    <string>-m</string>
+    <string>foreman.phone</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__REPO__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONPATH</key>
+    <string>__REPO__</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+    <key>FOREMAN_HOME</key>
+    <string>__HOME__/.foreman</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>ExitTimeOut</key>
+  <integer>45</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>__HOME__/.foreman/logs/phone.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.foreman/logs/phone.stderr.log</string>
+</dict>
+</plist>

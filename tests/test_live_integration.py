@@ -41,6 +41,8 @@ class LI1OwnersDefaultIsACatalogModel(EngineCase):
 
     def test_a_brain_load_by_gpud_does_not_keep_the_owners_default(self):
         self.load(BRAIN)
+        # The adapter reports the load ready, then restores the default on the same load thread.
+        wait_for(lambda: self.fake.default_id == FLASH_BASE and defaults(self.fake))
         self.assertEqual(self.fake.default_id, FLASH_BASE, "the owner's default stays the owner's")
         self.assertEqual(defaults(self.fake), [{"model": FLASH_BASE, "default": True}])
         self.assertIn(FLASH_BASE, self.fake.ready, "and the owner's model stays resident")

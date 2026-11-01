@@ -7,3 +7,6 @@ __pycache__/
 artifacts/
 *.log
 .DS_Store
+secrets/
+telegram.json
+*.lock

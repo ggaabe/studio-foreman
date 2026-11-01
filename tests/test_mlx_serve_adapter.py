@@ -315,6 +315,8 @@ class M3Engine(EngineCase):
         self.load(KOKORO)  # media loads never qualify for promotion
         self.assertEqual(self.fake.default_id, FOREIGN)
         self.load(BRAIN)
+        # The adapter reports the load ready, then restores the default on the same load thread.
+        wait_for(lambda: self.fake.default_id == FOREIGN and not self.fake.default_promoted)
         self.assertEqual(self.fake.default_id, FOREIGN, "the brain load must not keep the default")
         self.assertFalse(self.fake.default_promoted, "the restore pins the default explicitly")
         self.assertEqual([b for b in self.fake.bodies("/v1/load-model") if b.get("default")],

@@ -229,6 +229,49 @@ CREATE TABLE IF NOT EXISTS template_state (
   at          REAL,
   since       REAL                               -- kill criteria only count history after this
 );
+
+-- Phone approvals (foreman/phone.py, a separate process and a non-leader client of this file).
+-- One row per draft (a review-queue item), page or digest sent to the owner's paired Telegram
+-- chat: UNIQUE(item, kind) is what makes each one a single message whatever happens to either
+-- process. `issue` is bumped every time the buttons are drawn again; the HMAC-signed callback
+-- data carries it, so a button from an older drawing (or an older copy) is recognised as stale.
+-- Times here are wall clock (Telegram's), not supervisor time. Nothing secret is stored here:
+-- the bot token, the pairing and the signing key live in $FOREMAN_HOME/secrets/telegram.json.
+CREATE TABLE IF NOT EXISTS phone_messages (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  item        INTEGER NOT NULL,                  -- plan_items.id (draft), jobs.id (page), YYYYMMDD (digest)
+  kind        TEXT NOT NULL,                     -- draft | page | digest
+  state       TEXT NOT NULL,                     -- pending | sending | sent | failed | closed
+  claim       TEXT,                              -- token of the process sending it right now
+  claimed_at  REAL,
+  message_id  INTEGER,
+  old_ids     TEXT NOT NULL DEFAULT '[]',        -- earlier copies (a /queue resend), newest last
+  media       TEXT,                              -- video | audio | document | text: how it went out
+  body        TEXT,                              -- the caption or text, without the status line
+  issue       INTEGER NOT NULL DEFAULT 0,
+  shown       TEXT,                              -- the item or page state the buttons were drawn for
+  last_action TEXT,                              -- the last button the owner pressed on it
+  acted_at    REAL,
+  note        TEXT,                              -- a reply that waits for the verdict
+  attempts    INTEGER NOT NULL DEFAULT 0,
+  next_try_at REAL,
+  error       TEXT,
+  created_at  REAL NOT NULL,
+  sent_at     REAL,
+  UNIQUE(item, kind)
+);
+CREATE INDEX IF NOT EXISTS phone_messages_msg ON phone_messages(message_id);
+
+CREATE TABLE IF NOT EXISTS phone_state (
+  id             INTEGER PRIMARY KEY CHECK (id = 1),
+  update_offset  INTEGER NOT NULL DEFAULT 0,     -- getUpdates offset: persisted after each update is handled
+  last_poll_wall REAL,                           -- heartbeat of the phone service
+  last_ok_wall   REAL,                           -- last successful Bot API call
+  last_error     TEXT,                           -- redacted
+  blocked        INTEGER NOT NULL DEFAULT 0,     -- the paired chat blocked the bot (403)
+  hint_at        REAL                            -- last polite answer to text it does not understand
+);
+INSERT OR IGNORE INTO phone_state (id) VALUES (1);
 """
 
 # Columns added after the first schema; _migrate() adds them to an older database file.

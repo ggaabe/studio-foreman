@@ -20,6 +20,11 @@ The planner's loop (see README "Planner"):
     python3 -m foreman.cli planner status|pause|resume|plan-now [--note TEXT]
     python3 -m foreman.cli report [--days 7] [--out PATH]  Markdown scoreboard
 
+Phone approvals over Telegram (see README "Phone approvals"; the service is foreman.phone):
+
+    python3 -m foreman.cli phone setup [--no-wait]        bot token (hidden prompt or stdin), then pairing
+    python3 -m foreman.cli phone status | test | resend | unpair [--keep-token]
+
 The CLI never talks to mlx-serve (except `status --live`, which only reads /api/ps) and never
 takes gpud's lock: it opens the same SQLite file as a non-leader client (Supervisor(lead=False))
 and goes through the supervisor's public submit(), so every admission rule applies. The running
@@ -207,39 +212,85 @@ def cmd_review(cfg, show_all: bool) -> None:
             print(f"             {it.get('fail_class') or '?'} failure; {_p(it['count_note'], 200)}")
 
 
-def cmd_verdict(cfg, job_id: int, verdict: str, minutes, note) -> None:
+# The owner's actions, without printing. The phone service (foreman/phone.py) records verdicts,
+# retracts, shipments, notes and page resolutions through these same functions, so both paths
+# share the ledger's validation, its events (the phone's carry by="phone") and the kill criteria.
+
+def apply_verdict(cfg, job_id: int, verdict: str, minutes=None, note=None, by=None) -> dict:
+    """accept | reject | retract. Returns {"item", "p_ship", "killed"}; raises ledger.LedgerError."""
     templates, _ = _templates(cfg)
     sup = _client(cfg)
-    if verdict == "retract":
-        try:
-            it = ledger.retract_verdict(sup.store, job_id, note, sup._now())
-            t = templates.get(it["template_id"])
-            p = ledger.posterior(t, ledger.items(sup.store, template=t.id))[2] if t else None
-        finally:
-            sup.close()
-        print(f"job {job_id}: verdict retracted; {_p(it['template_id'], 80)} item back in the review queue"
-              + (f"; P(ship) is now {p:.2f}" if p is not None else ""))
-        return
     try:
         now = sup._now()
-        it = ledger.record_verdict(sup.store, job_id, verdict, minutes, note, now)
+        if verdict == "retract":
+            it = ledger.retract_verdict(sup.store, job_id, note, now, by=by)
+            killed = []
+        else:
+            it = ledger.record_verdict(sup.store, job_id, verdict, minutes, note, now, by=by)
+            killed = ledger.kill_check(sup.store, templates, now, cfg.planner_config()) if templates else []
         t = templates.get(it["template_id"])
-        killed = ledger.kill_check(sup.store, templates, now, cfg.planner_config()) if templates else []
         p = ledger.posterior(t, ledger.items(sup.store, template=t.id))[2] if t else None
     finally:
         sup.close()
+    return {"item": it, "p_ship": p, "killed": killed}
+
+
+def apply_ship(cfg, job_id: int, usd=None, by=None) -> dict:
+    sup = _client(cfg)
+    try:
+        return ledger.record_ship(sup.store, job_id, usd, sup._now(), by=by)
+    finally:
+        sup.close()
+
+
+def apply_note(cfg, job_id: int, note: str, window_s: float, by=None) -> dict:
+    """Add a note to a verdict given at most window_s ago (supervisor time)."""
+    sup = _client(cfg)
+    try:
+        return ledger.annotate_verdict(sup.store, job_id, note, sup._now(), window_s, by=by)
+    finally:
+        sup.close()
+
+
+def apply_resolve(cfg, page_id: int, note=None, by=None) -> None:
+    sup = _client(cfg)
+    try:
+        ledger.resolve_page(sup.store, page_id, note, sup._now(), by=by)
+    finally:
+        sup.close()
+
+
+def apply_planner(cfg, action: str, note=None) -> dict:
+    """status | pause | resume | plan-now; returns planner.status() after the action."""
+    sup = _client(cfg)
+    try:
+        now = sup._now()
+        if action == "pause":
+            planner.set_paused(sup.store, True, note, now)
+        elif action == "resume":
+            planner.set_paused(sup.store, False, note, now)
+        elif action == "plan-now":
+            planner.plan_now(sup.store, now)
+        return planner.status(sup.store, now)
+    finally:
+        sup.close()
+
+
+def cmd_verdict(cfg, job_id: int, verdict: str, minutes, note) -> None:
+    res = apply_verdict(cfg, job_id, verdict, minutes, note)
+    it, p = res["item"], res["p_ship"]
+    if verdict == "retract":
+        print(f"job {job_id}: verdict retracted; {_p(it['template_id'], 80)} item back in the review queue"
+              + (f"; P(ship) is now {p:.2f}" if p is not None else ""))
+        return
     print(f"job {job_id}: {verdict} recorded for {it['template_id']} ({it['verdict_minutes']:g} review min)"
           + (f"; P(ship) is now {p:.2f}" if p is not None else ""))
-    for tid, reason, detail in killed:
+    for tid, reason, detail in res["killed"]:
         print(f"template {tid} paused by a kill criterion: {reason} ({detail})")
 
 
 def cmd_ship(cfg, job_id: int, usd) -> None:
-    sup = _client(cfg)
-    try:
-        it = ledger.record_ship(sup.store, job_id, usd, sup._now())
-    finally:
-        sup.close()
+    it = apply_ship(cfg, job_id, usd)
     print(f"job {job_id}: shipped ({it['template_id']})" + (f", ${usd:.2f}" if usd is not None else ""))
 
 
@@ -314,18 +365,7 @@ def cmd_templates(cfg, action: str, tid, note) -> int:
 
 
 def cmd_planner(cfg, action: str, note) -> None:
-    sup = _client(cfg)
-    try:
-        now = sup._now()
-        if action == "pause":
-            planner.set_paused(sup.store, True, note, now)
-        elif action == "resume":
-            planner.set_paused(sup.store, False, note, now)
-        elif action == "plan-now":
-            planner.plan_now(sup.store, now)
-        st = planner.status(sup.store, now)
-    finally:
-        sup.close()
+    st = apply_planner(cfg, action, note)
     if action == "pause":
         print("planner paused (gpud keeps running the queue; `planner resume` to plan again)")
     elif action == "resume":
@@ -415,6 +455,12 @@ def main(argv=None) -> int:
     rp = sub.add_parser("report", help="write the Markdown scoreboard")
     rp.add_argument("--days", type=float, default=7.0)
     rp.add_argument("--out")
+    ph = sub.add_parser("phone", help="phone approvals over Telegram: setup, status, test, resend, unpair")
+    ph.add_argument("action", choices=("setup", "status", "test", "resend", "unpair"))
+    ph.add_argument("--no-wait", action="store_true",
+                    help="setup: print the pairing link and return (the phone service completes the pairing)")
+    ph.add_argument("--timeout", type=float, help="setup: wait at most this many seconds for the pairing")
+    ph.add_argument("--keep-token", action="store_true", help="unpair: keep the bot token for a new pairing")
     args = ap.parse_args(argv)
     cfg = studio.load_config(args.config, db_path=args.db_path)
     try:
@@ -460,6 +506,21 @@ def main(argv=None) -> int:
             cmd_planner(cfg, args.action, args.note)
         elif args.cmd == "report":
             cmd_report(cfg, max(1.0, args.days), args.out)
+        elif args.cmd == "phone":
+            from . import phone
+            try:
+                if args.action == "setup":
+                    return phone.cli_setup(cfg, wait=not args.no_wait, timeout=args.timeout)
+                if args.action == "status":
+                    return phone.cli_status(cfg)
+                if args.action == "test":
+                    return phone.cli_test(cfg)
+                if args.action == "resend":
+                    return phone.cli_resend(cfg)
+                return phone.cli_unpair(cfg, keep_token=args.keep_token)
+            except phone.PhoneError as e:
+                print(f"phone: {e}", file=sys.stderr)
+                return 1
     except AdmissionError as e:
         print(f"refused: {e}", file=sys.stderr)
         return 2

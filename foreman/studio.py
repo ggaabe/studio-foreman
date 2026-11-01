@@ -113,6 +113,8 @@ class Config:
     planner: bool = True              # run the planner inside gpud (FOREMAN_PLANNER); it does nothing
                                       # until an active template exists in $FOREMAN_HOME/templates
     planner_options: dict = field(default_factory=dict)  # PlannerConfig fields, e.g. {"interval_s": 1800}
+    phone_options: dict = field(default_factory=dict)    # PhoneConfig fields (foreman/phone_config.py), e.g.
+                                      # {"digest": true}; never the bot token (secrets/telegram.json)
 
     def policy(self) -> Policy:
         overrides = {"host_reserve_gb": OS_RESERVE_GB + OTHER_TENANTS_GB + float(self.min_headroom_gb),
@@ -125,6 +127,10 @@ class Config:
     def planner_config(self):
         from .planner import PlannerConfig
         return PlannerConfig.from_dict(self.planner_options)
+
+    def phone_config(self):
+        from .phone_config import PhoneConfig
+        return PhoneConfig.from_dict(self.phone_options)
 
     def finish(self) -> "Config":
         self.home = os.path.expanduser(self.home or _home())
@@ -177,11 +183,15 @@ def load_config(path: str | None = None, env=None, **overrides) -> Config:
             setattr(cfg, attr, _bool(env[var]))
     if env.get("FOREMAN_PLANNER_INTERVAL_S") not in (None, ""):
         cfg.planner_options = dict(cfg.planner_options or {}, interval_s=float(env["FOREMAN_PLANNER_INTERVAL_S"]))
+    if env.get("FOREMAN_PHONE_API") not in (None, "") and isinstance(cfg.phone_options, dict):
+        cfg.phone_options = dict(cfg.phone_options, api_base=str(env["FOREMAN_PHONE_API"]))
     for k, v in overrides.items():
         if v is not None:
             setattr(cfg, k, v)
     if not isinstance(cfg.planner_options, dict):
         raise ValueError(f"{path}: planner_options must be an object of planner settings")
+    if not isinstance(cfg.phone_options, dict):
+        raise ValueError(f"{path}: phone_options must be an object of phone settings")
     if not isinstance(cfg.foreign_models, (list, tuple)) or not all(isinstance(m, str) for m in cfg.foreign_models):
         raise ValueError(f"{path}: foreign_models must be a list of model names")
     cfg.foreign_models = [catalog_model(m, f"{path}: foreign_models") for m in cfg.foreign_models]
@@ -195,6 +205,7 @@ def load_config(path: str | None = None, env=None, **overrides) -> Config:
                          f"less than the {brain.size_gb:g} GB brain: nothing could ever be loaded. At most "
                          f"{256.0 - OS_RESERVE_GB - OTHER_TENANTS_GB - brain.size_gb:g} GB")
     cfg.planner_config()  # fail early on an unknown or malformed planner option
+    cfg.phone_config()    # ... and phone option (a bot token there is refused)
     return cfg.finish()
 
 
