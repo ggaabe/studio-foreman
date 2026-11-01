@@ -76,6 +76,9 @@ ENGINE_FAILURE_REASONS = ("rejected",)
 # and a plan job without that key is never applied.
 PLAN_KIND = "plan"
 PLAN_KEY_PREFIX = "plan-tick:"
+# A continuation may say how long its brain job is expected to take (it sizes that job's lease:
+# an ad's script is written by the brain inside its continuation). At most this long.
+MAX_CONTINUATION_EXPECTED_S = 900.0
 
 
 class AdmissionError(ValueError):
@@ -827,6 +830,11 @@ class Supervisor:
             raise AdmissionError(f"continuation needs must be one of {NEEDS}, got {spec.get('needs')!r}")
         if spec.get("context") is not None and not isinstance(spec["context"], dict):
             raise AdmissionError("continuation context must be an object")
+        if spec.get("expected_s") is not None:
+            value = number(spec["expected_s"])
+            if value is None or not 0 < value <= MAX_CONTINUATION_EXPECTED_S:
+                raise AdmissionError(f"continuation expected_s must be a number in (0, {MAX_CONTINUATION_EXPECTED_S:g}], "
+                                     f"got {spec['expected_s']!r}")
         _jsonable(spec, "continuation")
         return True
 
@@ -916,6 +924,13 @@ class Supervisor:
     def _is_brain(self, model: str) -> bool:
         spec = self.catalog.get(model)
         return bool(spec and spec.is_brain)
+
+    def _gpu_media(self, model: str) -> bool:
+        """A catalog media model that holds GPU memory (ModelSpec.gpu_media). Models outside the
+        catalog are someone else's and of unknown kind: an engine that must not run beside them
+        checks for itself (the ComfyUI adapter asks mlx-serve before it starts)."""
+        spec = self.catalog.get(model)
+        return bool(spec and spec.gpu_media)
 
     def _family(self, model: str | None) -> str:
         spec = self.catalog.get(model)
@@ -1602,6 +1617,17 @@ class Supervisor:
         usable = self.p.usable_gb
         pinned = self._pinned()
         exclusive = any(m in self.catalog and self.catalog[m].exclusive for m in target)
+        # ModelSpec.solo_media (ComfyUI): no other GPU media model beside it, on any engine
+        solo = any(m in self.catalog and self.catalog[m].solo_media for m in target)
+        gpu_target = any(self._gpu_media(m) for m in target)
+        blocking = sorted(m for m in pinned if m not in target and (
+            (solo and self._gpu_media(m)) or (gpu_target and m in self.catalog and self.catalog[m].solo_media)))
+        if blocking:
+            self._room_why = (f"{sorted(target)} may not share the host with the media model(s) {blocking}, which "
+                              f"gpud may not unload (someone else's, or their engine does not answer)")
+            self._note(now, "insufficient_memory", ("solo", tuple(sorted(target)), tuple(blocking)),
+                       target=sorted(target), pinned=blocking, reason="solo_media")
+            return False
         pinned_gb = sum(self._size(m) for m in pinned if m not in target)
         if (exclusive and any(m not in target for m in pinned)) or \
                 pinned_gb + sum(self._size(m) for m in target) > usable:
@@ -1630,7 +1656,9 @@ class Supervisor:
                 continue  # dropped by an engine restart earlier in this loop
             used = sum(self._size(x) for x in self._resident) + coming
             need = sum(self._size(x) for x in target if x not in self._resident)
-            must = exclusive or (m in self.catalog and self.catalog[m].exclusive) or (no_brain and self._is_brain(m))
+            must = exclusive or (m in self.catalog and self.catalog[m].exclusive) or (no_brain and self._is_brain(m)) \
+                or (solo and self._gpu_media(m)) \
+                or (gpu_target and m in self.catalog and self.catalog[m].solo_media)
             if not must and used + need <= usable:
                 continue
             try:
@@ -2131,9 +2159,13 @@ class Supervisor:
                 child = self._human_review(job, reason, now, idem=f"cont:{job.id}", brief=brief,
                                            is_continuation=True)
             else:
+                payload = {"needs": spec.get("needs", "any"), "brief": brief}
+                expected = number(spec.get("expected_s"))
+                if expected is not None and 0 < expected <= MAX_CONTINUATION_EXPECTED_S:
+                    payload["expected_s"] = expected  # sizes the brain job's lease (default brain_job_expected_s)
                 child, _ = self._insert_job(
                     kind=spec["kind"], requires="brain", state="queued",
-                    payload={"needs": spec.get("needs", "any"), "brief": brief},
+                    payload=payload,
                     parent_id=job.id, root_id=job.root_id or job.id, depth=job.depth + 1,
                     max_attempts=self.p.max_attempts, priority=self.p.continuation_priority,
                     deadline=now + self.p.brain_return_sla_s, idempotency_key=f"cont:{job.id}",

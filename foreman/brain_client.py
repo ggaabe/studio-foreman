@@ -199,12 +199,13 @@ class BrainClient:
     wants_context = True
 
     def __init__(self, base_url: str = "http://127.0.0.1:11234", catalog=None, max_tokens: int = 600,
-                 temperature: float = 0.2, timeout_s: float = 140.0, frames: int = 3, server_ids=None):
+                 temperature: float = 0.2, timeout_s: float = 140.0, frames: int = 3, server_ids=None, ads=None):
         self.base_url = base_url.rstrip("/")
         self.catalog = catalog or {}
         self.max_tokens, self.temperature, self.timeout_s = max_tokens, temperature, timeout_s
         self.frames = max(0, min(4, frames))
         self.server_ids = server_ids or {}
+        self.ads = ads               # foreman.ad_pipeline.AdPipeline: an ad's steps (kinds ad_*)
         self.transcript: list = []   # last few prompts/replies, for debugging (bounded)
 
     # ---- the contract
@@ -219,6 +220,11 @@ class BrainClient:
             return {"verdict": "ack", "note": "brain checkpoint between brainless jobs", "submit": []}
         if kind == PLAN_KIND:            # the planner: gpud built the prompt; its code parses the reply
             return self.plan(payload, model, ctx)
+        if kind.startswith("ad_"):       # an ad's dispatcher: code decides; the brain writes and checks
+            if self.ads is None:
+                return {"verdict": "human_review", "note": "an ad step reached a brain without the ad pipeline "
+                                                          "configured", "submit": []}
+            return self.ads.brain_step(spec, model, ctx, self)
         vision = bool(getattr(ctx.spec, "vision", False)) if ctx is not None else \
             bool(getattr(self.catalog.get(model), "vision", False))
         messages = self.messages(kind, brief, vision)

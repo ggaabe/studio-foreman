@@ -1,0 +1,13 @@
+{
+  "notes": "The FORMAT of a graph template, not a working graph: export the real one from ComfyUI (Save (API Format)) and put placeholders where Foreman fills values. A string that is exactly one placeholder takes the value's type ({{seed}} becomes a number). Foreman fills prompt, seed, width, height and image_1..image_4 (the uploaded stills) for stills; num_frames, fps, seconds and audio_1 for shots.",
+  "license": "set this to the license of every model the graph loads",
+  "commercial_ok": false,
+  "outputs": ["9"],
+  "defaults": {"steps": 4},
+  "graph": {
+    "1": {"class_type": "LoadImage", "inputs": {"image": "{{image_1}}"}},
+    "2": {"class_type": "ExampleImageEditNode", "inputs": {"image": ["1", 0], "prompt": "{{prompt}}", "seed": "{{seed}}",
+                                                            "steps": "{{steps}}", "width": "{{width}}", "height": "{{height}}"}},
+    "9": {"class_type": "SaveImage", "inputs": {"images": ["2", 0], "filename_prefix": "foreman"}}
+  }
+}

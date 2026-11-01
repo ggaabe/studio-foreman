@@ -9,6 +9,13 @@ SSE progress / complete / error for speech, music and video, streaming chat comp
 the fallback to the default model for an unknown id, and /metrics with
 `mlx_serve:process_start_time_seconds` (restart() starts a new server process). Per-request
 behaviours (hang, error, drop, http500, http400, black or frozen video) are scripted per endpoint.
+
+For the ad pipeline (MLX-Serve 26.11.1 shapes): capabilities per model in /v1/models (audio,
+music, video, image, transcription, alignment), speech with a Qwen3-TTS `ref_audio` clone,
+multipart /v1/audio/transcriptions answering verbose_json with word times spread over the WAV,
+non-streaming /v1/images/generations (edit mode, at most 4 ref_images), and the full video request
+checked the way the server checks it (8k+1 frames, a 64 px grid for two-stage and 32 px for one
+stage, audio-to-video only two-stage, at most 768 MiB of raw RGB, decodable keyframes and audio).
 """
 from __future__ import annotations
 
@@ -58,6 +65,50 @@ def video_frames(width: int, height: int, frames: int, mode: str = "ok") -> byte
     return bytes(out)
 
 
+def capabilities(mid: str, markers=()) -> list:
+    """What /v1/models lists for a model id (by its name, like the real server's packs)."""
+    low = mid.lower()
+    if "ace-step" in low:
+        return ["audio", "music"]
+    if "ltx" in low:
+        return ["video"]
+    if "flux" in low or "klein" in low:
+        return ["image"]
+    if "aligner" in low:
+        return ["alignment"]
+    if "asr" in low:
+        return ["transcription"]
+    if any(m in low for m in markers):
+        return ["audio"]
+    return ["chat", "streaming", "vision"]
+
+
+def parse_multipart(ctype: str, raw: bytes) -> tuple:
+    """({field: value}, {file field: bytes}) of a multipart/form-data body."""
+    m = __import__("re").search(r"boundary=([^;]+)", ctype or "")
+    fields, files = {}, {}
+    if not m:
+        return fields, files
+    boundary = b"--" + m.group(1).strip().strip('"').encode()
+    for part in raw.split(boundary):
+        if part.startswith(b"\r\n"):
+            part = part[2:]
+        if part.endswith(b"\r\n"):
+            part = part[:-2]
+        if not part or part.startswith(b"--"):
+            continue
+        head, _, data = part.partition(b"\r\n\r\n")
+        disp = head.decode("latin-1")
+        name = __import__("re").search(r'name="([^"]+)"', disp)
+        if not name:
+            continue
+        if 'filename="' in disp:
+            files[name.group(1)] = data
+        else:
+            fields[name.group(1)] = data.decode("utf-8", "replace")
+    return fields, files
+
+
 class FakeMlxServe:
     def __init__(self, sizes=None):
         self.sizes = dict(sizes or {})          # server id (or basename) -> bytes
@@ -68,7 +119,16 @@ class FakeMlxServe:
         # the default (default_promoted), unless a load said "default": true (setDefault).
         self.default_id = ""
         self.default_promoted = False
-        self.media_markers = ("kokoro", "ace-step", "ltx", "flux", "tts")
+        self.media_markers = ("kokoro", "ace-step", "ltx", "flux", "tts", "asr", "aligner", "klein")
+        self.speech_rate = 0.06                 # seconds of speech per input character
+        self.speech_cap = 3.0                   # ... at most this long
+        self.music_cap = 3.0
+        self.asr_text = None                    # what the fake "hears" (default: the input it last spoke)
+        self.asr_lower = True                   # ASR writes words lower-cased (a URL comes back lower-case)
+        self.last_speech = ""
+        self.image_size_cap = 256
+        self.image_delay = 0.0
+        self.video_requests = []                # summaries of the video requests (fields, decoded sizes)
         self.free_mib = 200000
         self.health_ok = True
         self.load_delay = 0.0
@@ -228,17 +288,20 @@ class _Handler(BaseHTTPRequestHandler):
                 ids += sorted(s.loading - set(ids))
                 data = [{"id": i, "object": "model", "loaded": i in s.ready,
                          "state": "ready" if i in s.ready else "loading" if i in s.loading else "unloaded",
-                         "capabilities": (["audio"] if any(m in i.lower() for m in s.media_markers)
-                                          else ["chat", "streaming", "vision"])} for i in ids]
+                         "capabilities": capabilities(i, s.media_markers)} for i in ids]
             return self._json(200, {"object": "list", "data": data,
                                     "machine": {"os": "macos", "free_mib": s.free_mib, "total_mib": 262144}})
         return self._error(404, "Unknown endpoint", "not_found")
 
     def do_POST(self):
         s = self.server_state
+        if self.path == "/v1/audio/transcriptions":
+            return self._transcribe()
         body = self._body()
         with s.lock:
             s.requests.append(("POST", self.path, body))
+        if self.path == "/v1/images/generations":
+            return self._image(body)
         if self.path == "/v1/load-model":
             return self._load(body)
         if self.path == "/v1/unload-model":
@@ -311,10 +374,118 @@ class _Handler(BaseHTTPRequestHandler):
                              "video/3D/decision model and target it by id.")
         return ok
 
+    def _transcribe(self):
+        s = self.server_state
+        n = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(n) if n else b""
+        fields, files = parse_multipart(self.headers.get("Content-Type", ""), raw)
+        with s.lock:
+            s.requests.append(("POST", self.path, dict(fields, file_bytes=len(files.get("file", b"")))))
+        if not self._resident_or_fallback({"model": fields.get("model")}):
+            return
+        audio = files.get("file")
+        try:
+            with wave.open(io.BytesIO(audio or b""), "rb") as w:
+                seconds = w.getnframes() / float(w.getframerate())
+        except Exception:
+            return self._error(400, "file must be a WAV")
+        text = s.asr_text if s.asr_text is not None else s.last_speech or "hello world"
+        words = [w for w in text.split() if w]
+        if s.asr_lower:
+            words = [w.lower() for w in words]
+        out = {"task": "transcribe", "language": fields.get("language") or "en", "duration": seconds,
+               "text": " ".join(words), "segments": [{"id": 0, "start": 0.0, "end": seconds, "text": " ".join(words)}]}
+        if fields.get("timestamp_granularities[]") == "word" and words:
+            lead, span = 0.05 * seconds, 0.9 * seconds
+            step = span / len(words)
+            out["words"] = [{"word": w.strip(".,!?"), "start": round(lead + i * step, 3),
+                             "end": round(lead + (i + 0.8) * step, 3)} for i, w in enumerate(words)]
+        return self._json(200, out)
+
+    def _image(self, body):
+        s = self.server_state
+        if not self._resident_or_fallback(body):
+            return
+        with s.lock:
+            behaviour = s.script["/v1/images/generations"].popleft() if s.script["/v1/images/generations"] else "ok"
+        if behaviour == "http500":
+            return self._error(500, "generation failed", "server_error")
+        if s.image_delay:
+            time.sleep(s.image_delay)
+        refs = body.get("ref_images") or []
+        if len(refs) > 4:
+            return self._error(400, "ref_images: this model takes at most 4 reference images")
+        for b in ([body["image"]] if body.get("image") else []) + list(refs):
+            try:
+                base64.b64decode(b, validate=True)
+            except Exception:
+                return self._error(400, "image is not base64")
+        if body.get("mode") not in (None, "edit", "variation"):
+            return self._error(400, "mode must be edit or variation")
+        try:
+            w, h = (int(x) for x in str(body.get("size") or "64x64").split("x"))
+        except ValueError:
+            return self._error(400, "size must be WxH")
+        w, h = max(8, min(w, s.image_size_cap)), max(8, min(h, s.image_size_cap))
+        seed = int(body.get("seed") or 0)
+        pix = bytes(((x * 7 + seed) % 256 if c == 0 else (y * 5 + seed) % 256 if c == 1 else (x + y) % 256)
+                    for y in range(h) for x in range(w) for c in range(3))
+        from foreman.media import encode_png
+        png = encode_png(w, h, pix)
+        return self._json(200, {"created": 0, "data": [{"b64_json": base64.b64encode(png).decode()}]})
+
+    def _video_problem(self, body):
+        w, h, n = body.get("width", 384), body.get("height", 256), body.get("num_frames", 9)
+        pipeline = body.get("pipeline") or "one_stage"
+        if not all(isinstance(v, int) for v in (w, h, n)):
+            return "width, height and num_frames must be integers"
+        if (n - 1) % 8 or n < 9:
+            return f"num_frames must be 8k+1, got {n}"
+        grid = 64 if str(pipeline).startswith("two_stage") else 32
+        if w % grid or h % grid:
+            return f"{pipeline} needs width and height divisible by {grid}"
+        if body.get("audio") and not str(pipeline).startswith("two_stage"):
+            return "audio-to-video requires pipeline two_stage or two_stage_hq"
+        if n * w * h * 3 > 768 * (1 << 20):
+            return "request exceeds 768 MiB of raw RGB"
+        if body.get("last_frame_image") and n < 9:
+            return "last_frame_image needs at least 9 frames"
+        summary = {k: body.get(k) for k in ("width", "height", "num_frames", "seed", "pipeline", "steps", "decoder",
+                                            "prompt", "lora_paths")}
+        for key in ("first_frame_image", "last_frame_image", "audio"):
+            if body.get(key):
+                try:
+                    raw = base64.b64decode(body[key], validate=True)
+                except Exception:
+                    return f"{key} is not base64"
+                summary[key] = len(raw)
+                if key == "audio":
+                    try:
+                        with wave.open(io.BytesIO(raw), "rb") as wv:
+                            summary["audio_s"] = wv.getnframes() / float(wv.getframerate())
+                    except Exception:
+                        return "audio must be a WAV"
+        with self.server_state.lock:
+            self.server_state.video_requests.append(summary)
+        return None
+
     def _media(self, path, body):
         s = self.server_state
         if not self._resident_or_fallback(body):
             return
+        if path.endswith("video/generations"):
+            problem = self._video_problem(body)
+            if problem:
+                return self._error(400, problem)
+        if path.endswith("speech") and body.get("ref_audio"):
+            try:
+                with wave.open(io.BytesIO(base64.b64decode(body["ref_audio"], validate=True)), "rb"):
+                    pass
+            except Exception:
+                return self._error(400, "ref_audio must be a base64 WAV")
+        if path.endswith("speech"):
+            with s.lock:
+                s.last_speech = str(body.get("input") or "")
         with s.lock:
             behaviour = s.script[path].popleft() if s.script[path] else "ok"
         if behaviour == "http500":
@@ -371,8 +542,11 @@ class _Handler(BaseHTTPRequestHandler):
                     + base64.b64encode(pcm) + b'"}')
             self._send(head + b64 + tail)
             return
-        seconds = float(body.get("duration_seconds") or max(1.0, 0.06 * len(body.get("input", "x"))))
-        wav = tone_wav(min(seconds, 3.0), silent_tail=min(seconds, 3.0) if behaviour == "silent" else 0.0)
+        if path.endswith("speech"):
+            seconds = min(s.speech_cap, max(1.0, s.speech_rate * len(body.get("input", "x"))))
+        else:
+            seconds = min(s.music_cap, float(body.get("duration_seconds") or max(1.0, 0.06 * len(body.get("input", "x")))))
+        wav = tone_wav(seconds, silent_tail=seconds if behaviour == "silent" else 0.0)
         self._send({"type": "complete", "format": "wav", "data": base64.b64encode(wav).decode()})
 
     def _chat(self, body):

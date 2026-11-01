@@ -20,6 +20,16 @@ The planner's loop (see README "Planner"):
     python3 -m foreman.cli planner status|pause|resume|plan-now [--note TEXT]
     python3 -m foreman.cli report [--days 7] [--out PATH]  Markdown scoreboard
 
+Ads (see README "Ads") and the characters they star:
+
+    python3 -m foreman.cli ads status                     every ad, where it stands
+    python3 -m foreman.cli ads inspect JOB|AD_ID          its steps, takes, QA and files
+    python3 -m foreman.cli ads enqueue TEMPLATE --brief TEXT [--seconds S --shots N --seed X] [--force]
+    python3 -m foreman.cli ads models [--rescan]          the configured model per role vs /v1/models
+    python3 -m foreman.cli characters list | show ID
+    python3 -m foreman.cli characters import DIR --id ID [--voice af_heart | --ref-wav F] [--look TEXT] [--approve]
+    python3 -m foreman.cli characters approve ID FILE... [--tags hero,talk] [--unapprove]
+
 Phone approvals over Telegram (see README "Phone approvals"; the service is foreman.phone):
 
     python3 -m foreman.cli phone setup [--no-wait]        bot token (hidden prompt or stdin), then pairing
@@ -50,7 +60,8 @@ from .text import printable as _p
 class _ClientEngine:
     """Admission only checks that an engine is configured; a client never calls it."""
 
-    name = studio.ENGINE
+    def __init__(self, name: str = studio.ENGINE):
+        self.name = name
 
     def __getattr__(self, item):
         raise AttributeError(f"the CLI does not talk to engines (asked for {item!r})")
@@ -59,8 +70,9 @@ class _ClientEngine:
 def _client(cfg) -> Supervisor:
     if not os.path.exists(os.path.dirname(cfg.db_path) or "."):
         os.makedirs(os.path.dirname(cfg.db_path), exist_ok=True)
-    return Supervisor(cfg.db_path, {studio.ENGINE: _ClientEngine()}, SystemClock(), studio.policy(),
-                      catalog=studio.catalog(cfg.video_exclusive), lead=False)
+    catalog = cfg.catalog()
+    engines = {name: _ClientEngine(name) for name in sorted({s.engine for s in catalog.values()})}
+    return Supervisor(cfg.db_path, engines, SystemClock(), studio.policy(), catalog=catalog, lead=False)
 
 
 def _when(wall) -> str:
@@ -399,6 +411,166 @@ def cmd_report(cfg, days: float, out) -> str:
     return path
 
 
+# ---------------------------------------------------------------- ads and characters
+
+def cmd_ads(cfg, args) -> int:
+    from . import ad_pipeline
+    if args.action == "status":
+        sup = _client(cfg)
+        try:
+            items = ad_pipeline.ad_items(sup.store, cfg.artifacts_dir)
+        finally:
+            sup.close()
+        if not items:
+            print("no ads yet (ads enqueue TEMPLATE --brief TEXT, or an active ad template for the planner)")
+        for it in items:
+            pr = it["progress"] or {}
+            last = it["last_job"] or {}
+            print(f"job {it['job_id']:<5} item {it['item']:<4} {it['state']:<9} {_p(it['template_id'], 60)}  "
+                  f"step {pr.get('current', '?'):<9} last {_p(last.get('kind'), 20)} {last.get('state', '-')}")
+            print(f"    brief: {_p(it['brief'], 160)}")
+            if pr.get("final"):
+                print(f"    MP4  {_p(pr['final'])}")
+            if it["state"] == "failed":
+                print(f"    {it.get('fail_class') or '?'} failure: {_p(it.get('fail_reason') or '', 200)}")
+        return 0
+    if args.action == "inspect":
+        if not args.target:
+            print("ads inspect needs a job id or an ad id", file=sys.stderr)
+            return 2
+        sup = _client(cfg)
+        try:
+            items = ad_pipeline.ad_items(sup.store, cfg.artifacts_dir)
+            events = None
+            hit = next((i for i in items if str(i["job_id"]) == args.target or i["ad_id"] == args.target), None)
+            if hit:
+                events = [e for e in sup.store.events(job_id=hit["job_id"])][-5:]
+        finally:
+            sup.close()
+        if hit is None:
+            print(f"no ad {args.target!r}", file=sys.stderr)
+            return 1
+        wd = hit["workdir"]
+        print(f"ad {hit['ad_id']} (job {hit['job_id']}, item {hit['item']}, {hit['state']})  {_p(wd)}")
+        pr = hit["progress"] or {"done": {}}
+        print("steps   " + "  ".join(f"{k}:{'done' if v else '-'}" for k, v in pr["done"].items()))
+        from . import paths as _paths
+        script = _paths.read_json(os.path.join(wd, "script.json")) if wd else None
+        if isinstance(script, dict):
+            for ln in script.get("lines", []):
+                print(f"  line {ln['i']} ({ln['role']}): {_p(ln['text'], 200)}")
+            for sh in script.get("shots", []):
+                print(f"  shot {sh['k']} {sh['kind']:<7} lines {sh['lines']} {_p(sh.get('visual') or '', 120)}")
+        pick = _paths.read_json(os.path.join(wd, "pick.json")) if wd else None
+        for k, v in (pick or {}).items():
+            print(f"  shot {k}: picked seed {v.get('seed')} (score {v.get('score')}); takes "
+                  + ", ".join(f"{t['seed']}={t['score']}" for t in v.get("takes", [])))
+        qa = _paths.read_json(os.path.join(wd, "final", "qa.json")) if wd else None
+        if isinstance(qa, dict):
+            print("QA      " + ("pass" if qa.get("ok") else "FAIL") + ": "
+                  + "; ".join(f"{c['check']} {'ok' if c['ok'] else 'FAIL'} ({_p(c['detail'], 60)})" for c in qa["checks"]))
+        state = _paths.read_json(os.path.join(wd, "state.json"), {}) if wd else {}
+        for st in (state or {}).get("steps", [])[-12:]:
+            print(f"  job {st.get('job_id')}: {st.get('kind')} {st.get('status')} ({st.get('reason')}) "
+                  f"{st.get('seconds')}s")
+        if (state or {}).get("script_errors"):
+            print(f"  script problems: {_p(state['script_errors'], 300)}")
+        for e in events or []:
+            print(f"  event {e['kind']} {json.dumps(e['data'], default=str)[:160]}")
+        for name in ("final/ad.mp4", "manifest.json"):
+            if wd and os.path.exists(os.path.join(wd, name)):
+                print(f"  {name:<14} {_p(os.path.join(wd, name))}")
+        return 0
+    if args.action == "enqueue":
+        templates, errors = _templates(cfg)
+        t = templates.get(args.target or "")
+        if t is None:
+            print(f"no loaded template {args.target!r}" + (f" ({len(errors)} template file(s) have errors)" if errors else ""),
+                  file=sys.stderr)
+            return 1
+        sup = _client(cfg)
+        try:
+            res = ad_pipeline.enqueue(sup, t, args.brief, args.consumer,
+                                      {"seconds": args.seconds, "shots": args.shots, "seed": args.seed},
+                                      cfg.artifacts_dir, cfg.home, cfg.planner_config(), force=args.force)
+        finally:
+            sup.close()
+        print(f"ad {res['ad_id']} queued as job {res['job_id']} (item {res['item']}); gpud runs it step by step. "
+              f"Work directory: {res['workdir']}")
+        return 0
+    if args.action == "models":
+        from .httpio import json_call
+        try:
+            if args.rescan:
+                json_call(cfg.base_url, "POST", "/v1/models/rescan", {}, timeout=30.0)
+            _, obj = json_call(cfg.base_url, "GET", "/v1/models", timeout=5.0)
+        except Exception as e:
+            print(f"mlx-serve unreachable: {type(e).__name__}: {e}", file=sys.stderr)
+            return 1
+        listed = {e.get("id"): set(e.get("capabilities") or []) for e in (obj or {}).get("data") or [] if isinstance(e, dict)}
+        need = {"tts": "audio", "tts_clone": "audio", "asr": "transcription", "image": "image", "video": "video",
+                "music": "music"}
+        ads_cfg = cfg.ads_config()
+        for role, cap in need.items():
+            m = ads_cfg.models.get(role)
+            base = (m or "").rsplit("/", 1)[-1]
+            sid = m if m in listed else next((i for i in listed if i and i.rsplit("/", 1)[-1] == base), None)
+            caps = listed.get(sid)
+            state = "missing" if sid is None else ("ok" if caps is None or cap in caps else f"lacks {cap!r}")
+            print(f"{role:<10} {_p(m or '-', 60):<60} {state}" + (f" (caps {sorted(caps)})" if caps else ""))
+        for i, caps in sorted(listed.items(), key=lambda x: str(x[0])):
+            print(f"  server: {_p(i, 70):<70} {sorted(caps)}")
+        return 0
+    return 2
+
+
+def cmd_characters(cfg, args) -> int:
+    from . import characters
+    try:
+        if args.action == "list":
+            found = characters.list_bibles(cfg.home)
+            if not found:
+                print(f"no characters in {characters.characters_dir(cfg.home)} (characters import DIR --id ID)")
+            for cid, b, err in found:
+                if b is None:
+                    print(f"{_p(cid, 64):<24} ERROR {_p(err, 300)}")
+                    continue
+                d = b.describe()
+                print(f"{cid:<24} {_p(d['name'] or '', 30):<30} {d['kind'] or '-':<7} stills {d['approved']}/{d['stills']} "
+                      f"approved, tags {d['tags']}, voice {d['voice'].get('engine')}" + ("" if d["hero"] else "  (NO HERO)"))
+            return 0
+        if args.action == "show":
+            b = characters.load_bible(cfg.home, args.id or "")
+            d = b.describe()
+            print(json.dumps(d, indent=1))
+            for st in b.data.get("stills", []):
+                print(f"  {'approved' if st.get('approved') else 'pending ':<8} {','.join(st.get('tags', [])):<24} "
+                      f"{_p(os.path.join(b.root, st['file']))}")
+            return 0
+        if args.action == "import":
+            if not args.dir or not args.id:
+                print("characters import needs DIR and --id", file=sys.stderr)
+                return 2
+            b = characters.import_folder(cfg.home, args.dir, args.id, name=args.name, kind=args.kind, look=args.look,
+                                         subject=args.subject, voice=args.voice, speed=args.speed, ref_wav=args.ref_wav,
+                                         language=args.language, approve=args.approve, overwrite=args.overwrite)
+            d = b.describe()
+            print(f"character {b.id}: {d['stills']} still(s), {d['approved']} approved, tags {d['tags']} -> {b.root}")
+            if not d["hero"]:
+                print("note: no approved still is tagged hero; ads need one (characters approve ID FILE --tags hero)")
+            return 0
+        if args.action == "approve":
+            b = characters.approve(cfg.home, args.id or "", args.files or [],
+                                   tags=[t for t in (args.tags or "").split(",") if t] or None,
+                                   approved=not args.unapprove)
+            print(f"character {b.id}: approved stills now {b.describe()['approved']}")
+            return 0
+    except characters.BibleError as e:
+        print(f"characters: {e}", file=sys.stderr)
+        return 1
+    return 2
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python3 -m foreman.cli", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -457,6 +629,33 @@ def main(argv=None) -> int:
     rp = sub.add_parser("report", help="write the Markdown scoreboard")
     rp.add_argument("--days", type=float, default=7.0)
     rp.add_argument("--out")
+    ad = sub.add_parser("ads", help="ads: status, inspect, enqueue one from a template, models")
+    ad.add_argument("action", choices=("status", "inspect", "enqueue", "models"))
+    ad.add_argument("target", nargs="?", help="inspect: a job id or an ad id; enqueue: a template id")
+    ad.add_argument("--brief", help="enqueue: this ad's angle on the template's concept")
+    ad.add_argument("--consumer")
+    ad.add_argument("--seconds", type=float)
+    ad.add_argument("--shots", type=int)
+    ad.add_argument("--seed", type=int)
+    ad.add_argument("--force", action="store_true", help="enqueue past the weekly cap and the disk guard")
+    ad.add_argument("--rescan", action="store_true", help="models: POST /v1/models/rescan first")
+    ch = sub.add_parser("characters", help="character bibles under $FOREMAN_HOME/characters")
+    ch.add_argument("action", choices=("list", "show", "import", "approve"))
+    ch.add_argument("id_or_dir", nargs="?", help="show/approve: the character id; import: the folder")
+    ch.add_argument("files", nargs="*", help="approve: still file names")
+    ch.add_argument("--id", dest="char_id")
+    ch.add_argument("--name")
+    ch.add_argument("--kind", choices=("human", "mascot"))
+    ch.add_argument("--look")
+    ch.add_argument("--subject")
+    ch.add_argument("--voice", help="a Kokoro voice id (or a blend 'am_onyx,bm_george')")
+    ch.add_argument("--speed", type=float)
+    ch.add_argument("--ref-wav", dest="ref_wav", help="a reference WAV for a Qwen3-TTS voice clone")
+    ch.add_argument("--language")
+    ch.add_argument("--tags", help="approve: comma-separated tags to set")
+    ch.add_argument("--approve", action="store_true", help="import: approve every still (you checked them)")
+    ch.add_argument("--unapprove", action="store_true")
+    ch.add_argument("--overwrite", action="store_true")
     ph = sub.add_parser("phone", help="phone approvals over Telegram: setup, status, test, resend, unpair")
     ph.add_argument("action", choices=("setup", "status", "test", "resend", "unpair"))
     ph.add_argument("--no-wait", action="store_true",
@@ -508,6 +707,14 @@ def main(argv=None) -> int:
             cmd_planner(cfg, args.action, args.note)
         elif args.cmd == "report":
             cmd_report(cfg, max(1.0, args.days), args.out)
+        elif args.cmd == "ads":
+            return cmd_ads(cfg, args)
+        elif args.cmd == "characters":
+            if args.action == "import":
+                args.dir, args.id = args.id_or_dir, args.char_id
+            else:
+                args.id = args.id_or_dir or args.char_id
+            return cmd_characters(cfg, args)
         elif args.cmd == "phone":
             from . import phone
             try:

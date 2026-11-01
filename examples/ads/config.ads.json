@@ -1,0 +1,21 @@
+{
+  "ads_options": {
+    "stills_backend": "mlx",
+    "talk_backend": "mlx",
+    "broll_backend": "mlx",
+    "talk_seeds": 3,
+    "talk_pipeline": "two_stage",
+    "broll_steps": 8,
+    "video_width": 704,
+    "video_height": 1280,
+    "expected": {"still": 60, "talk": 420, "broll": 150, "music": 120},
+    "max_job_s": 600,
+    "fonts": ["/System/Library/Fonts/Supplemental/Arial Bold.ttf"]
+  },
+  "comfyui_options": {
+    "dir": "~/ComfyUI",
+    "port": 8188,
+    "plan_gb": 60,
+    "exit_after_job": true
+  }
+}

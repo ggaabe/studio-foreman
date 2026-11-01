@@ -19,10 +19,20 @@ class ModelSpec:
     vision: bool = False
     exclusive: bool = False  # must be the only model resident on the host
     evicts_brain: bool = False  # no brain may stay resident while this model runs (other models may)
+    # The only media model on the host while it is resident, on any engine (ComfyUI beside
+    # mlx-serve): gpud unloads its own other media models before loading it and unloads it before
+    # loading any other media model; a media model gpud may not unload makes it wait. Brains and
+    # CPU-only models (family "cpu") may stay.
+    solo_media: bool = False
 
     @property
     def is_brain(self) -> bool:
         return self.family == "brain"
+
+    @property
+    def gpu_media(self) -> bool:
+        """A media model that holds GPU memory (not a brain, not CPU-only work)."""
+        return self.family not in ("brain", "cpu")
 
 
 def _catalog(*specs: ModelSpec) -> dict[str, ModelSpec]:

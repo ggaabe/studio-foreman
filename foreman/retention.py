@@ -121,6 +121,8 @@ def estimate_bytes(request: dict) -> float:
         return raw * 1.2 + 48000 * 2 * 2 * num("duration_s", frames / 24.0)
     if kind == "compose_music":
         return 48000 * 2 * 2 * num("duration_s", 30.0) * 1.1
+    if kind == "ad_facts":  # a whole ad: takes, stills, voice, music, the cut (foreman/ads.py estimate)
+        return num("plan_bytes", 2.5e9)
     return 2e6
 
 
@@ -246,3 +248,32 @@ def disk_guard(probe, cfg) -> tuple:
     if reading is None:
         return True, err
     return disk_verdict(reading, cfg)
+
+
+def prune_ad_alternates(store, now: float, root: str) -> list:
+    """Once the owner gave an ad's item a verdict, the takes its cut did not use are deleted (the
+    final MP4, the picked takes, stills, voice, music and the manifest stay until the item's own
+    retention prunes the whole work directory). Returns [(item id, bytes)]."""
+    from .ad_pipeline import AdPipeline
+    done = []
+    rows = store.conn.execute(
+        "SELECT i.id, i.job_id FROM plan_items i JOIN jobs j ON j.id = i.job_id "
+        "WHERE j.kind = 'ad_facts' AND i.verdict IS NOT NULL AND i.pruned_at IS NULL").fetchall()
+    pipe = None
+    for r in rows:
+        job = store.job(r["job_id"])
+        rel = (job.payload or {}).get("workdir") if job is not None and isinstance(job.payload, dict) else None
+        if not isinstance(rel, str) or not rel.startswith("ads/"):
+            continue
+        wd = os.path.join(root, rel)
+        if not _inside(wd, root) or not os.path.isdir(wd) or os.path.islink(wd):
+            continue
+        pipe = pipe or AdPipeline(artifacts_dir=root)
+        state = pipe.state(wd)
+        if state.get("alternates_pruned"):
+            continue
+        freed = pipe.prune_alternates(wd)
+        with store.tx():
+            store.event(now, "ad_alternates_pruned", r["job_id"], item=r["id"], bytes=freed)
+        done.append((r["id"], freed))
+    return done

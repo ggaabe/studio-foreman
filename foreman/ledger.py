@@ -260,6 +260,15 @@ def _bad_output(o: dict) -> list:
     return [str(r.get("check")) for r in (o.get("validator_results") or []) if isinstance(r, dict) and not r.get("ok")]
 
 
+def _carried_on(store, j: Job) -> bool:
+    """A failed media job whose recovery continuation decided to carry on without it (verdict
+    'continue': an ad keeps the takes that passed and goes to its next step)."""
+    cont = store.continuation(j.id)
+    child = store.job(cont["fired_job_id"]) if cont and cont.get("fired_job_id") else None
+    return bool(child is not None and child.requires == "brain" and child.state == "succeeded"
+                and _decision(child).get("verdict") == "continue")
+
+
 def failure_class(store, media: list) -> tuple:
     """('infra' | 'content', why) for an item whose lineage ended without output for review.
     Content if any media job failed for a content reason (also output that finished during a
@@ -269,7 +278,7 @@ def failure_class(store, media: list) -> tuple:
     request failing the engine the same way again is the request's doing). Infra if every
     failure was the environment's (a review that could not run otherwise is the environment's too)."""
     content, infra = [], []
-    repeats = []
+    repeats: dict = {}
     for j in media:
         o = j.outcome if isinstance(j.outcome, dict) else {}
         if j.state == "succeeded":
@@ -287,9 +296,11 @@ def failure_class(store, media: list) -> tuple:
                     infra.append(f"the brain's review of job {j.id} could not run ({child.state}: {r})")
             else:
                 verdict = _decision(child).get("verdict")
-                if verdict not in ("accept", "human_review"):
+                if verdict not in ("accept", "human_review", "continue"):
                     content.append(f"the brain's review of job {j.id} said {verdict}")
             continue
+        if _carried_on(store, j):
+            continue  # a failure the lineage recovered from by moving on (an ad's rejected take) ended nothing
         reason = o.get("reason")
         bad = _bad_output(o)
         if bad:
@@ -297,9 +308,12 @@ def failure_class(store, media: list) -> tuple:
         elif reason == "cancelled" and o.get("cancelled_by") == "gpud":
             infra.append(f"job {j.id} cancelled by gpud")
         elif reason in REPEAT_IS_CONTENT:
-            repeats.append(j.id)
-            if len(repeats) > 1:
-                content.append(f"jobs {repeats} each crashed or timed out: the same request failed the engine again")
+            # the same logical task (a retry shares its task_key): another step of the lineage that
+            # crashed once (an ad has many) is not the same request failing again
+            same = repeats.setdefault(j.task_key or (j.kind, j.requires), [])
+            same.append(j.id)
+            if len(same) > 1:
+                content.append(f"jobs {same} each crashed or timed out: the same request failed the engine again")
             else:
                 infra.append(f"job {j.id} {reason}")
         elif reason in INFRA_REASONS:

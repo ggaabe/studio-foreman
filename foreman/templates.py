@@ -12,8 +12,8 @@ a cap. Everything a proposal may vary is declared here with bounds.
 Template fields (unknown keys are an error, so typos do not silently weaken a limit):
 
     id               "demo.narration.v1"   lowercase, digits, . _ -
-    kind             speak | compose_music | render_video
-    family           tts | music | video   (must match the kind)
+    kind             speak | compose_music | render_video | ad
+    family           tts | music | video | ad   (must match the kind)
     model            optional: a specific catalog model of that family
     consumer         who uses the output: a string or a list of strings. Proposals must name
                      one of them. Generic audiences ("anyone", "youtube", "followers") are refused
@@ -24,7 +24,10 @@ Template fields (unknown keys are an error, so typos do not silently weaken a li
     params           {"seconds": {"min": 10, "max": 30, "default": 15},
                       "size": {"allowed": ["768x512"], "default": "768x512"}, ...}
                      speak: voice, speed, seed; compose_music: seconds, seed, instrumental, bpm;
-                     render_video: seconds, size, steps, seed
+                     render_video: seconds, size, steps, seed; ad: seconds (15-60), shots (4-6), seed
+    ad               kind ad only: the ad block (concept, character, facts, cta, end_card, disclosure,
+                     ai_label, captures, banned_marks, music, style, language, spellings, talk_seeds);
+                     see foreman/ads.py and README "Ads"
     style_prefix     prepended to the brief to form the model prompt
     brief_max_chars  longest brief a proposal may carry (default 600, at most 2000)
     flags            {"speculative", "filler", "commercial", "private", "hard_deadline"}: booleans
@@ -48,24 +51,29 @@ from dataclasses import dataclass, field
 from .policy import number
 from .text import fold, variants
 
-KINDS = {"speak": "tts", "compose_music": "music", "render_video": "video"}
+KINDS = {"speak": "tts", "compose_music": "music", "render_video": "video", "ad": "ad"}
+# The catalog family of the job a template's proposal becomes (an ad starts with its facts step
+# on the local CPU engine; foreman/ads.py submits the rest).
+ROOT_FAMILY = {"ad": "cpu"}
 PARAM_TYPES = {
     "speak": {"voice": "choice", "speed": "number", "seed": "int"},
     "compose_music": {"seconds": "number", "seed": "int", "instrumental": "bool", "bpm": "int"},
     "render_video": {"seconds": "number", "size": "size", "steps": "int", "seed": "int"},
+    "ad": {"seconds": "number", "shots": "int", "seed": "int"},
 }
-REQUIRED_PARAMS = {"compose_music": ("seconds",), "render_video": ("seconds", "size")}
+REQUIRED_PARAMS = {"compose_music": ("seconds",), "render_video": ("seconds", "size"), "ad": ("seconds", "shots")}
 # What the engines accept at all; a template's bounds must sit inside these.
 HARD_BOUNDS = {
     ("compose_music", "seconds"): (10.0, 600.0), ("render_video", "seconds"): (0.5, 20.0),
     ("render_video", "steps"): (1, 100), ("speak", "speed"): (0.5, 2.0), ("compose_music", "bpm"): (30, 300),
     ("speak", "seed"): (0, 2 ** 31 - 1), ("compose_music", "seed"): (0, 2 ** 31 - 1),
     ("render_video", "seed"): (0, 2 ** 31 - 1),
+    ("ad", "seconds"): (15.0, 60.0), ("ad", "shots"): (4, 6), ("ad", "seed"): (0, 2 ** 31 - 1),
 }
 FLAG_KEYS = ("speculative", "filler", "commercial", "private", "hard_deadline")
 CAP_KEYS = ("per_week", "max_stock", "two_week_use")
 TOP_KEYS = ("id", "kind", "family", "model", "consumer", "revenue_line", "value_usd", "prior", "caps",
-            "params", "style_prefix", "brief_max_chars", "flags", "review_minutes", "active", "notes")
+            "params", "style_prefix", "brief_max_chars", "flags", "review_minutes", "active", "notes", "ad")
 REQUIRED_KEYS = ("id", "kind", "family", "consumer", "revenue_line", "value_usd", "prior", "caps",
                  "review_minutes")
 # Keys that would describe an outward action. Foreman never acts outside the box.
@@ -191,6 +199,7 @@ class Template:
     active: bool = False
     notes: str = ""
     source: str = ""
+    ad: dict | None = None   # kind "ad": the ad block (foreman/ads.py)
 
     @property
     def flags(self) -> dict:
@@ -218,11 +227,14 @@ class Template:
         bounds = {}
         for k, s in self.params.items():
             bounds[k] = {x: s[x] for x in ("min", "max", "allowed", "default") if x in s}
-        return {"id": self.id, "kind": self.kind, "consumers": list(self.consumers),
-                "revenue_line": self.revenue_line, "value_usd": self.value_usd,
-                "review_minutes": self.review_minutes, "brief_max_chars": self.brief_max_chars,
-                "flags": [k for k in FLAG_KEYS if getattr(self, k)], "params": bounds,
-                "notes": self.notes[:300]}
+        out = {"id": self.id, "kind": self.kind, "consumers": list(self.consumers),
+               "revenue_line": self.revenue_line, "value_usd": self.value_usd,
+               "review_minutes": self.review_minutes, "brief_max_chars": self.brief_max_chars,
+               "flags": [k for k in FLAG_KEYS if getattr(self, k)], "params": bounds,
+               "notes": self.notes[:300]}
+        if self.ad:  # the brief is this ad's angle on the concept (no URLs: the end card has the address)
+            out["ad"] = {"concept": str(self.ad.get("concept") or "")[:400], "character": self.ad.get("character")}
+        return out
 
 
 def _r(value, limit: int = 60) -> str:
@@ -430,7 +442,15 @@ def parse_template(data, source: str = "<template>") -> Template:
     if not isinstance(notes, str):
         problems.append("notes must be a string")
         notes = ""
-    for label, text in (("id", tid), ("revenue_line", revenue), ("notes", notes), ("style_prefix", prefix)) + \
+    ad_block = None
+    if kind == "ad":
+        from .ads import parse_ad_block
+        ad_block = parse_ad_block(data.get("ad"), problems)
+    elif "ad" in data:
+        problems.append("ad is only for templates of kind ad")
+    concept = (ad_block or {}).get("concept") or ""
+    for label, text in (("id", tid), ("revenue_line", revenue), ("notes", notes), ("style_prefix", prefix),
+                        ("ad.concept", concept)) + \
             tuple(("consumer", c) for c in (consumers or []) if isinstance(c, str)):
         why = banned_reason(text) if isinstance(text, str) else None
         if why:
@@ -444,7 +464,8 @@ def parse_template(data, source: str = "<template>") -> Template:
         review_minutes=float(review), params=params, model=model, style_prefix=prefix, brief_max_chars=bmax,
         speculative=bool(flags.get("speculative", False)), filler=bool(flags.get("filler", False)),
         commercial=bool(flags.get("commercial", False)), private=bool(flags.get("private", False)),
-        hard_deadline=bool(flags.get("hard_deadline", False)), active=active, notes=notes, source=source)
+        hard_deadline=bool(flags.get("hard_deadline", False)), active=active, notes=notes, source=source,
+        ad=ad_block)
 
 
 def load_template_file(path: str) -> Template:
@@ -538,10 +559,19 @@ def model_prompt(template: Template, brief: str) -> str:
     return prefix + ("" if prefix[-1:].isspace() else " ") + brief
 
 
-def build_request(template: Template, model: str, consumer: str, brief: str, params: dict) -> dict:
+def build_request(template: Template, model: str, consumer: str, brief: str, params: dict,
+                  key: str | None = None) -> dict:
     """The gpud request for one validated proposal (params already checked against the template's
-    bounds and merged with its defaults)."""
+    bounds and merged with its defaults). `key` (the proposal's content hash) names an ad."""
     from .media_requests import music_request, speech_request, video_request
+    if template.kind == "ad":
+        import hashlib
+
+        from .ads import root_request
+        key = key or hashlib.sha256(f"{template.id}|{brief}|{sorted(params.items())}".encode()).hexdigest()
+        req = root_request(template, model, consumer, brief, params, key)
+        req["payload"].update(template_id=template.id, consumer=consumer)
+        return req
     prompt = model_prompt(template, brief)
     if template.kind == "speak":
         req = speech_request(prompt, voice=params.get("voice"), speed=params.get("speed"), model=model,

@@ -80,14 +80,19 @@ class Gpud:
         self.cfg = cfg
         os.makedirs(cfg.home, exist_ok=True)
         os.makedirs(cfg.artifacts_dir, exist_ok=True)
-        catalog = studio.catalog(cfg.video_exclusive)
+        catalog = cfg.catalog()
         if engine is None:
-            brain = BrainClient(cfg.base_url, catalog=catalog)
+            pipeline = studio.build_pipeline(cfg)
+            brain = BrainClient(cfg.base_url, catalog=catalog, ads=pipeline)
             engine = studio.build_engine(cfg, brain=brain)
+            engines = studio.build_engines(cfg, pipeline=pipeline, mlx=engine)
+        else:
+            engines = {studio.ENGINE: engine}
         self.engine = engine
+        self.engines = engines
         if planner is None and cfg.planner:
             planner = studio.build_planner(cfg)
-        self.sup = Supervisor(cfg.db_path, {studio.ENGINE: engine}, clock or SystemClock(), cfg.policy(),
+        self.sup = Supervisor(cfg.db_path, engines, clock or SystemClock(), cfg.policy(),
                               catalog=catalog, pager=Pager(os.path.join(cfg.home, "pages.jsonl")),
                               planner=planner)
         self.stop = threading.Event()
@@ -152,14 +157,18 @@ class Gpud:
         return 0
 
     def shutdown(self) -> None:
-        live = getattr(self.engine, "live_runs", lambda: [])()
+        live = [r for e in self.engines.values() for r in getattr(e, "live_runs", lambda: [])()]
         if live:
             log.warning("shutting down with live runs %s: their connections close now and mlx-serve aborts them; "
                         "the next gpud records them as interrupted", live)
         try:
-            close = getattr(self.engine, "close", None)
-            if close:
-                close()
+            for eng in self.engines.values():
+                close = getattr(eng, "close", None)
+                if close:
+                    try:
+                        close()
+                    except Exception:
+                        log.exception("closing engine %s failed", getattr(eng, "name", "?"))
         finally:
             try:
                 self.ship_events()

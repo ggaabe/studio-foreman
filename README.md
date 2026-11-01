@@ -13,7 +13,10 @@ the LLM decisions through it (see [Running on a Mac with mlx-serve](#running-on-
 A [planner](#planner) lets the resident brain propose what to make from owner-written templates;
 code validates and prices every proposal, and the owner's verdicts are the only feedback it learns
 from. [Phone approvals](#phone-approvals) put the review queue and the pages on the owner's phone
-through a Telegram bot, as a separate service that cannot affect scheduling. Everything uses only
+through a Telegram bot, as a separate service that cannot affect scheduling. [Ads](#ads) turn an
+owner template into a finished vertical ad (character, voice, lip-sync, B-roll, captions, music,
+end card) through a chain of gpud jobs, with an on-demand ComfyUI engine beside mlx-serve.
+Everything uses only
 the Python standard library (3.9 or newer; tested on 3.9.6 and 3.12). The
 test suite makes no network calls outside 127.0.0.1 and starts no real model server.
 
@@ -21,7 +24,7 @@ test suite makes no network calls outside 127.0.0.1 and starts no real model ser
 
 ```bash
 cd foreman
-python3 -m unittest discover -s tests -v     # 487 tests (plus subtests), about 150 to 200 seconds
+python3 -m unittest discover -s tests -v     # 549 tests (plus subtests), about 4 to 5 minutes
 python3 -m foreman.demo                       # narrated timeline: render hangs, brain recovers
 python3 -m foreman.demo --fault crash         # also: garbage, wedged, none
 ```
@@ -59,7 +62,15 @@ documented gap instead of demanding a fix. See [Inverted red-team tests](#invert
 | `foreman/phone_config.py` | `PhoneConfig` (`phone_options`), apart so gpud validates config.json without importing the phone code |
 | `foreman/text.py` | Text hygiene for untrusted strings: folding (NFKC, invisible characters removed) for hashes and filters, and `printable` for terminal and report output |
 | `foreman/media_requests.py` | Speech, music and video request builders (with their batons), shared by the CLI and the planner |
-| `examples/` | A generic `goals.md` and four inactive example templates (no real client names) |
+| `foreman/ads.py` | Ads: `AdsConfig`, the template's ad block, the root request, the lineage check, the script validator, numbers, word timing and cuts |
+| `foreman/ad_pipeline.py` | `AdPipeline`: the dispatcher (`ad_next`, `ad_recover`, `ad_review`), the facts, assembly and QA steps, take scoring, the manifest, `enqueue` and the CLI's views |
+| `foreman/assembly.py` | ffmpeg assembly and probes: segments, ASS captions, end card, ducking, loudnorm, the size-capped final encode, fonts, black/frozen/loudness checks |
+| `foreman/characters.py` | Character bibles: validation, import from a folder, approval |
+| `foreman/paths.py` | Path confinement for the files engines read and write |
+| `foreman/adapters/mlx_ops.py` | Multi-request jobs on mlx-serve: speech (Kokoro, Qwen3-TTS clone), transcription, images, the full video request |
+| `foreman/adapters/comfyui.py` | `ComfyUIEngine`: ComfyUI started on demand, graph templates, uploads, outputs, interrupt, /free, stop |
+| `foreman/adapters/local.py` | `LocalEngine`: CPU work (an ad's facts, assembly, QA) under gpud's leases |
+| `examples/` | A generic `goals.md` and four inactive example templates (no real client names); `examples/ads/`: a generic ad template, character bible, facts file, ComfyUI graph template and config |
 | `deploy/`, `scripts/` | LaunchAgent templates (gpud, phone) and install/uninstall scripts (no sudo) |
 | `tests/test_brain_return.py` | Invariants I1 to I9 (the original 48 tests, unchanged) |
 | `tests/test_adversarial.py` | The red team's 37 attacks (two inverted to require no crash; see below) |
@@ -72,6 +83,9 @@ documented gap instead of demanding a fix. See [Inverted red-team tests](#invert
 | `tests/test_live_fixes_adversarial.py` | The red team's 30 attacks on those three fixes (RP provenance, RC calibration, RF failure classes); one subtest adjusted, see below |
 | `tests/test_live_fixes_round2.py` | LR1 to LR4: regressions for the answers to that red team and its design concerns |
 | `tests/test_live_integration.py` | LI1 to LI2: regressions from verifying those fixes on the Studio (the owner's default is a catalog model; seeded models get their server id) |
+| `tests/test_ads_engines.py` | G1 to G4: the mlx-serve ops, the ComfyUI engine (a fake ComfyUI process, `tests/fake_comfyui.py`), the local engine, solo_media, a continuation's expected_s, engine checks, failure classes |
+| `tests/test_ads_pipeline.py` | P1 to P7: the ad template and the planner, the script validator, timing, characters, facts, assembly with real ffmpeg, the dispatcher |
+| `tests/test_ads_e2e.py` | E1 to E4: gpud on the fakes runs whole ads: the happy path, failures, retention, ComfyUI stills between mlx-serve media models |
 | `tests/test_phone.py` | PH1 to PH12: phone approvals against a local fake Bot API (`tests/fake_telegram.py`): pairing, exactly-once sends, media paths, captions, buttons through the ledger, stale and forged buttons, notes, commands, unauthorized updates, backoff, offsets, the token's secrecy, pages, digest, CLI, LaunchAgent |
 
 ## How the brain comes back
@@ -1242,6 +1256,223 @@ for example `{"phone_options": {"digest": true, "digest_hour": 8, "pages": false
   few file extensions that are no TLD (`json`, `wav`, `png`, ...) are kept.
 - Upgrading from the first phone version (no pairing id recorded) forgets the sent messages once
   and sends the drafts and pages awaiting the owner again.
+
+## Ads
+
+Finished vertical ads instead of single clips: 15 to 30 seconds (60 at most), 9:16, four to six
+shots of 2 to 8 seconds, one recurring character (a mascot or a human host) who speaks the hook
+and the call to action lip-synced to a voice-over, B-roll of the character, real screen captures
+of the product (never generated UI), captions timed word by word, a music bed ducked under the
+voice, an end card with the real price and address, and an AI disclosure. Which tools make each
+part is configuration (`ads_options`, `comfyui_options`), not code.
+
+An ad is an owner template of kind `ad`. The planner proposes ads like any other template, and
+`cli ads enqueue` runs one on demand. Either way the ad is one planned item whose lineage is a
+chain of gpud jobs, so every step runs under gpud's leases, progress, cancel, provenance and
+exactly-once failure handling, and the finished MP4 reaches the review queue and the phone like
+any draft.
+
+### The chain
+
+The root job reads the facts. Every job after it is submitted by the ad's dispatcher, a
+deterministic brain step (`ad_next`, `ad_recover`) that runs as the previous job's continuation,
+reads what is already on disk in the ad's work directory and submits the next job. A step whose
+outputs exist is skipped, so a crash, a retry or a gpud restart resumes from the files.
+
+| Step | Job kind | Runs on | Writes |
+|---|---|---|---|
+| facts | `ad_facts` | local CPU engine | `facts.json` (the facts URL fetched, or the facts file read), `ad.json`, `character.json` |
+| script | inside `ad_next` | the resident brain | `script.json`: hook, body, call to action and 4-6 shots, validated by code |
+| voice | `ad_voice` | Kokoro, or Qwen3-TTS cloning the bible's reference WAV | `voice/line-<i>.wav`, `voice/full.wav`, `voice/track.wav` |
+| timing | `ad_timing` | Qwen3-ASR (word times from the forced aligner) | `timing.json`: the script's words with times, cuts, 8k+1 frame counts, `voice/talk-<k>.wav` |
+| stills | `ad_stills` | image edit on mlx-serve, a ComfyUI graph, or the approved still itself | `stills/shot-<k>-a.png` (and `-b.png`, B-roll's last frame) |
+| shots | `ad_shots` | LTX: talking shots two-stage audio-to-video, N seeds each; B-roll one-stage first/last frame | `shots/shot-<k>-s<seed>.mp4` (+ sidecars with stats) |
+| music | `ad_music` | ACE-Step, instrumental, the ad's length | `music/bed.wav` |
+| assemble | `ad_assemble` | local CPU engine, ffmpeg | `final/ad.mp4`, `captions.ass`, `assembly.json`, `pick.json` |
+| finish | `ad_finish` | local CPU engine | `final/qa.json`, `final/video.json`, `manifest.json` |
+| review | `ad_review` | the vision brain | its verdict; the item goes to review (accept or human_review) or fails (give_up) |
+
+gpud runs one job at a time, so the GPU holds one media stack at a time in that order, with the
+brain resident beside it as for renders. mlx-serve's three model slots (the brain, the owner's
+default, one media model) make gpud unload each media model before the next. The work directory
+is `$FOREMAN_HOME/artifacts/ads/<ad id>/`; `cli ads inspect` shows it.
+
+**The script.** The brain answers a strict JSON object. Code checks it: line and shot counts and
+lengths (the template's bounds, about 2.6 spoken words a second, 2 to 8 seconds a shot), shot
+kinds `talk|broll|screen|endcard`, every line covered once and in order, the hook and the call to
+action as talking shots, screen shots only from the template's captures, still tags only from the
+bible's approved stills, no request for on-screen text, every price and number (digits or words:
+"nine dollars and fifty cents" is 9.50) present in `facts.json`, no testimonials, reviews,
+ratings or invented customers, no guarantees or delivery promises, no legal advice, no other
+brand's mark (the template's `banned_marks`, and no trademark symbols), no address but the ad's
+own, and the disclosure copied exactly. An invalid script gets one repair attempt with the
+problems listed; a second invalid one is a content failure.
+
+**Timing.** The voice track is the line WAVs joined with short pauses (`voice_track: "lines"`, the
+default; `"full"` uses the full read instead). Qwen3-ASR transcribes it with word times, and the
+times are mapped onto the script's own words by an edit-distance alignment, so captions show the
+script ("example.com", "$9.50") and never the ASR's spelling; a word the ASR dropped is
+interpolated. Cuts fall in the middle of the pause between two shots' lines. A talking shot gets
+the track's slice for its line, padded with silence to exactly `num_frames / 24` seconds, as
+audio-to-video needs; that padded WAV is also what is muxed onto the take.
+
+**Takes.** Each talking shot is rendered with `talk_seeds` seeds (default 3); all takes are kept
+and the assembly picks one with a scored heuristic: how well the motion around the mouth follows
+the voice's loudness (correlation over frames), how much the picture moves without freezing, and
+no black frames. A take or still that fails its checks (black, frozen, wrong size) is recorded and
+the ad carries on with the others; when a shot has no good take left, one more seed is tried
+(`talk_retry_seeds`), then it is a content failure.
+
+**Assembly** (`foreman/assembly.py`, ffmpeg only): every shot scaled to 1080x1920 and cut hard
+on its boundaries; screen captures fitted over a blurred copy of themselves, stills with a slow
+push-in; captions as ASS with the spoken word highlighted, inside the central safe zone (never
+over the top 12% or the bottom 20%), burned in with libass and an explicit `fontsdir`; the end
+card (an approved still tagged as the template says, or a plain colour) with the price, the
+address and the call to action drawn with an explicit `fontfile`; a small "AI-generated" label on
+every frame when the template asks for it; the music bed ducked under the voice with
+`sidechaincompress`, then two-pass `loudnorm` to -14 LUFS and -1.5 dBTP; H.264 (VideoToolbox,
+libx264 as the fallback) and AAC with `+faststart`, re-encoded smaller until it is under
+`max_mb` (40 MB) so Telegram's sendVideo takes it. ffmpeg on the Studio has no fontconfig, so a
+real font file is resolved at runtime (`ads_options.fonts`, then the usual macOS paths) and a
+missing one is a clear error.
+
+**QA** (`ad_finish`): resolution, duration, an AAC track, size, integrated loudness and true
+peak (ebur128), black intervals (blackdetect) before the end card, frozen intervals (freezedetect)
+inside generated shots, flat frames (a NaN-poisoned render decodes to a flat picture), finite
+measurements, captions and the label present. Then `ad_review` runs on the vision brain: it reads
+the facts, the spoken words, the end card and the QA, and compares sampled frames with the
+bible's hero still. It can accept only when the facts and the character both check out and it saw
+the images; otherwise the ad goes to the owner flagged (`human_review`) or fails (`give_up`).
+
+**The manifest** (`manifest.json`): models per role and their licenses, versions (mlx-serve,
+ComfyUI, ffmpeg), the backends and graphs, every seed (stills, takes with their scores and which
+one was picked, music), the disclosure flags, a snapshot of the facts with their hash, the
+script, the shots, the QA, every step's job and duration, and the review.
+
+**Failures.** An infrastructure failure of a step (a crash, a timeout, an engine lost, a load that
+never fit, a restart) is retried by `ad_recover` with the same request; its finished outputs are
+kept. The ledger classifies the item as usual, per logical task, so infrastructure failures do
+not use the template's weekly cap or the review budget, and a take the ad carried on without
+does not make a later infrastructure failure count as content.
+
+**Retention.** Raw frames are deleted after each take is muxed, scratch files after each op, and
+the assembly's intermediate segments after the cut. After the owner's verdict the takes the cut did
+not use are deleted; the final, the picked takes, the stills, voice, music and the manifest stay
+until the item's own retention prunes the whole work directory. The planner's disk guard counts
+an ad as its estimated size.
+
+### ComfyUI on demand
+
+Some graphs (character stills from an image-edit model, reference-conditioned shots) run in
+ComfyUI, which has its own Python and holds its own GPU memory. `foreman/adapters/comfyui.py` is a
+gpud engine that starts ComfyUI only for the job that needs it:
+
+    <comfyui_options.python> main.py --listen 127.0.0.1 --port 8188 --use-pytorch-cross-attention --disable-auto-launch
+
+from `comfyui_options.dir`, waits for `GET /system_stats`, uploads the input images, queues the
+graph (`POST /prompt`), follows it on `/queue` and `/history/<id>` with a bounded heartbeat,
+downloads the output (`/view`), then `POST /free` and stops the process (SIGTERM, a wait, SIGKILL
+only for the ComfyUI Foreman started). Its catalog model is `solo_media`: gpud unloads its own
+mlx-serve media models before starting it and stops it before loading any other media model, and
+the adapter refuses to start (deferred, then an infrastructure failure) while mlx-serve holds any
+media model, someone else's included, or free memory minus `plan_gb` would fall under the
+headroom. A ComfyUI that Foreman did not start is never used or signalled, and mlx-serve is never
+signalled at all.
+
+Graphs are JSON templates in ComfyUI's API format in `comfyui_options.graphs_dir` (default
+`$FOREMAN_HOME/comfyui/graphs`), with placeholders such as `{{prompt}}`, `{{seed}}`,
+`{{width}}`, `{{height}}`, `{{num_frames}}`, `{{image_1}}`: a string that is exactly one
+placeholder takes the value's type. The optional wrapper `{"graph": ..., "outputs": ["9"],
+"defaults": {...}, "license": "...", "commercial_ok": true}` names the output node and the
+license; a commercial template refuses a graph without `commercial_ok`. See
+`examples/ads/comfyui/graphs/` for the format.
+
+### Characters
+
+Bibles live under `$FOREMAN_HOME/characters/<id>/` and are never committed: `bible.json` (look,
+traits to keep, style notes, the voice: a Kokoro voice or blend, or a Qwen3-TTS clone from a
+reference WAV) and stills tagged by pose or scene (`hero`, `turnaround`, `expressions`, `talk`,
+`endcard`, any other scene name). The pipeline only uses approved stills; the hero is the
+reference every edit starts from and the QA compares against.
+
+```bash
+python3 -m foreman.cli characters import ~/Desktop/mascot-stills --id mascot-a --kind mascot \
+    --look "a round blue mascot in a yellow cap" --voice am_onyx,bm_george     # stills unapproved
+python3 -m foreman.cli characters approve mascot-a hero.png talk.png turnaround.png
+python3 -m foreman.cli characters list
+python3 -m foreman.cli characters show mascot-a
+```
+
+### Templates and running one
+
+`examples/ads/templates/ads.example-service.v1.json` is a generic ad template (inactive), with a generic
+bible (`examples/ads/characters/`), facts file (`examples/ads/assets/facts.json`) and config
+(`examples/ads/config.ads.json`). Its `ad`
+block: `concept`, `character`, `facts` (`{"url": ...}` or `{"file": "assets/facts.json"}` under
+`$FOREMAN_HOME`), `cta`, `end_card` (`price`, `url`, `cta`, `still`, `background`), `disclosure`,
+`ai_label`, `captures` (files under `$FOREMAN_HOME/assets`), `banned_marks`, `music`, `style`,
+`language`, `spellings` (terms the ASR should spell your way), `talk_seeds`. Its `params` are
+`seconds` (15 to 60), `shots` (4 to 6) and `seed`. The end card's price must appear in the facts
+(checked when the facts are read, so a stale template fails before anything renders).
+
+```bash
+python3 -m foreman.cli ads enqueue ads.example-service.v1 --brief "how fast it is from a phone" [--seconds 20 --shots 5]
+python3 -m foreman.cli ads status
+python3 -m foreman.cli ads inspect <job id | ad id>
+python3 -m foreman.cli ads models [--rescan]     # the configured model per role against /v1/models
+```
+
+### Configuration
+
+`config.json` keys (see `examples/ads/config.ads.json`):
+
+- `ads_options.models`: the catalog model per role (`tts`, `tts_clone`, `asr`, `image`, `video`,
+  `music`, `cpu`, `comfy`). Model ids live in the catalog (`foreman/studio.py`) and this map; the
+  adapter checks each op against the model's capabilities in `GET /v1/models`.
+- `stills_backend` (`mlx`, `comfyui`, `direct`), `talk_backend`, `broll_backend` (`mlx`,
+  `comfyui`) and their graphs (`stills_graph`, `talk_graph`, `broll_graph`).
+- `talk_seeds`, `talk_retry_seeds`, `broll_retry_seeds`, `still_retry_seeds`; `talk_pipeline`
+  (`two_stage`, `two_stage_hq`), `talk_steps`, `talk_stage2_steps`, `talk_decoder`,
+  `talk_cfg_scale`, `talk_cfg_audio_scale`, `broll_steps`, `broll_last_frame`, `image_steps`,
+  `lora_paths` / `lora_scales`.
+- `video_width` / `video_height` (704x1280: two-stage needs a 64 px grid, and at most 297 frames
+  fit LTX's 768 MiB per request at that size), `out_width` / `out_height` (1080x1920).
+- `voice_track`, `line_gap_s`, `endcard_s`, `words_per_s`, `min_shot_s`, `max_shot_s`,
+  `music_db`, `duck_threshold`, `duck_ratio`, `loudness_lufs`, `true_peak_db`, `max_mb`, `fonts`,
+  `endcard_color`, `push_in`.
+- `expected`: seconds per unit (`still`, `talk`, `broll`, `line`, `full`, `asr`, `music`,
+  `assemble`, `finish`, `script`, `review`, `dispatch`), and `max_job_s` (600): a step's units are
+  packed into jobs up to that expected time, so every lease stays inside gpud's brainless budget.
+- `characters_dir`, `assets_dir`, `commercial_models`, `max_jobs`, `keep_segments`.
+- `comfyui_options`: `dir`, `python`, `port`, `graphs_dir`, `plan_gb` (the footprint gpud plans
+  ComfyUI with, 60 by default), `start_timeout_s`, `exit_after_job`, `extra_args`.
+
+The deployment policy allows 64 continuation hops per lineage (an ad is up to about twenty steps,
+two hops each, plus retries); the dispatcher refuses an ad whose planned jobs would not fit.
+
+### Known gaps of the ad pipeline
+
+- Not run against the real servers yet: the request shapes follow MLX-Serve 26.11.1's docs and
+  measurements, and the fakes reproduce them. Expected times (`expected`) are placeholders until
+  the bake-off measures two-stage lip-sync, image edits and ComfyUI graphs on the Studio.
+- The new catalog sizes (Qwen3-TTS, Qwen3-ASR with its aligner, FLUX.2 klein, ComfyUI's
+  `plan_gb`) are estimates, not measurements.
+- Whether mlx-serve loads the forced aligner as a separate resident model (a fourth slot would
+  make it evict one) is not verified.
+- ComfyUI audio inputs (a talking-shot graph) are uploaded through `/upload/image`; whether the
+  installed nodes read them from there is not verified.
+- The take score is a heuristic (mouth-region motion against the voice's loudness): it ranks
+  takes, it does not measure lip-sync accuracy. The vision brain's character check sees four
+  small images.
+- The banned-claim and number checks are patterns: they catch the usual phrasings, not every
+  paraphrase. The brain's final review and the owner's verdict are the backstops.
+- Facts fetched from a URL are the page's text; prices rendered by JavaScript are not seen (use
+  a facts file then).
+- The model for each role is configuration (a catalog model), checked against `/v1/models`
+  capabilities before every request; gpud does not pick a different model by itself, because it
+  only loads catalog models it can account for (`cli ads models` shows the mapping).
+- The planner's disk guard counts an ad's estimated size while its first step is queued or
+  running; later steps write into the space the estimate reserved but are not counted again.
 
 ## Known gaps
 

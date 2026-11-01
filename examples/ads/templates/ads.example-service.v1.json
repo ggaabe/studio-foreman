@@ -1,0 +1,35 @@
+{
+  "id": "ads.example-service.v1",
+  "kind": "ad",
+  "family": "ad",
+  "consumer": ["the owner's ad account (replace with the real one)"],
+  "revenue_line": "marketing",
+  "value_usd": 40,
+  "prior": {"alpha": 2, "beta": 6},
+  "caps": {"per_week": 3, "max_stock": 3, "two_week_use": 4},
+  "params": {
+    "seconds": {"min": 15, "max": 30, "default": 20},
+    "shots": {"min": 4, "max": 6, "default": 5},
+    "seed": {"min": 0, "max": 2147483647}
+  },
+  "brief_max_chars": 300,
+  "flags": {"speculative": false, "filler": false, "commercial": true, "private": false},
+  "review_minutes": 3,
+  "active": false,
+  "notes": "A short vertical ad for an online service, starring a mascot character. The brief is this ad's angle on the concept. Set active to true once the character bible, the facts file and the captures exist.",
+  "ad": {
+    "concept": "Doing the chore online is quick and the price is clear before you pay.",
+    "character": "mascot-example",
+    "facts": {"file": "assets/facts.json"},
+    "cta": "Try it today at example.com.",
+    "end_card": {"price": "$9.00", "url": "example.com", "cta": "Try it today", "still": "endcard", "background": "#1d3557"},
+    "disclosure": "AI-generated",
+    "ai_label": true,
+    "captures": ["captures/checkout.png", "captures/upload.mp4"],
+    "banned_marks": ["Competitor Name"],
+    "music": {"prompt": "warm, upbeat acoustic guitar and light percussion", "bpm": 100},
+    "style": "bright natural light, friendly, uncluttered",
+    "language": "English",
+    "spellings": ["example.com"]
+  }
+}

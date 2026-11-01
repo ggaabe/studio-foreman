@@ -368,3 +368,146 @@ def decode_png(data: bytes) -> tuple:
             raise MediaError("filtered rows are not supported by this decoder")
         rows.append(line[1:])
     return w, h, channels, b"".join(rows)
+
+
+# ---------------------------------------------------------------- PCM WAV editing (ads)
+
+def _pcm_wav(path: str):
+    """(params, frames bytes) of an integer-PCM WAV file (what TTS engines write)."""
+    try:
+        with wave.open(path, "rb") as w:
+            params = w.getparams()
+            data = w.readframes(w.getnframes())
+    except (OSError, EOFError, wave.Error) as e:
+        raise MediaError(f"{path}: {e}") from None
+    if params.nchannels < 1 or params.framerate < 1 or params.sampwidth not in (1, 2, 3, 4):
+        raise MediaError(f"{path}: unsupported WAV layout")
+    return params, data
+
+
+def _write_pcm(path: str, params, data: bytes) -> None:
+    tmp = path + ".tmp"
+    with wave.open(tmp, "wb") as w:
+        w.setnchannels(params.nchannels)
+        w.setsampwidth(params.sampwidth)
+        w.setframerate(params.framerate)
+        w.writeframes(data)
+    os.replace(tmp, path)
+
+
+def wav_duration(path: str) -> float:
+    params, data = _pcm_wav(path)
+    return len(data) / float(params.sampwidth * params.nchannels * params.framerate)
+
+
+def _silence(params, n_frames: int) -> bytes:
+    fill = b"\x80" if params.sampwidth == 1 else b"\x00"
+    return fill * (max(0, n_frames) * params.sampwidth * params.nchannels)
+
+
+def pad_wav(src: str, dst: str, seconds: float) -> float:
+    """Copy an integer-PCM WAV padded with silence (or cut) to exactly `seconds`. Returns the
+    source duration. Audio-to-video wants the line's WAV exactly as long as the clip."""
+    params, data = _pcm_wav(src)
+    block = params.sampwidth * params.nchannels
+    want = int(round(seconds * params.framerate))
+    have = len(data) // block
+    out = data[: want * block] + _silence(params, want - have)
+    _write_pcm(dst, params, out)
+    return have / float(params.framerate)
+
+
+def concat_wavs(paths, dst: str, gap_s: float = 0.0, lead_s: float = 0.0) -> list:
+    """Join integer-PCM WAVs of one format with `gap_s` of silence between them (and `lead_s`
+    before the first). Returns [(start_s, end_s)] of each input inside the result."""
+    if not paths:
+        raise MediaError("nothing to join")
+    first = None
+    chunks, spans, pos = [], [], 0
+    for p in paths:
+        params, data = _pcm_wav(p)
+        if first is None:
+            first = params
+            gap = _silence(params, int(round(lead_s * params.framerate)))
+            chunks.append(gap)
+            pos += len(gap) // (params.sampwidth * params.nchannels)
+        elif (params.nchannels, params.sampwidth, params.framerate) != \
+                (first.nchannels, first.sampwidth, first.framerate):
+            raise MediaError(f"{p}: {params.nchannels}ch {params.sampwidth * 8}bit {params.framerate}Hz differs from "
+                             f"the first line ({first.nchannels}ch {first.sampwidth * 8}bit {first.framerate}Hz)")
+        else:
+            gap = _silence(first, int(round(gap_s * first.framerate)))
+            chunks.append(gap)
+            pos += len(gap) // (first.sampwidth * first.nchannels)
+        n = len(data) // (first.sampwidth * first.nchannels)
+        spans.append((pos / float(first.framerate), (pos + n) / float(first.framerate)))
+        chunks.append(data[: n * first.sampwidth * first.nchannels])
+        pos += n
+    _write_pcm(dst, first, b"".join(chunks))
+    return spans
+
+
+def cut_wav(src: str, dst: str, start_s: float, end_s: float, pad_to_s: float | None = None) -> None:
+    """[start_s, end_s) of an integer-PCM WAV, padded with silence to pad_to_s when given."""
+    params, data = _pcm_wav(src)
+    block = params.sampwidth * params.nchannels
+    a = max(0, int(round(start_s * params.framerate)))
+    b = max(a, int(round(end_s * params.framerate)))
+    out = data[a * block: b * block]
+    if pad_to_s is not None:
+        want = int(round(pad_to_s * params.framerate))
+        have = len(out) // block
+        out = out[: want * block] + _silence(params, want - have)
+    _write_pcm(dst, params, out)
+
+
+def wav_envelope(path: str, fps: float, start_s: float = 0.0, seconds: float | None = None) -> list:
+    """RMS level (0..1) of each 1/fps window of a WAV file: the voice's energy per video frame."""
+    rate, channels, bits, is_float, data = _read_wav(path)
+    samples, scale = _samples(data, bits, is_float, 1)
+    per = max(1, int(round(rate / float(fps)))) * channels
+    lo = int(start_s * rate) * channels
+    hi = len(samples) if seconds is None else min(len(samples), lo + int(seconds * rate) * channels)
+    out = []
+    for i in range(lo, hi, per):
+        chunk = samples[i: i + per]
+        if not chunk:
+            break
+        out.append(math.sqrt(math.fsum(map(operator.mul, chunk, chunk)) / len(chunk)) / scale)
+    return out
+
+
+def png_size(data: bytes):
+    """(width, height) from a PNG's IHDR, or None when `data` does not start like a PNG."""
+    if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n" or data[12:16] != b"IHDR":
+        return None
+    return struct.unpack(">II", data[16:24])
+
+
+def image_size(path: str):
+    """(width, height) of a PNG or JPEG file, or None when it is neither (or unreadable)."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(64 << 10)
+    except OSError:
+        return None
+    size = png_size(head)
+    if size:
+        return size
+    if head[:2] != b"\xff\xd8":
+        return None
+    i = 2
+    while i + 9 < len(head):
+        if head[i] != 0xFF:
+            i += 1
+            continue
+        marker = head[i + 1]
+        if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+            i += 2
+            continue
+        seg = struct.unpack(">H", head[i + 2: i + 4])[0]
+        if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+            h, w = struct.unpack(">HH", head[i + 5: i + 9])
+            return w, h
+        i += 2 + seg
+    return None

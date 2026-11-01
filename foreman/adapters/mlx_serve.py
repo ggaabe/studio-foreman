@@ -70,8 +70,11 @@ FIELDS = {
     "music": ("prompt", "lyrics", "instrumental", "vocal_language", "bpm", "keyscale", "timesignature",
               "seed", "duration_seconds"),
     "video": ("prompt", "num_frames", "width", "height", "seed", "steps", "stage2_steps", "pipeline",
-              "cfg_scale", "cfg_audio_scale", "stg_scale", "decoder"),
+              "cfg_scale", "cfg_audio_scale", "stg_scale", "decoder", "lora_paths", "lora_scales"),
 }
+# Jobs with an "ops" list (one model, several requests: an ad's lines, stills or takes), and the
+# speech-to-text, image and full video requests (keyframes, audio-to-video), run through
+# foreman/adapters/mlx_ops.py under the same lease, cancel and provenance.
 VIDEO_FPS = 24                 # LTX's frame rate in mlx-serve v26.10.3 (fixed server-side)
 EVENT_CAP = 0.95               # progress reported for events stays below this
 DECODE_TOP = 0.99              # the decode heartbeat climbs from EVENT_CAP to this
@@ -213,6 +216,7 @@ class _Run:
         self.error_msg = None
         self.complete = None    # (fields, streamed) of the complete event
         self.dir = None
+        self.beat = None        # (start, seconds, from, to): bounded heartbeat while a request has no events
         self._progress_line = False
         self.t0 = time.monotonic()
         self.timings: dict = {}  # stage -> seconds since start when it was first seen
@@ -275,7 +279,7 @@ class MlxServeEngine:
                  max_silence_s: float = 1800.0, decode_s_per_mpf: float = 0.6, min_decode_grace_s: float = 60.0,
                  sample_frames: int = 4, sample_max_side: int = 512, stall_after: int | None = None,
                  stall_kinds=None, forbidden=FORBIDDEN_PATTERNS, ffmpeg: str | None = "auto",
-                 preserve_default: bool = True, keep_raw_frames: bool = False):
+                 preserve_default: bool = True, keep_raw_frames: bool = False, input_roots=None):
         split_url(base_url)  # validate early
         self.name = name
         self.base_url = base_url.rstrip("/")
@@ -301,6 +305,10 @@ class MlxServeEngine:
         # After a successful MP4 mux the raw rgb8 frames (~330 MB per 5 s at 704p) are deleted
         # unless this is set; the MP4, sampled PNGs, audio.wav and video.json stay.
         self.keep_raw_frames = bool(keep_raw_frames)
+        # Where op inputs (a character's stills, a reference voice) may be read from: the artifacts
+        # root and the owner's Foreman home (characters/, assets/).
+        home = os.path.expanduser(os.environ.get("FOREMAN_HOME", "~/.foreman"))
+        self.input_roots = [self.artifacts_dir] + [os.path.expanduser(r) for r in (input_roots or [home])]
         self._mine ={m for m, s in self.catalog.items() if s.engine == name}
         self._boot = secrets.token_hex(4)
         self._seq = itertools.count(1)
@@ -517,6 +525,40 @@ class MlxServeEngine:
                 continue
             if str(e.get("state") or "").lower() == "loading" and self.catalog_name(e["id"]) in self._mine:
                 out.add(self.catalog_name(e["id"]))
+        return out
+
+    def capabilities(self) -> dict:
+        """{server id: set of capabilities} from /v1/models, for the ids that list them ({} when the
+        server cannot be asked): an op is refused on a model without the capability it needs."""
+        try:
+            data = (self._get("/v1/models") or {}).get("data") or []
+        except Exception as e:
+            log.debug("could not read /v1/models capabilities: %s", e)
+            return {}
+        out = {}
+        for e in data:
+            if isinstance(e, dict) and isinstance(e.get("id"), str) and isinstance(e.get("capabilities"), list):
+                out[e["id"]] = {str(c) for c in e["capabilities"]}
+        return out
+
+    def resident_media(self) -> list:
+        """Server ids of every media model resident in mlx-serve, whoever loaded it: catalog media
+        models, and others whose /v1/models capabilities are media without chat (unknown ones count:
+        fail closed). The ComfyUI engine refuses to start while this is not empty."""
+        ps = self._ps()
+        caps = self.capabilities()
+        media_caps = {"image", "video", "audio", "music", "transcription", "alignment", "sound", "3d",
+                      "diarization", "speech"}
+        out = []
+        for sid in sorted(ps):
+            spec = self.catalog.get(self.catalog_name(sid))
+            if spec is not None and spec.engine == self.name:
+                if spec.gpu_media:
+                    out.append(sid)
+                continue
+            c = caps.get(sid)
+            if c is None or (c & media_caps and "chat" not in c):
+                out.append(sid)
         return out
 
     def _metrics_text(self) -> tuple:
@@ -861,6 +903,12 @@ class MlxServeEngine:
                 return Poll("lost", log_tail=(
                     "mlx-serve adapter: this gpud process does not own that run. Its HTTP stream died with "
                     "the process that started it, and mlx-serve aborts a run whose client disconnects.",))
+            if run.status == "running" and run.beat is not None and not run.stalled:
+                t0, grace, lo, hi = run.beat
+                frac = min(1.0, (time.monotonic() - t0) / grace) if grace > 0 else 1.0
+                beat = lo + (hi - lo) * frac
+                if beat > run.progress:
+                    run.progress = beat
             if run.status == "running" and run.decode_at is not None and not run.stalled:
                 elapsed = time.monotonic() - run.decode_at
                 frac = min(1.0, elapsed / run.decode_grace) if run.decode_grace > 0 else 1.0
@@ -922,8 +970,11 @@ class MlxServeEngine:
 
     def _run_main(self, run: _Run) -> None:
         try:
+            from . import mlx_ops
             if run.family == "brain":
                 self._run_brain(run)
+            elif run.family in mlx_ops.OP_FAMILIES and mlx_ops.wants_ops(run):
+                self._finish(run, "done", artifact=mlx_ops.run_ops(self, run))
             elif run.family in ENDPOINTS:
                 self._run_media(run)
             else:

@@ -53,8 +53,8 @@ from . import ledger, retention
 from .policy import number
 from .store import ACTIVE
 from .supervisor import PLAN_KEY_PREFIX, PLAN_KIND, AdmissionError, LineageClosed
-from .templates import (banned_reason, build_request, dir_signature, generic_consumer, has_url, load_goals,
-                        load_inbox, load_templates, strip_urls)
+from .templates import (ROOT_FAMILY, banned_reason, build_request, dir_signature, generic_consumer, has_url,
+                        load_goals, load_inbox, load_templates, strip_urls)
 from .text import CONTROL_RE, fold, has_control, printable, strip_invisible
 
 log = logging.getLogger("foreman.planner")
@@ -113,7 +113,7 @@ ENGINE_SIDE = ("crash", "engine_error")
 RETRY_TUNABLE = ("seed", "expected_s", "p90_s", "progress_interval_s")
 RETRY_PARAMS = {"speak": ("voice", "speed"), "compose_music": ("bpm", "instrumental"), "render_video": ("steps",)}
 TRIGGER_EVENTS = ("verdict_recorded", "item_shipped", "template_unpaused", "page_resolved")
-MEDIA_KINDS = ("speak", "compose_music", "render_video")
+MEDIA_KINDS = ("speak", "compose_music", "render_video", "ad_finish")
 SKIP_EXPLAINED = {
     "paused": "the owner paused the planner",
     "suspended": "suspended after repeated invalid ticks",
@@ -402,11 +402,13 @@ class Planner:
         return 2.0 if days <= 1 else 1.5 if days <= 3 else 1.25 if days <= 7 else 1.0
 
     def model_for(self, sup, t) -> str | None:
+        family = ROOT_FAMILY.get(t.kind, t.family)
+
         def usable(name):  # never a model gpud is told it may not load (Policy.foreign_models)
             spec = sup.catalog.get(name)
-            return bool(spec and spec.family == t.family and not spec.is_brain and spec.engine in sup.engines
+            return bool(spec and spec.family == family and not spec.is_brain and spec.engine in sup.engines
                         and name not in sup.p.foreign_models)
-        for name in (t.model, self.models.get(t.family)):
+        for name in (t.model, self.models.get(family)):
             if name:
                 return name if usable(name) else None
         for name in sup.catalog:
@@ -451,6 +453,7 @@ class Planner:
             step(load)
             step(lambda: ledger.kill_check(store, loaded, now, self.cfg) if loaded else None)
             step(lambda: retention.prune_due(store, now, self.artifacts_dir, self.cfg))
+            step(lambda: retention.prune_ad_alternates(store, now, self.artifacts_dir))
         step(lambda: self.hold_paused(sup, now))
         if errors:
             raise errors[0]
@@ -510,6 +513,11 @@ class Planner:
         root = store.job(root_id)
         if root is None:
             raise AdmissionError(f"planned job {root_id} no longer exists")
+        if root.kind == "ad_facts":
+            # An ad's lineage is a chain of steps its dispatcher builds from the ad's files, each
+            # checked here: an ad step, in the ad's own work directory, within the ad's job budget.
+            from .ads import check_child as ad_check_child
+            return ad_check_child(sup, root, kind, requires, payload)
         if kind != root.kind or requires != root.requires:
             raise AdmissionError(f"planned work (template {tid}) may only retry its own {root.kind} on {root.requires}, "
                                  f"not submit {printable(kind, 40)} on {printable(requires, 60)}")
@@ -1139,10 +1147,12 @@ class Planner:
             return tid, "duplicate", f"content hash {h} was already proposed"
         ctx["hashes"].add(h)
         try:
-            req = build_request(t, model, named, brief, merged)
+            req = build_request(t, model, named, brief, merged, key=h)
         except AdmissionError as e:
             return tid, "param_out_of_bounds", str(e)
-        est = float(number(req["payload"].get("expected_s")) or 0.0) + sup.p.brain_job_expected_s
+        # An ad's root job is only its first step: price the whole chain (ads.estimate).
+        est = float(number(req["payload"].get("plan_gpu_s")) or number(req["payload"].get("expected_s")) or 0.0) \
+            + sup.p.brain_job_expected_s
         p_ship = ctx["posterior"][tid][2]
         urgency = self.urgency(deadline_wall, wall)
         review_cost = cfg.review_usd_per_min * t.review_minutes

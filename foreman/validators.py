@@ -10,6 +10,7 @@ from .policy import number
 MAX_BLACK_FRAME_RATIO = 0.2
 MAX_FROZEN_FRAME_RATIO = 0.5
 MAX_SILENCE_RATIO = 0.5
+MAX_EXTRA_CHECKS = 64
 
 
 def check(family: str, payload: dict, artifact) -> list[dict]:
@@ -61,6 +62,15 @@ def check(family: str, payload: dict, artifact) -> list[dict]:
     if family == "image":
         w, h = number(art.get("width")), number(art.get("height"))
         add("dimensions", bool(w and h and w > 0 and h > 0), f"{art.get('width')!r}x{art.get('height')!r}")
+    # Checks the engine measured itself on a multi-output job (every take of an ad's shots, the
+    # finished ad's QA): each one can only add a failure, never excuse one of the checks above.
+    extra = art.get("checks")
+    if isinstance(extra, list):
+        for r in extra[:MAX_EXTRA_CHECKS]:
+            if isinstance(r, dict) and isinstance(r.get("check"), str) and r["check"]:
+                add(r["check"][:80], r.get("ok") is True, str(r.get("detail") or "")[:300])
+    elif extra is not None:
+        add("checks", False, f"the engine's checks are a {type(extra).__name__}, not a list")
     return results
 
 

@@ -1,0 +1,16 @@
+{
+  "id": "mascot-example",
+  "name": "Example Mascot",
+  "kind": "mascot",
+  "subject": "the mascot",
+  "look": "a round, friendly blue mascot character with big eyes, a yellow cap and a small satchel",
+  "keep": ["yellow cap", "small satchel", "blue body"],
+  "style": "soft studio light, clean backgrounds",
+  "voice": {"engine": "kokoro", "voice": "am_onyx,bm_george", "speed": 1.0},
+  "stills": [
+    {"file": "stills/hero.png", "tags": ["hero"], "approved": true, "note": "front, full body, plain backdrop"},
+    {"file": "stills/talk.png", "tags": ["talk"], "approved": true, "note": "medium close-up facing the camera"},
+    {"file": "stills/turnaround.png", "tags": ["turnaround"], "approved": true, "note": ""},
+    {"file": "stills/endcard.png", "tags": ["endcard"], "approved": true, "note": "left third, space on the right"}
+  ]
+}
