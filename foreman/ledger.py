@@ -457,12 +457,20 @@ def retract_verdict(store, job_id: int, note: str | None, now: float, by: str | 
 NOTE_MAX = 1000  # characters of verdict_note, at most
 
 
-def annotate_verdict(store, job_id: int, note: str, now: float, window_s: float, by: str | None = None) -> dict:
+def annotate_verdict(store, job_id: int, note: str, now: float, window_s: float, by: str | None = None,
+                     ref: str | None = None) -> dict:
     """Add a note to a verdict already given (the phone's reply-to-note), within window_s of the
     verdict (supervisor time). The verdict itself, P(ship) and the kill criteria are unchanged;
-    a verdict_noted event records it. An earlier note is kept and the new one appended."""
+    a verdict_noted event records it. An earlier note is kept and the new one appended.
+
+    `ref` names where the note came from (the phone: its Telegram message): a note whose ref is
+    already recorded for this job is not added again, so a message delivered twice (a crash before
+    its update was confirmed) adds one note."""
     if not isinstance(note, str) or not note.strip():
         raise LedgerError("an empty note")
+    ref = str(ref)[:40] if ref else None
+    if ref is not None and _noted(store, job_id, ref):
+        return item_for_job(store, job_id)
     it = _item_or_raise(store, job_id)
     if it["state"] not in ("accepted", "rejected", "shipped") or not it.get("verdict"):
         raise LedgerError(f"item {it['id']} (job {it['job_id']}) is {it['state']}: there is no verdict to add a note to")
@@ -473,11 +481,17 @@ def annotate_verdict(store, job_id: int, note: str, now: float, window_s: float,
     old = it.get("verdict_note") or ""
     text = (f"{old} | {note.strip()}" if old else note.strip())[:NOTE_MAX]
     with store.tx():
+        if ref is not None and _noted(store, it["job_id"], ref):  # the same note won a race meanwhile
+            return item(store, it["id"])
         if not update_item(store, it["id"], expect_state=it["state"], verdict_note=text):
             raise LedgerError(f"item {it['id']} changed while adding the note; try again")
         store.event(now, "verdict_noted", it["job_id"], item=it["id"], template=it["template_id"],
-                    verdict=it.get("verdict"), chars=len(note.strip()), **_by(by))
+                    verdict=it.get("verdict"), chars=len(note.strip()), **_by(by), **({"ref": ref} if ref else {}))
     return item(store, it["id"])
+
+
+def _noted(store, job_id: int, ref: str) -> bool:
+    return any(e["data"].get("ref") == ref for e in store.events("verdict_noted", job_id))
 
 
 def record_ship(store, job_id: int, usd: float | None, now: float, by: str | None = None) -> dict:

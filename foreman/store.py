@@ -253,6 +253,7 @@ CREATE TABLE IF NOT EXISTS phone_messages (
   last_action TEXT,                              -- the last button the owner pressed on it
   acted_at    REAL,
   note        TEXT,                              -- a reply that waits for the verdict
+  note_ids    TEXT NOT NULL DEFAULT '[]',        -- the replies already in `note` (a redelivery adds nothing)
   attempts    INTEGER NOT NULL DEFAULT 0,
   next_try_at REAL,
   error       TEXT,
@@ -269,7 +270,9 @@ CREATE TABLE IF NOT EXISTS phone_state (
   last_ok_wall   REAL,                           -- last successful Bot API call
   last_error     TEXT,                           -- redacted
   blocked        INTEGER NOT NULL DEFAULT 0,     -- the paired chat blocked the bot (403)
-  hint_at        REAL                            -- last polite answer to text it does not understand
+  hint_at        REAL,                           -- last polite answer to text it does not understand
+  pair_id        TEXT,                           -- the pairing phone_messages belong to ('' = none)
+  bot_id         INTEGER                         -- the bot update_offset counts for (each bot has its own ids)
 );
 INSERT OR IGNORE INTO phone_state (id) VALUES (1);
 """
@@ -292,6 +295,8 @@ _MIGRATIONS = {
     "model_owners": [("server_id", "TEXT")],
     "plan_items": [("reserved_slot", "INTEGER NOT NULL DEFAULT 0"), ("fail_class", "TEXT"), ("counted", "INTEGER"),
                    ("count_note", "TEXT")],
+    "phone_messages": [("note_ids", "TEXT NOT NULL DEFAULT '[]'")],
+    "phone_state": [("pair_id", "TEXT"), ("bot_id", "INTEGER")],
 }
 
 

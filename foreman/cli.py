@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import sys
 import time
 
@@ -243,11 +244,12 @@ def apply_ship(cfg, job_id: int, usd=None, by=None) -> dict:
         sup.close()
 
 
-def apply_note(cfg, job_id: int, note: str, window_s: float, by=None) -> dict:
-    """Add a note to a verdict given at most window_s ago (supervisor time)."""
+def apply_note(cfg, job_id: int, note: str, window_s: float, by=None, ref=None) -> dict:
+    """Add a note to a verdict given at most window_s ago (supervisor time); `ref` makes it
+    idempotent (see ledger.annotate_verdict)."""
     sup = _client(cfg)
     try:
-        return ledger.annotate_verdict(sup.store, job_id, note, sup._now(), window_s, by=by)
+        return ledger.annotate_verdict(sup.store, job_id, note, sup._now(), window_s, by=by, ref=ref)
     finally:
         sup.close()
 
@@ -520,6 +522,9 @@ def main(argv=None) -> int:
                 return phone.cli_unpair(cfg, keep_token=args.keep_token)
             except phone.PhoneError as e:
                 print(f"phone: {e}", file=sys.stderr)
+                return 1
+            except (OSError, sqlite3.Error) as e:  # an unreadable file or database: a message, not a traceback
+                print(f"phone: {phone.redact(f'{type(e).__name__}: {e}')}", file=sys.stderr)
                 return 1
     except AdmissionError as e:
         print(f"refused: {e}", file=sys.stderr)

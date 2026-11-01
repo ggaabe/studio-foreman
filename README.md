@@ -21,7 +21,7 @@ test suite makes no network calls outside 127.0.0.1 and starts no real model ser
 
 ```bash
 cd foreman
-python3 -m unittest discover -s tests -v     # 417 tests (plus subtests), about 120 to 150 seconds
+python3 -m unittest discover -s tests -v     # 487 tests (plus subtests), about 150 to 200 seconds
 python3 -m foreman.demo                       # narrated timeline: render hangs, brain recovers
 python3 -m foreman.demo --fault crash         # also: garbage, wedged, none
 ```
@@ -219,6 +219,15 @@ cannot free: the over-planning this round fixed) until a human or the server rem
 subtest now asserts the documented gap (the release happens); the `missing` subtest (no identity
 at all), where gpud does disown its other models after such a disappearance, is unchanged and
 passes. Every other attack in that file passes as written.
+
+One of the implementation's own tests changed meaning after the phone red team:
+`test_phone.PH1SetupAndPairing.test_wrong_codes_count_and_burn_the_code` asserted that five wrong
+pairing codes burn the code for everyone. `test_phone_adversarial.PA1Strangers` showed that this
+lets anyone who knows the bot's @username cancel every code the owner makes, for no gain against
+guessing (the code has about 50 bits). It is now
+`test_wrong_codes_count_and_lock_out_their_sender_not_the_owner`: the five wrong codes lock out
+their sender (the right code from that sender is refused too), the code survives, and the owner
+pairs. All 55 attacks in `test_phone_adversarial.py` pass as written.
 
 ## Mapping to the real engines
 
@@ -1079,13 +1088,16 @@ same kill criteria afterwards.
    `getMe` and saves it in `~/.foreman/secrets/telegram.json` (directory 0700, file 0600).
 3. Setup prints a link, `https://t.me/<your bot>?start=<code>`, and the code. Open the link on
    the phone and tap **Start** (or send `/pair <code>` to the bot). The code works once, for 15
-   minutes, and only from a private chat. Setup waits and prints `paired` when it arrives.
+   minutes, and only from a private chat. Setup waits and prints `paired` when it arrives. Taps on
+   an older link (sent before this code existed) are ignored: tap the new one.
 4. Install the service: `scripts/install-launchagent.sh phone` (`com.github.ggaabe.foreman.phone`,
    KeepAlive, logs in `~/.foreman/logs/phone.log`). Then `python3 -m foreman.cli phone test` sends
    a harmless message.
 
 If the service already runs, `phone setup` leaves the pairing to it (`--no-wait` returns right
 after printing the link). Without a token or a pairing the service idles and looks again every 30 s.
+`phone setup` also repairs a secrets file that is corrupt, unreadable or a symlink (it replaces
+it), and `phone unpair` removes one.
 
 ```bash
 python3 -m foreman.cli phone setup [--no-wait] [--timeout S]   # token, getMe, pairing
@@ -1114,8 +1126,11 @@ The caption is plain text and is sent without `parse_mode`, so HTML or Markdown 
 written: the job id and template, the consumer, the brief (at most 360 characters), the brain's
 verdict and note, the review minutes, how the files went out, and "Reply to this message to add a
 note to your verdict." Terminal escape sequences, control characters, line breaks and invisible or
-bidi characters are removed, links in the brief and the brain's note become `[link removed]` (no
-tappable link, and link previews are off), and the caption stays inside Telegram's 1024 characters.
+bidi characters are removed. In the brief, the brain's note and page reasons, anything Telegram
+could make tappable is defused: URLs and anything host-shaped (any script, any TLD, punycode
+included; a file name such as `config.json` stays) become `[link removed]`, and `@name` and
+`/word` are spaced apart (`@ name`, `/ word`) so they are neither a mention nor a command. Link
+previews are off, and the caption stays inside Telegram's 1024 characters.
 
 ### Buttons, notes and commands
 
@@ -1126,7 +1141,10 @@ tappable link, and link previews are off), and the caption stays inside Telegram
 - The message's status line and buttons follow the item: a verdict, retract or pruning done
   elsewhere (the CLI, retention) redraws it within a minute (`refresh_s`).
 - **A reply to a draft** adds a note: kept until the verdict while the draft waits, added to the
-  verdict (a `verdict_noted` event) within 30 minutes of it (`note_window_s`), refused after.
+  verdict (a `verdict_noted` event) within 30 minutes of it (`note_window_s`), refused after. Each
+  reply counts once: a reply delivered again after a crash (its update not yet confirmed) adds
+  nothing, and a reply that is empty once control characters are removed is refused, not "noted".
+- Forwarded messages are never commands, notes or pairing codes, even from the owner.
 - `/queue` sends every draft still awaiting a verdict and every open page again (the older copy
   loses its buttons). `/status` shows gpud's mode and last tick, the planner, the review queue and
   the week's caps per template. `/pause` and `/resume` pause or resume the planner only. `/help`
@@ -1136,13 +1154,22 @@ tappable link, and link previews are off), and the caption stays inside Telegram
 
 - **Secrets.** The token, the pairing state and the HMAC key live only in
   `secrets/telegram.json`, written atomically under a lock; a looser mode is tightened back to
-  0600 / 0700 when it is read. config.json refuses a `phone_options` key or value that looks like a
-  token. The token is removed from every log line (the formatter redacts the whole finished line,
+  0600 / 0700 when it is read (the directory too). config.json refuses a `phone_options` key or
+  value that looks like a token without echoing it (gpud validates the same file, and its stderr is
+  a log), and an `api_base` that is plain http to anything but this machine (the token is in every
+  request's URL). The token is removed from every log line (the formatter redacts the whole finished line,
   tracebacks included), every exception (a Bot API failure is raised without the urllib exception,
   whose text or URL can carry it), every stored error and the CLI's output. The pairing code is
   kept only as an HMAC.
-- **Pairing** binds exactly one private chat id and one user id. Five wrong codes, or the right
-  code seen in a group, burn the code; a group or channel can never pair.
+- **Pairing** binds exactly one private chat id and one user id. A sender with five wrong codes
+  is ignored for the rest of that code's life (kept only as an HMAC of its id); strangers cannot
+  burn the owner's code. The right code seen in a group burns it; a group, a channel, a bot, a
+  forwarded message or a message dated before the code was made can never pair.
+- **Unpairing and re-pairing apply at once.** The secrets file is read again before every update
+  and right before every verdict, pause or resend, so a `phone unpair` or a new `phone setup` while
+  the long poll waits also covers the updates that wake it: the lost phone's /queue, /status, /pause
+  and button presses do nothing. Which pairing `phone_messages` belongs to is recorded with it, so
+  a crash between a new pairing and clearing the old chat's messages heals on the next pass.
 - **Everyone else is ignored.** Messages and button presses from another chat or user, any group,
   any bot, and every update type other than a message or a button press get no reply and are
   logged without their content.
@@ -1151,10 +1178,16 @@ tappable link, and link previews are off), and the caption stays inside Telegram
   at every pairing and unpairing). Forged or garbled data, data from an earlier pairing, a press on
   an older copy, a press on an older drawing of the buttons (the counter moved on) or on an item
   whose state changed meanwhile records nothing: it is answered with what happened and the message
-  is redrawn for the current state. The ledger's compare-and-set states are the last guard, so a
-  double tap or a race with the CLI records one verdict.
+  is redrawn for the current state. Only the canonical spelling of the data verifies (no leading
+  zeros, nothing after the MAC). Every send, a resend after a crash included, draws a new issue, so
+  two copies never carry the same data. The ledger's compare-and-set states are the last guard, so
+  a double tap or a race with the CLI records one verdict.
 - **Files.** Only regular files strictly inside the artifacts directory are uploaded (resolved;
-  never a symlink, never a file with a second hard link).
+  never a symlink, never a file with a second hard link). The upload opens the file itself without
+  following links and checks it is the very file that was checked (device and inode), so a file
+  swapped for a link afterwards uploads nothing; ffmpeg gets the checked WAV on stdin with the WAV
+  demuxer forced, never a path. Nothing above 50 MB is uploaded whatever the settings
+  (`upload_max_mb` is at most 50 and `video_max_mb` is held under it).
 
 **Privacy.** Drafts (the MP4 or audio, the brief, the brain's note), your notes and pages pass
 through Telegram's servers (bot chats are not end-to-end encrypted) and stay in the chat history on
@@ -1165,7 +1198,7 @@ lineage carry no details. To keep everything off Telegram, stop the service
 
 **Revoking.** `python3 -m foreman.cli phone unpair` tells the chat it is unpaired, deletes the
 token and the binding (`--keep-token` keeps the token to pair again) and invalidates every button
-already sent. To kill the token itself, send `/revoke` to @BotFather and pick the bot; the service
+already sent, effective for the very next update the service handles. To kill the token itself, send `/revoke` to @BotFather and pick the bot; the service
 then logs that Telegram rejected its token and waits for a new `phone setup`.
 
 ### Robustness
@@ -1174,12 +1207,15 @@ then logs that Telegram rejected its token and waits for a new `phone setup`.
   handled, so a restart neither loses nor repeats one. Each update has its own boundary: one that
   raises is logged and skipped (its offset advances); one that meets a busy database is tried
   again, up to three times.
-- Network errors back off exponentially (1 s, doubling to 5 min); a 429 waits its `retry_after`;
-  a 409 (someone else reads the updates) waits; a 401 (a revoked token) is logged once and the
-  service waits for a new token. Only a failure to reach Telegram ends a pass early: a bug or a bad
+- Network errors back off exponentially (1 s, doubling to 5 min); a 429 waits its `retry_after`
+  (at most an hour, whatever it says); a 409 (someone else reads the updates) waits; a 401 (a
+  revoked token) is logged once and the service waits for a new token. A file that vanishes or
+  is swapped mid-send is not an outage: the next way of sending the draft is tried. A press that
+  keeps meeting a busy database is answered ("nothing was recorded, tap again"). A new bot (another
+  bot id) reads its updates from the start: each bot numbers its updates on its own. Only a failure to reach Telegram ends a pass early: a bug or a bad
   row in the outbox never stops the owner's presses being read. A draft that keeps failing for
   another reason is marked failed after five tries (`phone status`; `/queue` tries it again).
-- A 403 (the owner blocked the bot) stops sending until the chat writes again.
+- A 403 (the owner blocked the bot) stops sending until the chat writes again or presses a button.
 - A watchdog thread exits the service (status 70; launchd restarts it) when a pass makes no
   progress for 10 minutes; an upload reports progress for every MB it sends.
 - Memory is bounded: answers are read up to 8 MB, uploads are streamed in 1 MB pieces, and the
@@ -1201,8 +1237,11 @@ for example `{"phone_options": {"digest": true, "digest_hour": 8, "pages": false
 - A note replied before a verdict that is then given on the CLI stays with the phone: it only goes
   with a verdict given by button.
 - A press is answered after the verdict is recorded; while Telegram is slow the button spins.
-- Telegram turns /commands in plain text into tappable links, so a brief containing "/pause" shows
-  one; tapping it sends the command from the owner's own chat, which is allowed anyway.
+- Defusing host-shaped text in briefs and notes is deliberately broad: a word like `Node.js` or
+  `final.mix` becomes `[link removed]` (Telegram links about 1500 TLDs, and that list changes); a
+  few file extensions that are no TLD (`json`, `wav`, `png`, ...) are kept.
+- Upgrading from the first phone version (no pairing id recorded) forgets the sent messages once
+  and sends the drafts and pages awaiting the owner again.
 
 ## Known gaps
 

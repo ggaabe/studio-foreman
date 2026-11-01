@@ -275,7 +275,12 @@ class PH1SetupAndPairing(PhoneCase):
         s.step()
         self.assertTrue(s.paired)
 
-    def test_wrong_codes_count_and_burn_the_code(self):
+    def test_wrong_codes_count_and_lock_out_their_sender_not_the_owner(self):
+        # Changed after the red team (test_phone_adversarial PA1): five wrong codes used to burn the
+        # code for everyone, which let anyone who knows the bot's @username cancel every code the
+        # owner makes, with no gain against guessing (the code has about 50 bits). Wrong codes now
+        # count against their sender, who is ignored for the rest of the code's life, the right
+        # code included; the owner still pairs.
         self.setup()
         s = self.svc()
         for k in range(4):
@@ -284,12 +289,20 @@ class PH1SetupAndPairing(PhoneCase):
         self.assertFalse(s.paired)
         self.assertEqual(self.secrets()["pairing"]["failures"], 4)
         self.fake.message(OTHER, OTHER, "/start WRONGCODE9")
-        self.fake.message(OWNER, OWNER, f"/start {CODE}")  # too late: the fifth wrong code burned it
+        self.fake.message(OTHER, OTHER, f"/start {CODE}")  # too late for this sender: its fifth wrong code locked it out
         s.step()
         self.assertFalse(s.paired)
-        self.assertIsNone(self.secrets()["pairing"])
-        self.assertIn("wrong codes", self.secrets()["burned"])
+        pairing = self.secrets()["pairing"]
+        self.assertIsNotNone(pairing, "a stranger cannot burn the owner's code")
+        self.assertEqual(pairing["failures"], 5)
+        self.assertEqual(list(pairing["senders"].values()), [5])
+        self.assertNotIn(str(OTHER), list(pairing["senders"]), "a sender is kept only as an HMAC")
         self.assertEqual(self.fake.sends(), [], "no reply to a stranger, nor to anyone while unpaired")
+        self.fake.message(OWNER, OWNER, f"/start {CODE}")
+        s.step()
+        self.assertTrue(s.paired)
+        self.assertEqual((self.secrets()["chat_id"], self.secrets()["user_id"]), (OWNER, OWNER))
+        self.assertEqual([r for r in self.fake.sends() if str(r["params"]["chat_id"]) == str(OTHER)], [])
 
     def test_an_expired_code_pairs_nobody(self):
         self.setup()
@@ -1270,6 +1283,183 @@ class PH12PagesDigestCli(PhoneCase):
             "print('foreman.phone' in sys.modules, cfg.phone_config().api_base == %r)" % self.fake.url))
         res = subprocess.run([sys.executable, "-c", code], capture_output=True, timeout=30, cwd=REPO)
         self.assertEqual(res.stdout.strip(), b"False True", res.stderr)
+
+
+# ---------------------------------------------------------------- PH13 the red team's design concerns
+
+class _Kill(BaseException):
+    """kill -9 at a chosen point (nothing in foreman/phone.py catches a BaseException)."""
+
+
+class PH13RedTeamFollowUps(PhoneCase):
+    def test_a_stale_claim_resend_signs_new_button_data(self):
+        s = self.paired_svc()
+        it = self.item()
+        real = phone.Phone._update_row
+
+        def kill_on_record(self_, row_id, expect=None, **cols):
+            if cols.get("state") == "sent":
+                raise _Kill()
+            return real(self_, row_id, expect, **cols)
+        with mock.patch.object(phone.Phone, "_update_row", kill_on_record), self.assertRaises(_Kill):
+            s.step()
+        orphan = max(self.fake.messages)
+        orphan_data = sorted(d for _, d in self.fake.buttons(self.fake.messages[orphan]["markup"]))
+        s.close()
+        s = self.svc()
+        self.clock.t += s.pc.stale_claim_s + 1
+        s.step()
+        fresh = sorted(d for _, d in self.fake.buttons(self.msg("draft", it["id"])["markup"]))
+        self.assertNotEqual(self.row("draft", it["id"])["message_id"], orphan)
+        self.assertFalse(set(orphan_data) & set(fresh), "the copy a stale claim sends carries a new issue")
+
+    def test_a_huge_retry_after_never_freezes_sending(self):
+        s = self.paired_svc()
+        it = self.item()
+        self.fake.fail("sendVideo", 429, "Too Many Requests", retry_after=10 ** 9)
+        s.step()
+        self.assertLessEqual(s.hold_until - self.clock.t, phone.RETRY_AFTER_MAX)
+        self.assertLessEqual(self.row("draft", it["id"])["next_try_at"] - self.clock.t, phone.RETRY_AFTER_MAX)
+        self.clock.t += phone.RETRY_AFTER_MAX + 1
+        s.step()
+        self.assertEqual(self.row("draft", it["id"])["state"], "sent")
+
+    def test_a_press_dropped_on_a_busy_database_is_still_answered(self):
+        s = self.paired_svc()
+        it = self.item()
+        s.step()
+        self.fake.callback(OWNER, OWNER, self.data("draft", it["id"], "Approve"), self.row("draft", it["id"])["message_id"])
+        with mock.patch.object(phone.Phone, "on_callback", side_effect=sqlite3.OperationalError("database is locked")):
+            for _ in range(4):
+                s.step()
+        answers = self.fake.calls("answerCallbackQuery")
+        self.assertEqual(len(answers), 1)
+        self.assertIn("busy", answers[0]["params"]["text"])
+        self.assertEqual(len(self.events("verdict_recorded")), 0)
+
+    def test_another_drafts_button_pressed_here_leaves_this_message_its_own_buttons(self):
+        s = self.paired_svc()
+        a, b = self.item(), self.item()
+        s.step()
+        ans = self.press(s, "draft", b["id"], None, data=self.data("draft", a["id"], "Approve"))
+        self.assertIn("older copy", ans["text"])
+        self.assertEqual([t for t, _ in self.fake.buttons(self.msg("draft", b["id"])["markup"])], ["Approve", "Reject"])
+        self.press(s, "draft", b["id"], "Approve")
+        self.assertEqual(ledger.item(self.store, b["id"])["state"], "accepted")
+        self.assertEqual(ledger.item(self.store, a["id"])["state"], "review")
+
+    def test_mentions_and_commands_in_a_brain_note_are_not_tappable(self):
+        s = self.paired_svc()
+        self.item(brain_note="DM @support_bot or tap /pause now; </b> stays, 24/7 stays, config.json stays")
+        s.step()
+        cap = self.fake.last("sendVideo")["params"]["caption"]
+        for gone in ("@support_bot", " /pause"):
+            self.assertNotIn(gone, cap)
+        for kept in ("@ support_bot", "/ pause", "</b>", "24/7", "config.json"):
+            self.assertIn(kept, cap)
+
+    def test_a_button_press_from_the_owner_resumes_sending_after_a_block(self):
+        s = self.paired_svc()
+        it = self.item()
+        s.step()
+        with self.store.tx():
+            self.store.conn.execute("UPDATE phone_state SET blocked = 1 WHERE id = 1")
+        self.press(s, "draft", it["id"], "Approve")
+        self.assertEqual(self.store.conn.execute("SELECT blocked FROM phone_state").fetchone()[0], 0)
+
+    def test_forwarded_messages_are_neither_commands_nor_notes(self):
+        s = self.paired_svc()
+        it = self.item()
+        s.step()
+        n = len(self.fake.sends())
+        owner = {"id": OWNER, "is_bot": False, "first_name": "Owner"}
+        for text, extra in (("/pause", {}), ("a note", {"reply_to_message": {"message_id": self.row("draft", it["id"])["message_id"]}})):
+            msg = {"message_id": 9000 + len(text), "date": int(time.time()), "text": text, "chat": {"id": OWNER, "type": "private"},
+                   "from": owner, "forward_origin": {"type": "user", "date": 0, "sender_user": {"id": OTHER}}}
+            msg.update(extra)
+            self.fake.push({"message": msg})
+        s.poll()
+        self.assertFalse(ledger.planner_state(self.store)["paused"])
+        self.assertIsNone(self.row("draft", it["id"])["note"])
+        self.assertEqual(len(self.fake.sends()), n)
+
+    def test_a_loose_secrets_directory_is_tightened_when_read(self):
+        s = self.paired_svc()
+        d = os.path.join(self.home, "secrets")
+        os.chmod(d, 0o777)
+        self.addCleanup(os.chmod, d, 0o700)
+        with open(os.path.join(d, "telegram.json")) as f:
+            data = json.load(f)
+        phone.SecretStore(self.home).update(lambda x: data)  # a rewrite, so the service reads it again
+        os.chmod(d, 0o777)
+        s.step()
+        self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o700)
+
+    def test_many_other_secrets_never_push_the_token_or_the_key_out_of_redaction(self):
+        s = self.paired_svc()
+        key = s.key
+        for k in range(200):
+            phone.register_secret(f"pairing-code-{k:04d}")
+        self.assertNotIn(key, phone.redact(f"key={key}"))
+        self.assertNotIn(TOKEN.split(":")[1], phone.redact(f"t={TOKEN.split(':')[1]}"))
+
+    def test_ffmpeg_reads_the_checked_wav_on_stdin_with_the_demuxer_forced(self):
+        ff = os.path.join(self.tmp, "ffmpeg-cat")
+        args = os.path.join(self.tmp, "ffmpeg-args")
+        with open(ff, "w") as f:
+            f.write('#!/bin/sh\nprintf "%%s\\n" "$@" > "%s"\nfor last; do :; done\ncat > "$last"\n' % args)
+        os.chmod(ff, 0o755)
+        s = self.paired_svc(ffmpeg=ff)
+        it = self.item(files=AUDIO_FILES, template="t.speech", kind="speak")
+        s.step()
+        wav = next(p for p in it["artifacts"] if p.endswith("output.wav"))
+        with open(wav, "rb") as f:
+            self.assertEqual(self.fake.last("sendAudio")["files"]["audio"]["data"], f.read(), "the WAV came on stdin")
+        with open(args) as f:
+            argv = f.read().split("\n")
+        self.assertNotIn(wav, argv, "ffmpeg is never given a path to open")
+        i = argv.index("-i")
+        self.assertEqual(argv[i + 1], "pipe:0")
+        self.assertEqual(argv[i - 2:i], ["-f", "wav"])
+        self.assertIn("-protocol_whitelist", argv[:i])
+
+    def test_config_refuses_an_upload_limit_above_the_bot_api(self):
+        with self.assertRaises(ValueError):
+            self.write_config(upload_max_mb=60)
+        self.write_config(upload_max_mb=50)
+
+    def test_multipart_never_builds_a_body_over_the_bot_api_limit(self):
+        p = os.path.join(self.tmp, "big.bin")
+        with open(p, "wb") as f:
+            f.write(b"x" * 2000)
+        with mock.patch.object(phone, "BOT_API_UPLOAD_MB", 0.001):
+            with self.assertRaises(phone.UploadFileError):
+                phone.multipart({}, [("document", "big.bin", "application/octet-stream", p)])
+
+    def test_a_missing_upload_file_is_a_file_error_not_a_network_error(self):
+        api = phone.BotApi(TOKEN, self.fake.url, 5)
+        with self.assertRaises(phone.UploadFileError) as cm:
+            api.send_file("sendDocument", "document", OWNER, os.path.join(self.tmp, "nope.wav"), "c")
+        self.assertNotIsInstance(cm.exception, phone.TelegramError)
+        self.assertEqual(self.fake.calls("sendDocument"), [], "nothing went out")
+
+    def test_a_new_bot_reads_its_updates_from_the_start(self):
+        s = self.paired_svc()
+        with self.store.tx():
+            self.store.conn.execute("UPDATE phone_state SET update_offset = 999999999 WHERE id = 1")
+        phone.SecretStore(self.home).update(lambda d: dict(d, bot_id=d["bot_id"] + 1))
+        self.fake.message(OWNER, OWNER, "/help")
+        s.step()
+        self.assertEqual(self.fake.last("sendMessage")["params"]["text"], phone.HELP)
+
+    def test_setup_over_a_paired_chat_forgets_its_messages_at_once(self):
+        s = self.paired_svc()
+        self.item()
+        s.step()
+        s.close()
+        self.setup()
+        self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM phone_messages").fetchone()[0], 0)
+        self.assertEqual([e["data"].get("replaced") for e in self.events("phone_unpaired")], [True])
 
 
 if __name__ == "__main__":
