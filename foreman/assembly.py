@@ -608,10 +608,19 @@ def _fit_over_blur(width: int, height: int) -> str:
             f"scale=trunc(iw/2)*2:trunc(ih/2)*2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1")
 
 
+def _fill_from_top(width: int, height: int) -> str:
+    # a phone-shaped capture covers the frame; what is cut is its bottom, never its headline
+    return (f"scale={width}:{height}:force_original_aspect_ratio=increase:flags=lanczos,"
+            f"crop={width}:{height}:(iw-{width})/2:0,setsar=1")
+
+
+PORTRAIT_CAPTURE = 0.75  # width/height at or below this fills the 9:16 frame instead of floating over a blur
+
+
 def seg_screen(ff: Ffmpeg, src: str, out: str, seconds: float, width: int, height: int, fps: int = 24,
                is_video: bool = True, push: float = 0.05, frames: int | None = None) -> str:
-    """A real screen capture fitted over a blurred copy of itself; a still capture also gets the
-    slow push-in."""
+    """A real screen capture: a portrait (phone) still fills the frame from its top, anything else is
+    fitted over a blurred copy of itself; a still capture also gets the slow push-in."""
     n = _frames(seconds, fps, frames)
     if is_video:
         ff.run(["-loglevel", "error", "-y", "-i", src, "-filter_complex",
@@ -619,8 +628,12 @@ def seg_screen(ff: Ffmpeg, src: str, out: str, seconds: float, width: int, heigh
                 f"tpad=stop_mode=clone:stop_duration={n / float(fps) + 1:.3f}[v]",
                 "-map", "[v]", "-frames:v", str(n)] + X264_SEG + [out], heartbeat=30.0)
         return out
+    from .media import image_size
+    size = image_size(ff.path(src))
+    portrait = bool(size and size[1] and size[0] / float(size[1]) <= PORTRAIT_CAPTURE)
     composed = os.path.splitext(out)[0] + "-composed.png"
-    ff.run(["-loglevel", "error", "-y", "-i", src, "-filter_complex", f"[0:v]{_fit_over_blur(width, height)}[v]",
+    ff.run(["-loglevel", "error", "-y", "-i", src, "-filter_complex",
+            f"[0:v]{_fill_from_top(width, height) if portrait else _fit_over_blur(width, height)}[v]",
             "-map", "[v]", "-frames:v", "1", composed])
     try:
         return _pushin(ff, composed, out, seconds, width, height, fps, push, n)
@@ -657,6 +670,13 @@ def fitted_lines(ff: Ffmpeg, fontfile: str, textfile: str, fs: int, max_w: float
     return out
 
 
+# Over a still, the end card's text sits in this band (fractions of the height): below the
+# character's face and above the bottom strip where TikTok and Reels draw their own buttons.
+ENDCARD_BAND = (0.57, 0.83)
+ENDCARD_LINES_OVER_STILL = (("price", 0.068, 0.64), ("url", 0.042, 0.72), ("cta", 0.038, 0.78))
+ENDCARD_LINES_PLAIN = (("price", 0.075, 0.40), ("url", 0.045, 0.52), ("cta", 0.04, 0.60))
+
+
 def seg_endcard(ff: Ffmpeg, out: str, seconds: float, width: int, height: int, fontfile: str, lines: list,
                 background: str | None = None, color: str = "#1d3557", fps: int = 24, frames: int | None = None) -> str:
     """The end card: a still (darkened a little) or a plain colour, with `lines` drawn centred:
@@ -674,9 +694,12 @@ def seg_endcard(ff: Ffmpeg, out: str, seconds: float, width: int, height: int, f
                                    "black@0.45", max(4, pfs // 3)))
     chain = ",".join(draws) if draws else "null"
     if background:
+        # the character stays clear above a darkened band that holds the text (ENDCARD_BAND)
+        top, bottom = ENDCARD_BAND
         args = ["-loglevel", "error", "-y", "-loop", "1", "-framerate", str(fps), "-i", background, "-vf",
                 f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1,"
-                f"drawbox=x=0:y=0:w=iw:h=ih:color=black@0.25:t=fill,{chain}"]
+                f"drawbox=x=0:y=0:w=iw:h=ih:color=black@0.10:t=fill,"
+                f"drawbox=x=0:y=ih*{top}:w=iw:h=ih*{bottom - top:.3f}:color=black@0.55:t=fill,{chain}"]
     else:
         if not re.match(r"^#[0-9a-fA-F]{6}$", color or ""):
             color = "#1d3557"

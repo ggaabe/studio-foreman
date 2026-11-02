@@ -981,13 +981,14 @@ class AdPipeline:
             else:
                 lines = []
                 card = ad.get("end_card") or {}
-                for j, (key, size, y) in enumerate((("price", 0.075, 0.40), ("url", 0.045, 0.52), ("cta", 0.04, 0.60))):
+                bg = self.endcard_background(bible, card)
+                layout = assembly.ENDCARD_LINES_OVER_STILL if bg else assembly.ENDCARD_LINES_PLAIN
+                for j, (key, size, y) in enumerate(layout):
                     if card.get(key):
                         tf = f"final/endcard-{j}.txt"
                         with open(os.path.join(wd, tf), "w", encoding="utf-8") as f:
                             f.write(str(card[key]).replace("\n", " ")[:120])
                         lines.append((tf, size, y))
-                bg = self.endcard_background(bible, card)
                 assembly.seg_endcard(ff, seg, secs, W, H, fontfile, lines, background=bg,
                                      color=card.get("background") or cfg.endcard_color, frames=frames)
             segs.append(seg)

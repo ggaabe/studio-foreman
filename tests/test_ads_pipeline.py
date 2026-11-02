@@ -210,6 +210,22 @@ class P2Script(unittest.TestCase):
                                         for s in SCRIPT["shots"]])
         self.assertIn("product's screens", " | ".join(self.check(generated)[1]))
 
+    def test_the_templates_banned_words_are_never_said(self):
+        # Seen live: a scaffolding pitch whose concept ruled out safety claims still said "We are set up
+        # and safe on site." The template's banned words are now checked in code, whole words only.
+        words = ["safe", "safety", "OSHA"]
+        bad = dict(SCRIPT, body=["We are set up and safe on site.", "x y z.", "a b c."])
+        self.assertIn("rules out", " | ".join(self.check(bad, banned_words=words)[1]))
+        spoofed = dict(SCRIPT, body=["Every crew follows ОSHA rules.", "x y z.", "a b c."])  # Cyrillic О
+        self.assertIn("'OSHA'", " | ".join(self.check(spoofed, banned_words=words)[1]))
+        fine = dict(SCRIPT, body=["We get there safely and quickly.", "x y z.", "a b c."])
+        self.assertNotIn("rules out", " | ".join(self.check(fine, banned_words=words)[1]), "'safely' is not 'safe'")
+        self.assertEqual(self.check(SCRIPT, banned_words=words)[1], [])
+        problems = []
+        ads.parse_ad_block(dict(template_data()["ad"], banned_words=words, cta="Stay safe and get a quote at example.com."),
+                           problems)
+        self.assertIn("rules out", " | ".join(problems), "the template's own call to action is held to it too")
+
     def test_length_follows_the_template(self):
         short = dict(SCRIPT, hook="Hi.", body=["Upload it."], cta="Do it at example.com.",
                      shots=[{"kind": "talk", "lines": [0], "visual": "office"}, {"kind": "broll", "lines": [1], "visual": "desk"},
@@ -526,6 +542,31 @@ class P6Assembly(TmpCase):
         self.assertLessEqual(res["bytes"], 250e3)
         self.assertGreaterEqual(len(res["attempts"]), 2)
         self.assertGreater(res["attempts"][0]["bytes"], 250e3)
+
+    def test_a_phone_capture_fills_the_frame_from_its_top(self):
+        # Seen live: a phone-sized capture floated small over a blurred copy, which read as black bars on
+        # a dark page. A portrait capture now covers the frame and keeps its top (the headline) in view.
+        self.ff.run(["-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=c=0x202020:s=90x200",
+                     "-vf", "drawbox=x=0:y=0:w=iw:h=24:color=white:t=fill", "-frames:v", "1", "phone.png"])
+        assembly.seg_screen(self.ff, "phone.png", "scr.mp4", 1.0, 108, 192, is_video=False, push=0.0)
+        f = assembly.gray_frame(self.ff, "scr.mp4", 27, 48, 0.0)
+        self.assertGreater(sum(f[:27 * 2]) / (27 * 2), 200, "the capture's top band opens the frame")
+        self.assertLess(sum(f[27 * 30:27 * 32]) / (27 * 2), 60, "the dark page fills the sides, edge to edge")
+
+    def test_end_card_text_over_a_still_sits_in_the_band_below_the_character(self):
+        png(os.path.join(self.tmp, "card.png"), 90, 160, 120)
+        with open(os.path.join(self.tmp, "p.txt"), "w") as f:
+            f.write("From $9.50")
+        key, size, y = assembly.ENDCARD_LINES_OVER_STILL[0]
+        assembly.seg_endcard(self.ff, "with.mp4", 1.0, 270, 480, "fonts/caption.ttf", [("p.txt", size, y)],
+                             background="card.png")
+        assembly.seg_endcard(self.ff, "without.mp4", 1.0, 270, 480, "fonts/caption.ttf", [], background="card.png")
+        a, b = (assembly.gray_frame(self.ff, n, 54, 96, 0.5) for n in ("with.mp4", "without.mp4"))
+        changed = [r for r in range(96) if sum(abs(a[r * 54 + c] - b[r * 54 + c]) for c in range(54)) > 54 * 8]
+        top, bottom = assembly.ENDCARD_BAND
+        self.assertTrue(changed, "the price is drawn")
+        self.assertGreaterEqual(min(changed), int(top * 96) - 1, changed)
+        self.assertLessEqual(max(changed), int(bottom * 96) + 1, changed)
 
     def test_qa_probes_see_black_and_frozen_video(self):
         self.ff.run(["-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=c=black:s=64x64:r=24:d=1", "-f", "lavfi",
