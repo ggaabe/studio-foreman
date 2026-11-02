@@ -1,0 +1,18 @@
+{
+  "id": "presenter-example",
+  "name": "Example Presenter",
+  "kind": "human",
+  "subject": "the presenter",
+  "look": "a woman in her thirties with shoulder-length brown hair, a plain teal sweater and small silver earrings",
+  "keep": ["shoulder-length brown hair", "plain teal sweater"],
+  "style": "bright natural light, realistic photographic style",
+  "voice": {"engine": "kokoro", "voice": "af_heart", "speed": 1.0, "ref_wav": "voice/reference.wav"},
+  "stills": [
+    {"file": "stills/hero.png", "tags": ["hero"], "approved": true, "note": "front, waist up, plain backdrop"},
+    {"file": "stills/face.png", "tags": ["face"], "approved": true, "note": "a close-up of the face (H3's third picture)"},
+    {"file": "stills/desk.png", "tags": ["desk"], "approved": true, "note": "at a bright wooden desk by a window"},
+    {"file": "stills/kitchen.png", "tags": ["kitchen"], "approved": true, "note": "at a sunny kitchen counter"},
+    {"file": "stills/closeup.png", "tags": ["closeup"], "approved": true, "note": "close-up by the window"},
+    {"file": "stills/payoff.png", "tags": ["payoff"], "approved": true, "note": "a finished form in a folder, no text"}
+  ]
+}

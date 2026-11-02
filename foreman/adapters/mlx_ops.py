@@ -25,7 +25,8 @@ Foreman's own bookkeeping and is never sent):
                                                               unloaded when the job ends; speech: the input
                                                               holds speech (an answer without text, or no
                                                               word in any of a job's two or more recordings
-                                                              with sound, is the engine's failure)
+                                                              with sound, is the engine's failure); need_words:
+                                                              text with no word times is the engine's failure
     image       /v1/images/generations         image          prompt size seed steps mode strength ...,
                                                               image_path -> image, ref_image_paths -> ref_images
     video       /v1/video/generations          video          prompt width height num_frames seed steps pipeline
@@ -625,6 +626,13 @@ def _op_transcribe(engine, run, op, out, wd, lo, hi, i) -> dict:
         raise _ms.EnvironmentFailure(f"op {i}: the transcription answer carried no text: {str(obj)[:200]}",
                                      reason="engine_error")
     words = obj.get("words") if isinstance(obj.get("words"), list) else []
+    if op.get("need_words") and re.search(r"[A-Za-z0-9]", obj["text"]) and not any(
+            isinstance(w, dict) and number(w.get("start")) is not None and number(w.get("end")) is not None
+            for w in words):
+        # The server answers without word times when its forced aligner is missing or cannot load: the
+        # engine's failure (retried, never written), not a take that "said nothing".
+        raise _ms.EnvironmentFailure(f"op {i}: the transcription has text but no word times (is the forced aligner "
+                                     f"on disk and loadable?): {obj['text'][:120]!r}", reason="engine_error")
     paths.atomic_json(out, obj)
     ok = True
     checks = [{"check": "transcript", "ok": ok, "detail": f"{len(words)} timed words"}]

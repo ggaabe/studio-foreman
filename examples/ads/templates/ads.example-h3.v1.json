@@ -1,0 +1,89 @@
+{
+  "id": "ads.example-h3.v1",
+  "kind": "ad",
+  "family": "ad",
+  "consumer": ["the owner's ad account (replace with the real one)"],
+  "revenue_line": "marketing",
+  "value_usd": 40,
+  "prior": {"alpha": 2, "beta": 6},
+  "caps": {"per_week": 3, "max_stock": 3, "two_week_use": 4},
+  "params": {
+    "seconds": {"min": 15, "max": 30, "default": 20},
+    "shots": {"min": 4, "max": 5, "default": 4},
+    "seed": {"min": 0, "max": 2147483647}
+  },
+  "brief_max_chars": 300,
+  "flags": {"speculative": false, "filler": false, "commercial": true, "private": false},
+  "review_minutes": 3,
+  "active": false,
+  "notes": "A short vertical ad in which a human presenter speaks every beat on camera: the h3 talk chain (README, H3 talking shots). Each beat is one MiniMax H3 take in ComfyUI from the scene still, the hero, the face close-up and the presenter's reference voice; the edit lays the screen capture, the price card, a still and the end card over parts of the beats while the voice goes on. Set active to true once the character bible (with voice.ref_wav and the face and scene stills approved), the facts file, the capture and its boxes exist, and the graph's license fields are filled in. It is a commercial template (an ad for a paid service), so the facts step refuses it until the graph's wrapper says commercial_ok: true, which only its owner sets after reading the model license (the example graph says false).",
+  "ad": {
+    "concept": "Getting a form prepared and filed from a phone is quick, and the price is clear before you pay.",
+    "character": "presenter-example",
+    "facts": {"file": "assets/facts-h3.json"},
+    "cta": "Get it done today at example.com.",
+    "end_card": {"price": "$9.50", "url": "example.com", "cta": "Get it done today"},
+    "disclosure": "AI-generated",
+    "ai_label": false,
+    "captures": ["captures/checkout.png"],
+    "banned_marks": ["Competitor Name"],
+    "music": {"prompt": "warm, light acoustic guitar and soft percussion", "bpm": 100},
+    "style": "bright natural light, friendly, uncluttered",
+    "language": "English",
+    "spellings": ["ExampleCo", "example.com"],
+    "lexicon": [
+      {"display": "ExampleCo", "spoken": "Example Co", "respellings": ["Eggs Ample Co"]}
+    ],
+    "h3": {
+      "presenter": {"noun": "woman", "subject": "she", "object": "her", "voice": "her own warm, clear voice",
+                    "voice_style": "in a warm, friendly, natural voice with a relaxed conversational accent,"},
+      "face": "face",
+      "scenes": {
+        "desk": {"still": "desk", "framing": "Vertical medium shot from the waist up, the presenter in the middle of the frame.",
+                 "setting": "She sits at a bright wooden desk by a window", "roles": ["hook", "body"]},
+        "kitchen": {"still": "kitchen", "framing": "Vertical medium close-up from the chest up.",
+                    "setting": "She stands at a sunny kitchen counter", "roles": ["body", "cta"],
+                    "hands_gate": true, "crop": {"scale": 1.1, "anchor_y": null}},
+        "closeup": {"still": "closeup", "framing": "Vertical close-up of her face and shoulders.",
+                    "setting": "She stands by the window in soft light", "roles": ["cta"], "caption_pos": [500, 300]}
+      },
+      "stills": {"payoff": {"still": "payoff", "note": "a finished form in a folder on a desk, no text"}},
+      "captures": {
+        "captures/checkout.png": {"id": "checkout", "note": "the checkout page with the price", "crop": [0, 0, 1080, 1400],
+                                  "tap": [140, 1200, 940, 1320], "tap_color": "#1d4ed8"}
+      },
+      "price_card": {"big": "$9.50", "lines": ["One form, everything included"], "pulse_line": 0},
+      "endcard": {"lead": "Get it done from", "big": "$9.50", "lines": ["Everything included"],
+                  "footnote": ["Online, from your phone"]},
+      "brand": {"name": "ExampleCo", "bg": "#0B1220", "accent": "#2563EB", "accent_pressed": "#1D4ED8",
+                "highlight": "#FFD700", "text": "#FFFFFF", "muted": "#E5E7EB"},
+      "headline": true,
+      "readings": {"$9.50": "nine fifty"},
+      "caption": {"size": 92, "margin_v": 710, "margins": [100, 180]},
+      "punch_scale": 1.2,
+      "hold_cta_s": 1.0,
+      "tail_hook_s": 0.05,
+      "notes": "Short lines read best. Say the brand by name once, in the beat that shows how it works.",
+      "example": {
+        "title": "Filed from your phone",
+        "headline": "File a form from your phone",
+        "beats": [
+          {"line": "Need a form filed, but no time to stand in line?", "scene": "desk",
+           "action": "holding a stack of papers up beside her face, she asks the camera with one eyebrow raised",
+           "cutaways": [{"kind": "punch", "at": "but"}]},
+          {"line": "Upload your document from your phone, and ExampleCo prepares and files it.", "scene": "desk",
+           "action": "holding her phone in both hands, she taps it once, then looks up and tells the camera",
+           "cutaways": [{"kind": "screen", "capture": "checkout", "at": "from", "until": "prepares", "tap": "ExampleCo"},
+                        {"kind": "still", "still": "payoff", "at": "prepares"}]},
+          {"line": "It costs $9.50, with everything included.", "scene": "kitchen",
+           "action": "resting her forearms on the counter, she explains with an easy smile",
+           "cutaways": [{"kind": "price", "at": "$9.50", "pulse": "everything"}]},
+          {"line": "Get it done today at example.com and skip the line.", "scene": "closeup",
+           "action": "her hands folded, she says it warmly, pronouncing the web address slowly and clearly, word by word",
+           "cutaways": [{"kind": "endcard", "at": "and", "pulse": "line"}]}
+        ],
+        "disclosure": "AI-generated"
+      }
+    }
+  }
+}

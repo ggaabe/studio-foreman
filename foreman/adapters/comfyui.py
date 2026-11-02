@@ -23,7 +23,8 @@ when the job is done, so it never shares the GPU with an mlx-serve media model.
     template file <graphs_dir>/<name>.json in ComfyUI's API format with placeholders such as
     {{prompt}}, {{seed}}, {{width}}, {{image_1}} (a string that is exactly one placeholder takes the
     value's type; one inside a longer string is replaced by its text). Optional wrapper:
-        {"graph": {...}, "outputs": ["9"], "defaults": {"steps": 8}, "license": "...", "commercial_ok": true}
+        {"graph": {...}, "outputs": ["9"], "defaults": {"steps": 8}, "license": "...", "commercial_ok": true,
+         "attribution": "..."}   (a credit the model's license requires, recorded with each output)
     Images are uploaded first (POST /upload/image), the graph is queued (POST /prompt), its
     progress is followed by polling /queue and /history/<id> (a bounded heartbeat while it runs),
     and the first file of the output nodes is downloaded (GET /view) to `out`, streamed to a temp
@@ -49,6 +50,7 @@ import re
 import secrets
 import signal
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -64,6 +66,12 @@ EVENT_CAP = 0.95
 MAX_OUTPUT_BYTES = 2 << 30   # one downloaded output at most (a 2 GiB take is far past anything an ad uses)
 PLACEHOLDER = re.compile(r"\{\{\s*([a-z][a-z0-9_]{0,40})\s*\}\}")
 META = ".meta.json"
+# launchd runs gpud as a Background job, and macOS gives that band (throttled CPU and I/O) to every
+# child, a new session included: ComfyUI's start-up, model loading and CPU-side work ran several times
+# slower in it than from a shell. ComfyUI is started through this, which leaves the band and execs it
+# (the process keeps its pid, and its command line is main.py's again).
+UNBACKGROUND = ("import os, sys\ntry:\n    os.setpriority(4, 0, 0)  # PRIO_DARWIN_PROCESS: not background\n"
+                "except (AttributeError, OSError):\n    pass\nos.execv(sys.argv[1], sys.argv[1:])")
 
 
 class GraphError(ValueError):
@@ -114,9 +122,43 @@ def load_graph(graphs_dir: str, name) -> dict:
     if outputs is not None and (not isinstance(outputs, list) or not all(str(o) in graph for o in outputs)):
         raise GraphError(f"graph template {name!r}: outputs must list node ids of the graph")
     defaults = data.get("defaults") if wrapped and isinstance(data.get("defaults"), dict) else {}
+    attribution = data.get("attribution") if wrapped else None
     return {"graph": graph, "outputs": [str(o) for o in outputs] if outputs else None, "defaults": defaults,
             "license": data.get("license") if wrapped else None,
-            "commercial_ok": data.get("commercial_ok") is True if wrapped else False, "path": path}
+            "commercial_ok": data.get("commercial_ok") is True if wrapped else False,
+            "attribution": attribution.strip()[:200] if isinstance(attribution, str) and attribution.strip() else None,
+            "path": path}
+
+
+_WEIGHT_FILE = re.compile(r"\.(safetensors|ckpt|pt|pth|bin|gguf|onnx)\b", re.I)
+
+
+def missing_install(body) -> str | None:
+    """What a POST /prompt refusal says the installation lacks (None when it is about the graph
+    itself): a node type no installed pack provides, or a model file that is not on disk (ComfyUI
+    answers value_not_in_list for an input naming a weights file it does not have)."""
+    try:
+        obj = json.loads((body or b"").decode("utf-8", "replace"))
+    except ValueError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    err = obj.get("error") if isinstance(obj.get("error"), dict) else {}
+    msg = str(err.get("message") or "")
+    if err.get("type") == "missing_node_type" or re.search(r"node (type )?\S+ (does not exist|not found)|"
+                                                           r"not found\. the custom node", msg, re.I):
+        return f"a node type is not installed: {msg[:200]}"
+    nodes = obj.get("node_errors") if isinstance(obj.get("node_errors"), dict) else {}
+    for nid, entry in nodes.items():
+        for e in (entry.get("errors") if isinstance(entry, dict) and isinstance(entry.get("errors"), list) else []):
+            if not isinstance(e, dict):
+                continue
+            extra = e.get("extra_info") if isinstance(e.get("extra_info"), dict) else {}
+            value = str(extra.get("received_value") or e.get("details") or "")
+            if e.get("type") == "value_not_in_list" and _WEIGHT_FILE.search(value):
+                return (f"node {nid} ({entry.get('class_type') or '?'}): a model file is missing: "
+                        f"{str(e.get('details') or value)[:200]}")
+    return None
 
 
 def output_problem(path: str, ctype: str, name: str) -> str | None:
@@ -370,15 +412,27 @@ class ComfyUIEngine:
         cmd = [self.python, "main.py", "--listen", self.host, "--port", str(self.port),
                "--use-pytorch-cross-attention", "--disable-auto-launch"] + self.extra_args
         log.info("starting ComfyUI: %s (in %s)", " ".join(cmd), self.comfy_dir)
+        if sys.platform == "darwin":  # leave launchd's Background band first (see UNBACKGROUND)
+            cmd = [self.python, "-c", UNBACKGROUND] + cmd
         try:
             proc = self._popen(cmd, cwd=self.comfy_dir, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                               start_new_session=True)
+                               start_new_session=True, env=self._env())
         finally:
             out.close()
         with self._lock:
             self._proc, self._pid, self._started_wall = proc, proc.pid, time.time()
             self._live_port, self._stale_queue = self.port, False
         self._write_pidfile()
+
+    def _env(self) -> dict:
+        """ComfyUI's environment: gpud's, without its PYTHONPATH (Foreman's checkout is not
+        ComfyUI's to import), and with the python's own bin directory first on PATH: custom nodes
+        build kernels with tools from the venv (ninja), which launchd's minimal PATH does not have."""
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        bindir = os.path.dirname(self.python)
+        rest = [p for p in env.get("PATH", os.defpath).split(os.pathsep) if p and p != bindir]
+        env["PATH"] = os.pathsep.join([bindir] + rest)
+        return env
 
     def _signal(self, sig) -> None:
         """Signal the server's process group: ComfyUI and its children only. Foreman's ComfyUI leads
@@ -822,6 +876,19 @@ class ComfyUIEngine:
         with self._lock:
             self._stale_queue = False
 
+    def _remove_own(self, folder: str, rel: str) -> None:
+        """Best effort: delete a file Foreman uploaded to ComfyUI's input folder, or an output it has
+        downloaded, so neither folder grows by a take's pictures, voice and video on every job. Only a
+        name that starts with "foreman" inside that folder of the ComfyUI Foreman runs is touched."""
+        root = os.path.realpath(os.path.join(self.comfy_dir, folder))
+        path = os.path.realpath(os.path.join(root, rel))
+        if not path.startswith(root + os.sep) or not os.path.basename(path).startswith("foreman"):
+            return
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
     def _upload(self, run: _Run, name: str, src: str) -> str:
         ext = os.path.splitext(src)[1].lower() or ".png"
         fname = f"foreman-{re.sub(r'[^A-Za-z0-9_-]+', '_', run.spec.run_id)}-{name}{ext}"
@@ -858,11 +925,21 @@ class ComfyUIEngine:
         images = op.get("images") or {}
         if not isinstance(images, dict):
             raise RunRefused(f"op {i}: images must be an object of name -> file")
-        for name, src in images.items():
-            if not PLACEHOLDER.fullmatch("{{" + str(name) + "}}"):
-                raise RunRefused(f"op {i}: image name {name!r} is not a placeholder name")
-            real = paths.input_path(src, self.input_roots, wd)
-            values[name] = self._upload(run, str(name), real)
+        uploaded = []
+        try:
+            for name, src in images.items():
+                if not PLACEHOLDER.fullmatch("{{" + str(name) + "}}"):
+                    raise RunRefused(f"op {i}: image name {name!r} is not a placeholder name")
+                real = paths.input_path(src, self.input_roots, wd)
+                values[name] = self._upload(run, str(name), real)
+                uploaded.append(values[name])
+            return self._run_rendered(run, op, tpl, values, out, lo, hi, weight, i)
+        finally:
+            for rel in uploaded:  # every op uploads its own inputs again
+                self._remove_own("input", rel)
+
+    def _run_rendered(self, run: _Run, op: dict, tpl: dict, values: dict, out: str, lo: float, hi: float,
+                      weight: float, i: int) -> dict:
         graph = render_graph(tpl["graph"], values)
         client = f"foreman-{run.spec.run_id}"
         try:
@@ -870,6 +947,9 @@ class ComfyUIEngine:
                                timeout=max(10.0, self.call_timeout_s))
         except HttpError as e:
             if 400 <= e.status < 500:
+                missing = missing_install(e.body)
+                if missing:  # the machine lacks a model file or a node pack: not the graph's fault
+                    raise EngineTrouble(f"ComfyUI cannot run the graph {op.get('graph')!r} here: {missing}") from None
                 raise RunRefused(f"ComfyUI refused the graph {op.get('graph')!r}: {e.message} "
                                  f"{error_message(e.body)[:300]}") from None
             raise
@@ -914,8 +994,12 @@ class ComfyUIEngine:
             except OSError:
                 pass
             raise EngineTrouble(f"/view for {f0.get('filename')} did not return the output file: {problem}")
+        if (f0.get("type") or "output") == "output":
+            self._remove_own("output", os.path.join(f0.get("subfolder") or "", f0.get("filename") or ""))
         meta = {"prompt_id": prompt_id, "file": f0.get("filename"), "bytes": nbytes, "license": tpl["license"],
                 "commercial_ok": tpl["commercial_ok"], "content_type": ctype}
+        if tpl.get("attribution"):
+            meta["attribution"] = tpl["attribution"]
         size = media.image_size(out)
         if size:
             meta.update(width=size[0], height=size[1])

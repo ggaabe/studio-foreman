@@ -24,7 +24,7 @@ test suite makes no network calls outside 127.0.0.1 and starts no real model ser
 
 ```bash
 cd foreman
-python3 -m unittest discover -s tests -v     # 549 tests (plus subtests), about 4 to 5 minutes
+python3 -m unittest discover -s tests -v     # 927 tests (plus subtests), about 15 minutes
 python3 -m foreman.demo                       # narrated timeline: render hangs, brain recovers
 python3 -m foreman.demo --fault crash         # also: garbage, wedged, none
 ```
@@ -70,7 +70,9 @@ documented gap instead of demanding a fix. See [Inverted red-team tests](#invert
 | `foreman/adapters/mlx_ops.py` | Multi-request jobs on mlx-serve: speech (Kokoro, Qwen3-TTS clone), transcription, images, the full video request |
 | `foreman/adapters/comfyui.py` | `ComfyUIEngine`: ComfyUI started on demand, graph templates, uploads, outputs, interrupt, /free, stop |
 | `foreman/adapters/local.py` | `LocalEngine`: CPU work (an ad's facts, assembly, QA) under gpud's leases |
-| `examples/` | A generic `goals.md` and four inactive example templates (no real client names); `examples/ads/`: a generic ad template, character bible, facts file, ComfyUI graph template and config |
+| `foreman/h3core.py` | The h3 talk chain's pure logic: the template's h3 block, the brain's beat plan, what the voice is told, beat seconds, the H3 prompt, the judge of a take, retakes |
+| `foreman/h3/` | The h3 media worker (numpy + Pillow, run as a subprocess under `ads_options.media_python`, never imported by the core): probe, edit, audio, captions, graphics |
+| `examples/` | A generic `goals.md` and four inactive example templates (no real client names); `examples/ads/`: generic ad templates (an LTX mascot ad, an h3 presenter ad), character bibles, facts files, ComfyUI graph templates (the format, and an H3 Ref2VA take graph) and config |
 | `deploy/`, `scripts/` | LaunchAgent templates (gpud, phone) and install/uninstall scripts (no sudo) |
 | `tests/test_brain_return.py` | Invariants I1 to I9 (the original 48 tests, unchanged) |
 | `tests/test_adversarial.py` | The red team's 37 attacks (two inverted to require no crash; see below) |
@@ -86,6 +88,10 @@ documented gap instead of demanding a fix. See [Inverted red-team tests](#invert
 | `tests/test_ads_engines.py` | G1 to G4: the mlx-serve ops, the ComfyUI engine (a fake ComfyUI process, `tests/fake_comfyui.py`), the local engine, solo_media, a continuation's expected_s, engine checks, failure classes |
 | `tests/test_ads_pipeline.py` | P1 to P7: the ad template and the planner, the script validator, timing, characters, facts, assembly with real ffmpeg, the dispatcher |
 | `tests/test_ads_e2e.py` | E1 to E4: gpud on the fakes runs whole ads: the happy path, failures, retention, ComfyUI stills between mlx-serve media models |
+| `tests/test_h3_core.py` | H1 to H11: the h3 chain's pure logic: the h3 block, the beat plan, spellings and readings, seconds, the prompt, alignment, the judge, retakes, the number fix, what may reach the prompt, the picture and the speech gate, a scan that no owner data is in the repo (its terms come from a private file named by `FOREMAN_PRIVATE_TERMS`; skipped without it), and H12, the second review's fixes |
+| `tests/test_h3_pipeline.py` | S1 to S7: the h3 chain in the dispatcher on synthetic files (a fake media worker): the facts preflight and its failure classes, every round's step (a take whose audio does not decode, one of another size, one heard saying a claim), the final gate's safe re-edit, captions that every beat moves, finish's file checks, the gate record, retention, process groups, ComfyUI's environment and refusals, the examples |
+| `tests/test_h3_worker.py`, `tests/test_h3_graphics.py` | The media worker's probe and edit, and its graphics, under the local python with numpy and Pillow (skipped without them): a punch-in inside the beat's crop, word times inside their beat, the caption font alone for libass, a worker whose parent dies |
+| `tests/test_h3_e2e.py` | H1 to H4: gpud runs whole h3 ads on the fakes (a fake ComfyUI process rendering talking takes, the fake ASR hearing them by their tones) with the real media worker and ffmpeg: the happy path, retakes and a safe re-edit, retention, the failure classes, and the seams between the parts |
 | `tests/test_phone.py` | PH1 to PH12: phone approvals against a local fake Bot API (`tests/fake_telegram.py`): pairing, exactly-once sends, media paths, captions, buttons through the ledger, stale and forged buttons, notes, commands, unauthorized updates, backoff, offsets, the token's secrecy, pages, digest, CLI, LaunchAgent |
 
 ## How the brain comes back
@@ -324,7 +330,8 @@ Model names are the ids mlx-serve's `--model-dir` discovery gives the packs (`<o
 Packs downloaded after the server started are not discovered until a rescan, so the adapter then
 loads them by absolute path, which registers them under the directory basename; both names map
 back to the catalog. FastH3-Omni (MiniMax-H3 derived; its license excludes US users) is not in
-the catalog, and the adapter refuses to load or run anything matching it.
+the catalog, and the adapter refuses to load or run anything matching it. (The ComfyUI H3 graph of
+the h3 talk chain is gated by its graph template's license fields instead: see "H3 talking shots".)
 
 **Plan sizes are calibrated.** The sizes are what mlx-serve's `/api/ps` reported as `size_vram`
 on the Studio (2026-10-26), and for LTX the peak seen during a live render, plus a modest margin;
@@ -504,7 +511,9 @@ fallback brain was still downloading while gpud ran.
 `deploy/com.github.ggaabe.foreman.gpud.plist` is a user LaunchAgent template: `KeepAlive` true
 (gpud holds no GPU memory, so restarting it however it exited strands nothing),
 `ThrottleInterval` 30, `ExitTimeOut` 60, `ProcessType` Background, stdout and stderr under
-`~/.foreman/logs`. Nothing installs it automatically. The phone service has its own template
+`~/.foreman/logs`. macOS gives a Background job's children its throttled CPU and I/O band, so the
+ComfyUI that gpud starts and the h3 media worker leave that band first (an edit there ran about five
+times slower than from a shell). Nothing installs it automatically. The phone service has its own template
 (`deploy/com.github.ggaabe.foreman.phone.plist`, see [Phone approvals](#phone-approvals)).
 
 ```bash
@@ -1532,7 +1541,8 @@ gpud engine that starts ComfyUI only for the job that needs it:
 from `comfyui_options.dir`, waits for `GET /system_stats`, uploads the input images, queues the
 graph (`POST /prompt`), follows it on `/queue` and `/history/<id>` with a bounded heartbeat,
 downloads the output (`/view`, streamed to a temp file and checked: a cut connection, an error
-page or a truncated image is never kept), then `POST /free` and stops the process (SIGTERM, a
+page or a truncated image is never kept; its own uploads and the downloaded output are then deleted from
+ComfyUI's input and output folders), then `POST /free` and stops the process (SIGTERM, a
 wait, SIGKILL only for the ComfyUI Foreman started). The server counts as resident while that
 process is alive, answering or not (a busy or wedged ComfyUI still holds its memory). A restarted
 gpud adopts it from `run/comfyui.json` on whatever port it was started, but only a process that is
@@ -1631,6 +1641,145 @@ The deployment policy allows 64 continuation hops per lineage (an ad is up to ab
 two hops each, plus retries, the audio gate's retake rounds and one re-mix); the dispatcher refuses
 an ad whose planned jobs would not fit.
 
+### H3 talking shots
+
+A template whose `ad` block has an `h3` block runs the **h3 chain** instead of the voice, timing,
+stills and shots steps: a human presenter says every beat on camera. Each beat is one talking take
+of MiniMax H3 Ref2VA in ComfyUI (pictures: the beat's scene still, the hero still and a face
+close-up; audio: the character's own reference voice, so the voice is one person's across beats;
+the line inside the structured prompt, a static camera). The take is the picture and the voice:
+no TTS runs. Code hears every take, keeps the first that says its line cleanly, takes a beat again
+when it does not, and the edit lays the screen capture, the price card, a still and the end card
+over parts of the beats while the voice goes on (J and L cuts on word onsets). The chain is chosen
+per template, so a mascot template on LTX keeps running beside it.
+
+| Step | Job kind | Runs on | Writes |
+|---|---|---|---|
+| facts | `ad_facts` | local CPU engine | as above, plus the h3 checks below; `ad.json` picks `backends.talk = "h3"` |
+| script | inside `ad_next` | the resident brain | `script.json`: lines, one talk shot per beat, and the beats (scene, action, cutaways on words of the line, seconds, seed) |
+| takes | `ad_shots` | ComfyUI (`comfyui/graphs`), the h3 graph | `takes/beat-<k>-t<n>.mp4` (+ the adapter's sidecar) |
+| probe | `ad_probe` | local CPU engine, the media worker | `takes/beat-<k>-t<n>.wav` (16 kHz mono), `.probe.json` (levels, voiced runs, stray hands) |
+| hear | `ad_gate` | Qwen3-ASR: hinted with word times, and free-running | `gate/beat-<k>-t<n>.asr.json`, `.asr0.json`; the verdicts in `gate.json` |
+| music | `ad_music` | ACE-Step | `music/bed.wav` (as long as the takes could make the cut) |
+| assemble | `ad_assemble` | local CPU engine, the media worker | `final/ad.mp4`, `final/audio.wav`, `captions.ass`, `ad.srt`, `timeline.json`, `final/beats/`, `publish.json`, `assembly.json`; `timing.json`, `pick.json` |
+| final gate | `ad_gate` | Qwen3-ASR, free-running | `gate/final-<beat>-r<n>.json` per beat, `gate/mix-r<n>.json` |
+| finish | `ad_finish` | local CPU engine | `final/qa.json` (with the h3 checks), `final/video.json`, `manifest.json` |
+| review | `ad_review` | the vision brain | as above |
+
+A round of takes is one take for every beat still pending, packed into ComfyUI jobs (`max_job_s`
+over `expected.h3_take`, 140 s), so ComfyUI starts once per round; then one probe job and one
+hearing job. **The judge** (`foreman/h3core.py`, code): the take must have audio, the render's size
+and most of the length asked; the free-running transcript must say every lexicon term and number
+of the line and no other number inside it, within `gate_wer_max`; the word-timed transcript must
+start with the line (nothing said before it), not run on into another word within `h3_runon_s`
+(0.15 s), and hear most of it; a cut word (the end card's) must start on a real voiced onset after
+quiet (`h3_anchor_tol_s`, `h3_anchor_gap_s`: a forced aligner packs a spoken address short and
+slides the next words early); a scene with `hands_gate` must show no stray hands in its bottom band
+in the frames the cut shows of the take (from just before the line to its sound's end and hold, not under a
+card or still);
+the line must end before the take does; and what the take was heard saying may not add what the
+ad's rules refuse and its line does not (a claim, another brand or address, a banned word: H3 makes its
+own speech, and one inserted word stays within `gate_wer_max` on a long line; the final gate applies
+the same rule to each beat's finished voice). A take whose probe found a problem (no audio, an audio
+stream that does not decode, silence) is judged on it without being heard. A take of another size
+than `h3_width` x `h3_height` stops the ad as the machine's failure (`engine_unconfigured`: the graph
+does not take its size from `{{width}}` and `{{height}}`), not the template's. A render ComfyUI fails
+on, or that leaves no file, is an infrastructure failure of the takes job, retried as it was (same
+seeds), never a failed take. A failed beat is taken again with seed + 1000 n and, once
+it was re-rolled `gate_rerolls` times for a term it did not say, that term's next spelling, up to
+`h3_attempts` (3) takes and `h3_budget_s` (1200) render seconds per ad; then the ad fails as content,
+naming the beat and what was heard. The dispatcher refuses an ad whose worst case (every beat taken
+`h3_attempts` times) would not fit the continuation depth. A take's voice is told the line with the
+lexicon's spellings (the ad's address spelled out first: "example dot com") and the template's
+`readings` ("nine fifty" for $9.50); the speech gate must take what the voice is told for the line
+word for word, or the ad fails before any render. Nothing else in the prompt may speak for it: the
+brain's action is held to the visual rules plus no claim, banned word, markup or quoted speech, the
+template's presenter, framing and setting likewise, and every field is stripped of the prompt's own
+markup (`<`, `>`, `[`, `]`, `{`, `}`), so the line is the prompt's one `<d>` dialogue tag.
+
+**The edit** keeps each beat's take on a 24 fps grid trimmed to the line's acoustic bounds, cuts
+the cutaways in on word onsets (a punch-in is cut inside the beat's own `crop`, so it never shows rows
+the crop, and the hands check, leave out; no word time leaves its beat, so no caption runs over the
+next beat's picture), removes pauses only under graphic cutaways and only where the take
+is silent by energy, sets each beat's voice to -14 LUFS, lays the music `h3_music_under` (14) LU
+under the voice (`h3_bed_lift` between lines), burns word-highlight captions (Arial Black,
+hidden under the price card and the end card; libass is given the caption font alone, so it draws the
+face the lines were measured with), encodes bt709 x264 (`h3_crf`) within `max_mb`, and
+writes a sidecar SRT. **The final gate** hears each beat's finished voice again: one that lost a word
+(an edit that cut "dot com") makes the ad be edited once more with no pause removed and no gap
+closed; a second loss fails the ad. The mix is judged as above against the takes, with one re-mix
+(the music `gate_remix_db` further under). **Finish** adds what the file must show: exactly the
+timeline's frame count, no frozen second anywhere, a scene cut at every punch-in, bt709 tags (the
+assembly checks that the captions show where they are drawn: in the caption band, or at the moved
+position when every beat sets `caption_pos`). No AI
+label is ever burned into the picture: an h3 template must say `"ai_label": false`, no drawn text (the
+headline, the cards, the brand's name) and no line may label the ad as AI-made, and
+`final/publish.json`, keyed to the finished file's hash, is the gate a person fills in before
+posting (each platform's AI-content disclosure, the region, the SRT uploaded, the attribution); the
+review's note ends by saying so.
+
+**The template's `h3` block** (owner data, never in the repo; checked when the template loads, and
+against the bible, the files and the facts at the facts step):
+`presenter` (`noun`, `subject`, `object` for the prompt, `voice`: what the reference recording
+holds, `voice_style`), `face` (the approved still tag of the face close-up), `scenes` (2 to 12:
+`still`, `framing`, `setting`, `roles`, `hands_gate`, `crop`, `caption_pos`, `punch_anchor_y`),
+`stills` (cutaway pictures: `still`, `note`), `captures` (PNG captures of `ad.captures` with `id`,
+`note`, `crop`, `paint` boxes, the `tap` button and its colour), `price_card` (`big`, `lines`, a
+capture `crop`, `underline` boxes, `pulse_line`, a `lead` of card-coloured pixels stacked between the
+crop's text lines so an underline clears the next one, `paint` boxes), `endcard` (`lead`, `big`,
+`lines`, `footnote`),
+`brand` (`name`, colours, an optional `logo` PNG under assets), `headline` (true: the brain writes
+one; a string; null), `readings`, `caption` (`size`, `margin_v`, `margins`), `punch_scale`,
+`hold_cta_s`, `tail_hook_s`, `example` (a finished plan shown to the brain) and `notes`. See
+`examples/ads/templates/ads.example-h3.v1.json` (generic: ExampleCo, example.com, $9.50), its
+facts `examples/ads/assets/facts-h3.json` and presenter `examples/ads/characters/presenter-example/`.
+The character's voice names its reference recording (`voice.ref_wav`, allowed with any engine).
+
+**The media worker** (`foreman/h3/`: probe, edit, audio, captions, graphics) needs numpy and Pillow,
+which gpud's Python does not have, so the core never imports it: it runs
+`<ads_options.media_python> -I foreman/h3/worker.py probe|edit h3/<command>-req.json` in the ad's
+work directory, in a process group of its own (a cancel stops its ffmpeg too; out of the reach of
+launchd ending gpud's group, it watches its parent and stops the same way when gpud is gone, so a
+retried step never races it on the same files). `media_python` is resolved once to an absolute path
+(a bare name on `PATH`, a relative path from gpud's directory): the preflight checks what the worker
+runs. Its last stdout line
+is its answer; exit 2 is a content failure, 3 the machine's (an infrastructure failure), anything
+else a crash that is retried. On the Studio `media_python` is ComfyUI's venv python.
+
+**Configuration** (`ads_options`): `media_python`, `h3_graph` (`h3_ref2va`), `h3_width` /
+`h3_height` (576x1024, multiples of 32), `h3_attempts`, `h3_budget_s`, `h3_music_under`,
+`h3_bed_lift`, `h3_crf`, `h3_hands_floor` / `h3_hands_limit`, `h3_anchor_tol_s`, `h3_anchor_gap_s`,
+`h3_runon_s`, and `expected.h3_take`, `h3_probe`, `h3_edit`. The facts step stops an h3 ad before any
+GPU work when the machine is not ready (`engine_unconfigured`: `media_python` missing or without
+numpy and Pillow, `out_width` / `out_height` other than 1080x1920 (the frame the cards, the headline
+and the captions are drawn for), the graph template missing, without outputs, a needed placeholder or a license
+text, the fonts, character files outside `$FOREMAN_HOME`) or the template or character does not
+hold (content: no reference voice, the face or a scene still not approved, a capture or the logo
+missing, a box outside its capture, a card's number or price not in the facts).
+
+**The graph and its license.** `examples/ads/comfyui/graphs/h3_ref2va.example.json` is the API
+graph of a macOS ComfyUI H3 workflow (the int8 transformer, the turbo 4-step LoRA, Spectrum and
+SolAttn), its constant switches folded and unused nodes dropped, with placeholders `{{prompt}}`,
+`{{image_1}}` to `{{image_3}}`, `{{audio_1}}`, `{{seed}}`, `{{seconds}}`, `{{width}}`, `{{height}}`
+and `{{lora}}`; the graph rounds the frames up to 17k+5 itself. The MiniMax H3 Community License
+grants rights only outside its Excluded Territories, which are the European Union, the United
+Kingdom, the Republic of Korea and the United States: there, neither the weights nor their outputs
+may be used without a separate license from MiniMax. A commercial product or service using it must
+display "MiniMax H3", and large commercial users need MiniMax's written authorization. Its Acceptable
+Use Policy (Exhibit A) also forbids publishing outputs in a public environment "without clearly and
+prominently disclosing" that they are machine-generated (item 12) and using them for false online
+engagement such as fake reviews (item 8); the license encourages a "Powered by MiniMax H3" notice on a
+product built with it (Section III.3). Whether each platform's AI-content toggle (Foreman never burns a
+label into the picture) is a clear and prominent enough disclosure, and where the attribution goes, is
+also the owner's call. Foreman does not decide whether the license allows a given use: the owner does,
+after reading it. The h3 graph
+template must state a `license` (required), may carry an `attribution` (recorded in every take's
+sidecar, the manifest and `final/publish.json`), and a commercial template refuses it unless its
+wrapper says `commercial_ok: true`, which only the owner sets. The example graph says `commercial_ok:
+false`, and the example template, an ad for a paid service, is commercial: the pair is refused at the
+facts step until the owner decides. mlx-serve's FastH3 builds stay refused by model id (`studio.FORBIDDEN`); that guard is about
+model ids, not this graph.
+
 ### Known gaps of the ad pipeline
 
 - Not run against the real servers yet: the request shapes follow MLX-Serve 26.11.1's docs and
@@ -1678,6 +1827,13 @@ an ad whose planned jobs would not fit.
   not verified (the gate unloads it either way), and whether its Kokoro reads `ipa` or `arpabet`
   is not known (they are not sent). The tests use the fake MLX-Serve, whose voice says what a test
   tells it and whose ASR hears what each WAV holds; the gate has not run against the Studio yet.
+- The h3 chain has not run end to end through gpud on the Studio yet: its recipe ran by hand (the
+  v6 ad), and the tests drive the dispatcher on synthetic files and the worker on synthetic takes.
+  `expected.h3_take` (140 s) is the recipe's measured render time; ComfyUI's `plan_gb` (60) is about
+  what an H3 take needs beside the resident brains and should be measured through Foreman. The
+  judge's thresholds (most of the line heard: 70% of its words; the alignment costs) are judgement
+  calls tuned on the recipe's takes. `final/publish.json` leaves the region (`geo`) and every
+  platform toggle for a person to fill in.
 
 ## Known gaps
 

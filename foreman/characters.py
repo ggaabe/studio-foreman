@@ -2,7 +2,7 @@
 
     $FOREMAN_HOME/characters/<id>/bible.json
     $FOREMAN_HOME/characters/<id>/stills/*.png|jpg     approved stills, tagged by pose or scene
-    $FOREMAN_HOME/characters/<id>/voice/reference.wav  a Qwen3-TTS clone's reference (optional)
+    $FOREMAN_HOME/characters/<id>/voice/reference.wav  the voice's reference recording (optional)
 
 bible.json (unknown keys are an error, so a typo cannot silently drop a trait):
 
@@ -11,7 +11,7 @@ bible.json (unknown keys are an error, so a typo cannot silently drop a trait):
      "look": "plain description of the face, hair, build and outfit",
      "keep": ["traits every shot keeps", ...],
      "style": "style notes (lens, light, palette)",
-     "voice": {"engine": "kokoro", "voice": "af_heart", "speed": 1.0}
+     "voice": {"engine": "kokoro", "voice": "af_heart", "speed": 1.0[, "ref_wav": "voice/reference.wav"]}
             | {"engine": "qwen3_clone", "ref_wav": "voice/reference.wav", "language": "English"},
      "stills": [{"file": "stills/hero.png", "tags": ["hero"], "approved": true, "note": ""}, ...]}
 
@@ -19,7 +19,9 @@ Tags name what a still shows: hero (the reference the pipeline edits from and th
 against), turnaround, expressions, talk (a front-facing frame for lip-sync), endcard, and any
 other short scene name. The pipeline only ever uses approved stills; importing a folder records
 its images unapproved unless the owner says otherwise (`characters import ... --approve`, or
-`characters approve ID FILE...`).
+`characters approve ID FILE...`). A voice of any engine may name a reference recording
+(`ref_wav`): a Qwen3-TTS clone speaks from it, and a talking-take model that hears its voice from a
+recording (the h3 chain) uses it whatever the engine.
 """
 from __future__ import annotations
 
@@ -87,8 +89,14 @@ class Bible:
         return found[0] if found else None
 
     def ref_wav(self) -> str | None:
+        """The Qwen3-TTS clone's reference (None for any other engine: Kokoro never reads it)."""
         v = self.voice
         return self.file(v["ref_wav"]) if v.get("engine") == "qwen3_clone" and v.get("ref_wav") else None
+
+    def voice_ref(self) -> str | None:
+        """The voice's reference recording, whatever the engine (None when the bible names none)."""
+        v = self.voice
+        return self.file(v["ref_wav"]) if v.get("ref_wav") else None
 
     def fingerprint(self) -> str:
         h = hashlib.sha256(json.dumps(self.data, sort_keys=True).encode())
@@ -149,7 +157,9 @@ def validate(data, root: str) -> dict:
         sp = voice.get("speed", 1.0)
         if isinstance(sp, bool) or not isinstance(sp, (int, float)) or not 0.5 <= sp <= 2.0:
             problems.append("voice.speed must be a number in 0.5..2.0")
-        extra = set(voice) - {"engine", "voice", "speed"}
+        if voice.get("ref_wav") is not None:  # the h3 chain's reference voice; Kokoro itself never reads it
+            _rel_file(root, voice.get("ref_wav"), "voice.ref_wav", problems)
+        extra = set(voice) - {"engine", "voice", "speed", "ref_wav"}
         if extra:
             problems.append(f"voice has unknown keys {sorted(extra)}")
     else:
@@ -300,7 +310,8 @@ def import_folder(home: str, src: str, cid: str, name: str | None = None, kind: 
         data["voice"] = {"engine": "qwen3_clone", "ref_wav": "voice/reference.wav", "language": language or "English"}
     elif voice:
         data["voice"] = {"engine": "kokoro", "voice": voice, "speed": float(speed or 1.0)}
-    elif isinstance(base.get("voice"), dict) and base["voice"].get("engine") == "qwen3_clone":
+    elif isinstance(base.get("voice"), dict) and (base["voice"].get("engine") == "qwen3_clone"
+                                                  or base["voice"].get("ref_wav") is not None):
         rel = base["voice"].get("ref_wav")
         bad = []
         _rel_file(src, rel, "the folder's bible.json voice.ref_wav", bad)  # never a file outside the folder

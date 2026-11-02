@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -113,6 +114,26 @@ class G1MlxOps(MlxCase):
         self.assertEqual((req["response_format"], req["timestamp_granularities[]"], req["language"], req["prompt"]),
                          ("verbose_json", "word", "en", "example.com"))
         self.assertEqual(req["file_bytes"], os.path.getsize(src))
+
+    def test_text_without_the_word_times_a_job_needs_is_the_engines_failure(self):
+        """An ASR whose forced aligner is missing answers verbose_json with no words: for the h3 judge
+        that is the engine's failure (retried, nothing written), never a take that said nothing."""
+        self.load(ASR)
+        wav(os.path.join(self.art, "ads", "a2", "voice", "take.wav"), 2.0)
+        self.fake.asr_resolver = lambda audio, fields: ("Get it today.", None)
+        op = {"op": "transcribe", "out": "gate/take.asr.json", "file_path": "voice/take.wav", "language": "en"}
+        out = os.path.join(self.art, "ads", "a2", "gate", "take.asr.json")
+        p = self.run_job(ASR, workdir="ads/a2", ops=[dict(op, need_words=True)])
+        self.assertEqual((p.status, p.reason), ("failed", "engine_error"), p)
+        self.assertIn("no word times", p.error or "")
+        self.assertFalse(os.path.exists(out), "nothing a retry would take for the answer")
+        req = [r for m, path, r in self.fake.requests if path == "/v1/audio/transcriptions"][-1]
+        self.assertNotIn("need_words", req, "Foreman's bookkeeping is never sent")
+        p = self.run_job(ASR, run_id="2.1", workdir="ads/a2", ops=[op])
+        self.assertEqual(p.status, "done", "without need_words the text alone is an answer")
+        self.fake.asr_resolver = lambda audio, fields: ("", None)
+        p = self.run_job(ASR, run_id="2.2", workdir="ads/a2", ops=[dict(op, out="gate/quiet.asr.json", need_words=True)])
+        self.assertEqual(p.status, "done", "nothing said needs no word times")
 
     def test_image_edits_with_reference_stills(self):
         self.load(KLEIN)
@@ -324,6 +345,32 @@ class ComfyCase(TmpCase):
 
 
 class G2ComfyEngine(ComfyCase):
+
+    def test_only_foremans_own_inputs_and_outputs_are_removed(self):
+        """ComfyUI's input and output folders would grow by every take's pictures, voice and video."""
+        files = {rel: os.path.join(self.comfy_dir, rel) for rel in (
+            "input/foreman-1_1-image_1.png", "input/someone-else.png", "output/video/foreman_h3_00001_.mp4",
+            "output/video/theirs_00001_.mp4", "foreman-outside.txt")}
+        for path in files.values():
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            open(path, "wb").close()
+        self.eng._remove_own("input", "foreman-1_1-image_1.png")
+        self.eng._remove_own("input", "someone-else.png")
+        self.eng._remove_own("output", "video/foreman_h3_00001_.mp4")
+        self.eng._remove_own("output", "video/theirs_00001_.mp4")
+        self.eng._remove_own("input", "../foreman-outside.txt")
+        self.eng._remove_own("input", "missing-foreman.png")
+        self.assertEqual(sorted(rel for rel, path in files.items() if os.path.exists(path)),
+                         ["foreman-outside.txt", "input/someone-else.png", "output/video/theirs_00001_.mp4"])
+
+    @unittest.skipUnless(sys.platform == "darwin" and shutil.which("taskpolicy"), "macOS background band")
+    def test_comfyui_starts_outside_launchds_background_band(self):
+        from foreman.adapters import comfyui
+        probe = "import os; print(os.getpriority(4, 0))"  # PRIO_DARWIN_PROCESS: 1 in the background band
+        plain = subprocess.run(["taskpolicy", "-b", sys.executable, "-c", probe], capture_output=True, text=True)
+        lifted = subprocess.run(["taskpolicy", "-b", sys.executable, "-c", comfyui.UNBACKGROUND, sys.executable,
+                                 "-c", probe], capture_output=True, text=True)
+        self.assertEqual((plain.stdout.strip(), lifted.stdout.strip()), ("1", "0"), lifted.stderr)
 
     def test_start_run_free_and_stop_after_the_job(self):
         self.assertEqual(self.eng.resident_models(), set())

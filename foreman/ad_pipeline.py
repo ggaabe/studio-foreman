@@ -16,7 +16,7 @@ import urllib.error
 import urllib.request
 
 from . import ads as ads_mod
-from . import assembly, characters, media, paths
+from . import assembly, characters, h3core, media, paths
 from .adapters.local import ContentFailure, InfraFailure
 from .ads import (LANG_CODES, MAX_EXPECTED_S, AdError, AdsConfig, advance_spelling, cont, gate_lexicon, gate_tokens,
                   give_up, go_on, judge_heard, merge_lexicon, number_problems, numbers_in, neutralize, parse_ad_block,
@@ -39,6 +39,21 @@ GATE_FILE = "gate.json"
 TRANSIENT_HTTP = (408, 425, 429)
 VIDEO_EXT = (".mp4", ".mov", ".m4v", ".webm")
 IMAGE_EXT = (".png", ".jpg", ".jpeg")
+# The h3 chain's media worker (numpy + Pillow, never imported by the core): run as a subprocess under
+# ads_options.media_python, in the ad's work directory (foreman/h3/worker.py documents the protocol).
+H3_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "h3", "worker.py")
+H3_FONTS = {"black": "/System/Library/Fonts/Supplemental/Arial Black.ttf",
+            "bold": "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+            "logo": "/System/Library/Fonts/Avenir Next.ttc"}
+# Placeholders an h3 graph must carry: without one, Foreman's value would be dropped without a word
+# (a take in another voice, or of another scene).
+H3_PLACEHOLDERS = ("prompt", "image_1", "image_2", "image_3", "audio_1", "seed", "seconds", "width", "height")
+H3_PUBLISH_NOTE = "Before posting: set each platform's AI-content disclosure (final/publish.json)."
+# The frame the h3 edit draws its cards, headline and captions on (foreman/h3/graphics.py).
+H3_FRAME = (1080, 1920)
+# A worker infrastructure failure that names the machine's setup (not a passing fault).
+H3_UNCONFIGURED = re.compile(r"ffmpeg not found|cannot run ffmpeg|font|numpy|pillow|\bPIL\b|media python|cannot load",
+                             re.IGNORECASE)
 
 REVIEW_SYSTEM = """You check a finished vertical video ad before its owner sees it. You get the facts it \
 must stay within (untrusted reference data), the words the ad speaks, what speech recognition heard in \
@@ -123,7 +138,13 @@ class AdPipeline:
             raise AdError(str(e)) from None
 
     def handlers(self) -> dict:
-        return {"ad_facts": self.run_facts, "ad_assemble": self.run_assemble, "ad_finish": self.run_finish}
+        return {"ad_facts": self.run_facts, "ad_assemble": self.run_assemble, "ad_finish": self.run_finish,
+                "ad_probe": self.run_probe}
+
+    @staticmethod
+    def is_h3(ad: dict) -> bool:
+        """The ad runs the h3 chain (its template's ad block has an h3 block; frozen at its facts step)."""
+        return ((ad.get("picks") or {}).get("backends") or {}).get("talk") == "h3"
 
     def bible(self, wd: str):
         """The ad's character as of now: the snapshot taken at its facts step, keeping only the stills
@@ -184,6 +205,8 @@ class AdPipeline:
         ctx.progress(0.1)
         lexicon = self.lexicon(ad)
         picks = self.picks(ad, bible)
+        if ad.get("h3"):
+            picks["h3"].update(self.h3_preflight(ad, bible, ctx))
         if ad.get("commercial"):
             bad = sorted({m for m in picks["models"].values() if m not in self.commercial})
             if bad:
@@ -203,6 +226,11 @@ class AdPipeline:
         bad = number_problems(card.get("cta") or "", facts, money)
         if bad:
             raise ContentFailure(f"the end card call to action {card.get('cta')!r}: {'; '.join(bad)}")
+        if ad.get("h3"):
+            bad = h3core.h3_facts_problems(ad["h3"], facts, ad)
+            if bad:
+                raise ContentFailure(f"the template's h3 block does not hold against the facts ({facts['source']}): "
+                                     + "; ".join(bad)[:800])
         src_url = (ad.get("facts") or {}).get("url")
         if src_url and card.get("url"):
             a, b = _site(src_url), _site(card["url"])
@@ -241,6 +269,17 @@ class AdPipeline:
     def picks(self, ad: dict, bible) -> dict:
         cfg = self.cfg
         voice = bible.voice
+        if ad.get("h3"):
+            # One H3 take is the picture and the voice: no TTS, stills or B-roll model runs, so none is
+            # named (the commercial check and the manifest's license rows list only what runs).
+            comfy = self.model("comfy")
+            return {"models": {"voice": comfy, "talk": comfy, "asr": self.model("asr"), "music": self.model("music"),
+                               "cpu": self.model("cpu")},
+                    "backends": {"stills": None, "talk": "h3", "broll": None},
+                    "graphs": {"stills": None, "talk": cfg.h3_graph, "broll": None},
+                    "talk_seeds": 1, "voice": voice, "video": [cfg.h3_width, cfg.h3_height],
+                    "out": [cfg.out_width, cfg.out_height], "voice_track": "lines",
+                    "h3": {"width": cfg.h3_width, "height": cfg.h3_height}}
         models = {"voice": self.model("tts_clone" if voice.get("engine") == "qwen3_clone" else "tts"),
                   "asr": self.model("asr"), "music": self.model("music"), "cpu": self.model("cpu")}
         if cfg.stills_backend == "mlx":
@@ -260,7 +299,7 @@ class AdPipeline:
         from .adapters.comfyui import GraphError, load_graph
         gdir = self._graphs_dir()
         for stage in ("stills", "talk", "broll"):
-            if picks["backends"][stage] != "comfyui":
+            if picks["backends"].get(stage) not in ("comfyui", "h3"):
                 continue
             try:
                 g = load_graph(gdir, picks["graphs"][stage])
@@ -272,6 +311,106 @@ class AdPipeline:
 
     def _graphs_dir(self) -> str:
         return self.graphs_dir
+
+    def h3_preflight(self, ad: dict, bible, ctx) -> dict:
+        """The h3 chain's checks before any GPU work. The machine (infrastructure, engine_unconfigured):
+        the media worker's interpreter imports numpy and Pillow, the graph template loads with its
+        outputs, its placeholders and a license text, the fonts resolve, and every file ComfyUI uploads
+        lies where it may read it. The template and the character (content): a reference voice, the
+        face and scene stills approved, the captures and logo there and every box inside its capture.
+        Returns the graph's license, attribution and commercial_ok (recorded in the ad's picks)."""
+        from .adapters.comfyui import PLACEHOLDER, GraphError, load_graph
+        cfg, h3 = self.cfg, ad["h3"]
+        py = self.media_python()
+        if not py:
+            raise InfraFailure("the h3 chain needs ads_options.media_python: a Python with numpy and Pillow that runs "
+                               "its media worker (stopped before any GPU work)", reason="engine_unconfigured")
+        try:
+            res = ctx.run([py, "-I", "-c", "import numpy, PIL"], timeout=120.0)
+        except (OSError, RuntimeError) as e:
+            raise InfraFailure(f"ads_options.media_python {py!r} cannot run: {e} (stopped before any GPU work)",
+                               reason="engine_unconfigured") from None
+        if res.returncode != 0:
+            tail = (res.stderr or b"").decode("utf-8", "replace").strip()[-300:]
+            raise InfraFailure(f"ads_options.media_python {py!r} cannot import numpy and Pillow: {tail} (stopped "
+                               f"before any GPU work)", reason="engine_unconfigured")
+        if (cfg.out_width, cfg.out_height) != H3_FRAME:
+            raise InfraFailure(f"an h3 ad is drawn on a {H3_FRAME[0]}x{H3_FRAME[1]} frame (its cards, headline and "
+                               f"captions) and ads_options out_width/out_height are {cfg.out_width}x{cfg.out_height} "
+                               f"(stopped before any GPU work)", reason="engine_unconfigured")
+        name = cfg.h3_graph
+        try:
+            g = load_graph(self._graphs_dir(), name)
+        except GraphError as e:
+            raise InfraFailure(f"{e} (ads_options.h3_graph; stopped before any GPU work)",
+                               reason="engine_unconfigured") from None
+        if not g["outputs"]:
+            raise InfraFailure(f"graph {name!r} must name its output node (\"outputs\": the SaveVideo node)",
+                               reason="engine_unconfigured")
+        found = set(PLACEHOLDER.findall(json.dumps(g["graph"]))) | set(g["defaults"])
+        lost = [x for x in H3_PLACEHOLDERS if x not in found]
+        if lost:
+            raise InfraFailure(f"graph {name!r} has no placeholder for {', '.join(lost)}: an h3 take needs every one",
+                               reason="engine_unconfigured")
+        lic = g.get("license")
+        if not isinstance(lic, str) or not lic.strip():
+            raise InfraFailure(f"graph {name!r} states no license: its owner writes the model license's terms into "
+                               f"its wrapper (license, commercial_ok, attribution) after reading it",
+                               reason="engine_unconfigured")
+        self.h3_fonts()
+        ref = bible.voice_ref()
+        if not ref or not os.path.isfile(ref):
+            raise ContentFailure(f"character {bible.id!r} has no reference voice (voice.ref_wav in its bible.json): an "
+                                 f"h3 take speaks in the voice it hears there")
+        bad = h3core.h3_still_problems(h3, bible.approved_tags())
+        if bad:
+            raise ContentFailure("; ".join(bad)[:900])
+        stills = [ref, bible.hero()] + [p for tag in [h3.get("face")] + [s["still"] for s in h3["scenes"].values()]
+                                        + [s["still"] for s in (h3.get("stills") or {}).values()]
+                                        for p in bible.approved(tag)[:1]]
+        far = [p for p in stills if p and not any(paths.inside(p, r) for r in (self.home, self.artifacts_dir))]
+        if far:
+            raise InfraFailure(f"the character's files {far[:2]} are outside {self.home}, where ComfyUI may not read them "
+                               f"(ads_options.characters_dir)", reason="engine_unconfigured")
+        sizes = {}
+        pc = h3.get("price_card") or {}
+        for key in list(h3.get("captures") or {}) + ([pc["capture"]] if pc.get("capture") else []):
+            sizes[key] = media.image_size(self.capture_path(key))
+        bad = h3core.h3_box_problems(h3, sizes)
+        if bad:
+            raise ContentFailure("; ".join(bad)[:900])
+        if (h3.get("brand") or {}).get("logo"):
+            self.asset_png(h3["brand"]["logo"], "the brand's logo")
+        return {"graph": name, "license": lic.strip()[:600], "attribution": g.get("attribution"),
+                "commercial_ok": g["commercial_ok"]}
+
+    def media_python(self) -> str:
+        """ads_options.media_python as the one absolute path the preflight checks and the worker runs (the
+        worker runs in the ad's work directory, where a relative path would name nothing): a bare name is
+        looked up on PATH, a relative path is taken from gpud's own directory. "" when unset."""
+        py = os.path.expanduser(self.cfg.media_python) if self.cfg.media_python else ""
+        if py and os.sep not in py:
+            py = shutil.which(py) or py
+        return os.path.abspath(py) if py else ""
+
+    def h3_fonts(self) -> dict:
+        """The edit's fonts: captions in the configured font (else Arial Black), card headings in Arial
+        Black, body text in Arial Bold, the logo pill's name in Avenir Next when present."""
+        try:
+            caption = assembly.find_font(list(self.cfg.fonts or []) + [H3_FONTS["black"]])
+            display = assembly.find_font([H3_FONTS["black"]] + list(self.cfg.fonts or []))
+            bold = assembly.find_font([H3_FONTS["bold"]] + list(self.cfg.fonts or []))
+        except assembly.FontError as e:
+            raise InfraFailure(f"{e} (the h3 edit's fonts)", reason="engine_unconfigured") from None
+        return {"caption": caption, "bold": bold, "display": display,
+                "logo": H3_FONTS["logo"] if os.path.isfile(H3_FONTS["logo"]) else None}
+
+    def asset_png(self, name, what: str) -> str:
+        full = os.path.join(self.assets_dir, str(name or ""))
+        if not name or not paths.inside(full, self.assets_dir) or not os.path.isfile(full) \
+                or media.image_size(full) is None:
+            raise ContentFailure(f"{what} {name!r} is not a PNG under {self.assets_dir}")
+        return os.path.realpath(full)
 
     def fetch_facts(self, ad: dict, ctx=None) -> dict:
         src = ad.get("facts") or {}
@@ -402,8 +541,20 @@ class AdPipeline:
             script, why = self.write_script(wd, ad, bible, facts, model, ctx, client)
             if script is None:
                 return give_up(f"the brain's script failed validation after one repair: {why}")
-        for step in (self.step_voice, self.step_gate, self.step_timing, self.step_stills, self.step_shots,
-                     self.step_music, self.step_assemble, self.step_mix_gate, self.step_finish):
+        if self.is_h3(ad):
+            if not os.path.isfile(self.gate_path(wd)):
+                n = len(script.get("beats") or [])
+                need = self.h3_depth_needed(n, self.cfg.h3_attempts)
+                if need > self.max_depth:
+                    return give_up(f"this ad's {n} beats, each taken up to {self.cfg.h3_attempts} times, could need {need} "
+                                   f"continuation hops, past the depth limit {self.max_depth}: lower h3_attempts or "
+                                   f"raise max_job_s")
+            steps = (self.step_h3_takes, self.step_h3_probe, self.step_h3_hear, self.step_music, self.step_assemble,
+                     self.step_mix_gate, self.step_finish)
+        else:
+            steps = (self.step_voice, self.step_gate, self.step_timing, self.step_stills, self.step_shots,
+                     self.step_music, self.step_assemble, self.step_mix_gate, self.step_finish)
+        for step in steps:
             res = step(wd, rel, ad, bible, script)
             if res is None:
                 continue
@@ -415,12 +566,14 @@ class AdPipeline:
     # ---- b: the script (inside the dispatcher, on the resident brain)
 
     def write_script(self, wd, ad, bible, facts, model, ctx, client) -> tuple:
-        messages = script_prompt(ad, bible, facts, self.cfg)
+        h3 = self.is_h3(ad)
+        messages = (h3core.h3_script_prompt if h3 else script_prompt)(ad, bible, facts, self.cfg)
+        validate = h3core.validate_h3_script if h3 else validate_script
         raws, why = [], ""
         for attempt in range(2):
             raw = client.chat(model, messages, ctx, max_tokens=self.cfg.script_max_tokens)
             raws.append(raw)
-            script, errors = validate_script(parse_reply(raw), ad, facts, bible.approved_tags(), self.cfg)
+            script, errors = validate(parse_reply(raw), ad, facts, bible.approved_tags(), self.cfg)
             if script is not None:
                 paths.atomic_write(os.path.join(wd, "script.raw.txt"), "\n\n----\n\n".join(raws).encode())
                 paths.atomic_json(os.path.join(wd, "script.json"), script)
@@ -795,6 +948,8 @@ class AdPipeline:
         the voice stem (music masking the voice), and must still say every term and number. If it
         does, the ad is mixed once more with the music gate_remix_db lower; a second loss fails the
         ad as content."""
+        if self.is_h3(ad):
+            return self.step_h3_final_gate(wd, rel, ad, bible, script)
         g = self.gate_state(wd, ad, script)
         if g["status"] == "failed":
             return ("fail", g.get("reason") or "the audio gate failed")
@@ -873,14 +1028,29 @@ class AdPipeline:
                 if form != display:
                     spelled[display] = form
         takes = sum(len(u.get("attempts") or []) for u in (g.get("units") or {}).values())
-        return {"status": g.get("status"), "reason": g.get("reason"), "voice_wer": (g.get("track") or {}).get("wer"),
-                "mix_wer": (g.get("mix") or {}).get("wer"), "mix_lost": (g.get("mix") or {}).get("lost"),
-                "music_db": (g.get("mix") or {}).get("music_db"), "takes": takes,
-                "retakes": takes - len(g.get("units") or {}), "spelled": spelled,
-                "heard": (g.get("mix") or {}).get("heard") or (g.get("track") or {}).get("heard") or ""}
+        out = {"status": g.get("status"), "reason": g.get("reason"), "voice_wer": (g.get("track") or {}).get("wer"),
+               "mix_wer": (g.get("mix") or {}).get("wer"), "mix_lost": (g.get("mix") or {}).get("lost"),
+               "music_db": (g.get("mix") or {}).get("music_db"), "takes": takes,
+               "retakes": takes - len(g.get("units") or {}), "spelled": spelled,
+               "heard": (g.get("mix") or {}).get("heard") or (g.get("track") or {}).get("heard") or ""}
+        if g.get("mode") == "h3":
+            fin = g.get("final") if isinstance(g.get("final"), dict) else {}
+            heard = [b for b in (fin.get("beats") or {}).values() if isinstance(b, dict)]
+            out.update(mode="h3", beats=len(g.get("units") or {}), spent_s=g.get("spent_s"),
+                       final_ok=bool(heard) and all(b.get("ok") for b in heard), safe_edit=bool(fin.get("safe")))
+        return out
 
     @staticmethod
     def gate_note(s: dict) -> str:
+        if s.get("mode") == "h3":
+            if s.get("status") == "passed":
+                n = int(s.get("retakes") or 0)
+                return (f"speech gate passed ({s.get('beats')} beats, {n} retake{'' if n == 1 else 's'}; final lines heard "
+                        f"intact{', edited with no pause removed' if s.get('safe_edit') else ''}; mix WER "
+                        f"{float(s.get('mix_wer') or 0):.2f})")
+            if s.get("status") == "failed":
+                return f"speech gate failed: {s.get('reason') or ''}".strip()
+            return "speech gate not finished (the finished ad was not heard end to end)"
         if s.get("status") == "passed":
             return (f"audio gate passed (voice WER {float(s.get('voice_wer') or 0):.2f}, mix WER "
                     f"{float(s.get('mix_wer') or 0):.2f}" + (f", {s['retakes']} retake(s)" if s.get("retakes") else "")
@@ -1180,7 +1350,13 @@ class AdPipeline:
         return (f"music/bed.wav" if not n else f"music/bed-r{n}.wav"), n
 
     def step_music(self, wd, rel, ad, bible, script):
-        timing = self.timing(wd)
+        if self.is_h3(ad):
+            g = self.h3_gate(wd, ad, script)
+            if g["status"] not in ("voice_passed", "passed"):
+                return ("fail", g.get("reason") or "the speech gate has not passed: no music before every beat has a take")
+            seconds = self.h3_music_s(wd, g, script) + 1.0  # the edit only shortens: a bed long enough for any cut
+        else:
+            seconds = self.timing(wd)["total_s"]
         out, n = self.music_out(wd)
         meta = self._meta(wd, out)
         if meta is not None and meta.get("ok") is not False:
@@ -1195,7 +1371,7 @@ class AdPipeline:
         music = ad.get("music") or {}
         op = {"op": "music", "out": out, "prompt": f"{music.get('prompt') or 'warm, upbeat modern background music'}, "
                                                    f"instrumental, no vocals",
-              "duration_seconds": int(max(10, math.ceil(timing["total_s"] + 1))), "instrumental": True,
+              "duration_seconds": int(max(10, math.ceil(seconds + 1))), "instrumental": True,
               "seed": int(ad.get("seed") or 0) + 7 + 31 * n, "expected_s": self.cfg.exp("music"), "unit": "music"}
         if music.get("bpm"):
             op["bpm"] = int(music["bpm"])
@@ -1209,13 +1385,391 @@ class AdPipeline:
                 os.path.isfile(os.path.join(wd, "final", "ad.mp4")):
             return None
         return ("job", "assembly", self.job(rel, ad, "ad_assemble", "assemble", ad["picks"]["models"]["cpu"], None,
-                                            self.cfg.exp("assemble")))
+                                            self.cfg.exp("h3_edit" if self.is_h3(ad) else "assemble")))
 
     def step_finish(self, wd, rel, ad, bible, script):
         if isinstance(paths.read_json(os.path.join(wd, "final", "qa.json")), dict):
             return None
         return ("job", "QA and manifest", self.job(rel, ad, "ad_finish", "finish", ad["picks"]["models"]["cpu"], None,
                                                    self.cfg.exp("finish"), last=True))
+
+    # ---------------------------------------------------------------- the h3 chain (dispatcher)
+    #
+    # A template whose ad block has an h3 block films each beat as one talking take of a ComfyUI H3
+    # graph: the take is the picture and the voice. Per round, every beat still pending gets one take
+    # (ad_shots), the round's takes are probed by the media worker (ad_probe: the 16 kHz WAV, levels,
+    # voiced runs, stray hands), heard twice by the ASR (ad_gate: hinted with word times, and free-
+    # running), and judged here (h3core.judge_take). A beat that fails is taken again with a new seed
+    # (and, for a term not heard, its next spelling) until it passes or its attempts, the render
+    # budget or the continuation depth run out. Then music, the edit (ad_assemble: the worker's edit),
+    # the final gate (each beat's finished voice and the mix heard again) and finish.
+
+    def h3_gate(self, wd: str, ad: dict, script: dict) -> dict:
+        """The speech gate's record of an h3 ad (gate.json, mode "h3"), made on first use: a unit per
+        beat with its takes (h3core.h3_attempt), the render seconds spent, the final gate's verdicts."""
+        g = paths.read_json(self.gate_path(wd))
+        if isinstance(g, dict) and g.get("version") == 1 and g.get("mode") == "h3" and isinstance(g.get("units"), dict):
+            return g
+        cfg = self.cfg
+        lex = h3core.h3_lexicon(ad)  # its address entry starts spelled out; each take's choice indexes it
+        readings = (ad.get("h3") or {}).get("readings") or {}
+        lang = str(ad.get("language") or "English")
+        units = {}
+        for b in script["beats"]:
+            units[f"beat-{b['k']}"] = {"line": b["k"], "text": b["line"], "n": 0, "choice": {}, "rerolls": 0,
+                                       "status": "pending",
+                                       "attempts": [h3core.h3_attempt(b, 0, lex, readings, None, "first take", ad)]}
+        g = {"version": 1, "mode": "h3", "language": LANG_CODES.get(lang.lower(), lang), "seeded": True,
+             "settings": {"wer_max": cfg.gate_wer_max, "attempts": cfg.h3_attempts, "rerolls": cfg.gate_rerolls,
+                          "mix_margin": cfg.gate_mix_margin, "remix_db": cfg.gate_remix_db, "budget_s": cfg.h3_budget_s,
+                          "runon_s": cfg.h3_runon_s, "anchor_tol_s": cfg.h3_anchor_tol_s,
+                          "anchor_gap_s": cfg.h3_anchor_gap_s},
+             "lexicon": lex, "units": units, "rounds": 0, "spent_s": 0.0,
+             "track": {"status": "pending", "attempts": []},
+             "mix": {"status": "pending", "round": 0, "music_db": None, "attempts": []},
+             "final": {"round": 0, "safe": False, "beats": {}},
+             "status": "running", "reason": None, "created_wall": _now_wall()}
+        self.save_gate(wd, g)
+        return g
+
+    @staticmethod
+    def h3_beats(script: dict) -> dict:
+        return {f"beat-{b['k']}": b for b in script.get("beats") or []}
+
+    def h3_depth_needed(self, n_beats: int, rounds: int) -> int:
+        """Continuation hops an h3 ad needs with `rounds` rounds of takes (each job and the brain step
+        after it), with the hops kept free for infrastructure retries."""
+        return 2 * h3core.h3_planned_jobs(n_beats, rounds, self.cfg) + 2 + 2 * RETRY_HOPS
+
+    def h3_images(self, bible, ad: dict, beat: dict) -> dict:
+        """The take's pictures and voice: <Picture 1> the scene, <Picture 2> the hero, <Picture 3> the
+        face close-up, <Audio 1> the character's reference voice."""
+        h3 = ad.get("h3") or {}
+        scene, face, hero, ref = bible.approved(beat.get("still")), bible.approved(h3.get("face")), bible.hero(), \
+            bible.voice_ref()
+        for what, ok in ((f"scene still {beat.get('still')!r}", scene), (f"face still {h3.get('face')!r}", face),
+                         ("hero still", hero), ("reference voice", ref and os.path.isfile(ref))):
+            if not ok:
+                raise AdError(f"beat {beat.get('k')}: the character's {what} is no longer approved or there")
+        return {"image_1": scene[0], "image_2": hero, "image_3": face[0], "audio_1": ref}
+
+    def h3_probe_of(self, wd: str, take: dict):
+        """A take's probe record, or None while it has none (or its WAV is gone). A record with problems
+        is final without a WAV: the take is judged on them (an audio stream that does not decode leaves no
+        WAV, and probing it again finds the same)."""
+        pr = paths.read_json(os.path.join(wd, take["probe"]))
+        if not isinstance(pr, dict) or not isinstance(pr.get("problems"), list):
+            return None
+        if pr.get("has_audio") and not pr["problems"] and not os.path.isfile(os.path.join(wd, take["wav"])):
+            return None
+        return pr
+
+    def step_h3_takes(self, wd, rel, ad, bible, script):
+        """The round's takes: one per beat still pending whose last take is not rendered, packed into
+        ComfyUI jobs (ComfyUI starts once per job, not per take). What the voice is told passes the
+        speech gate's own guard again before anything renders."""
+        g = self.h3_gate(wd, ad, script)
+        if g["status"] == "failed":
+            return ("fail", g.get("reason") or "the speech gate failed")
+        if g["status"] != "running":
+            return None
+        picks = ad.get("picks") or {}
+        size = picks.get("h3") or {}
+        W, H = int(size.get("width") or self.cfg.h3_width), int(size.get("height") or self.cfg.h3_height)
+        beats = self.h3_beats(script)
+        units = []
+        for key, u in g["units"].items():
+            take = u["attempts"][-1]
+            if u["status"] != "pending" or self._meta(wd, take["mp4"]) is not None:
+                continue
+            beat = beats[key]
+            bad = h3core.spoken_guard(beat["line"], take["spoken"], g["lexicon"], ad)
+            if bad:
+                return self.gate_failed(wd, g, f"speech gate: beat {beat['k']} would be told {take['spoken']!r}: "
+                                               + "; ".join(bad)[:400])
+            op = {"op": "graph", "graph": picks["graphs"]["talk"], "out": take["mp4"],
+                  "images": self.h3_images(bible, ad, beat),
+                  "params": {"prompt": h3core.h3_prompt(ad, bible, beat, take["spoken"]), "seed": int(take["seed"]),
+                             "width": W, "height": H, "seconds": float(beat["seconds"])},
+                  "expected_s": self.cfg.exp("h3_take"), "unit": f"beat-{beat['k']}-t{take['n']}", "shot": beat["k"],
+                  "seed": int(take["seed"]), "role": "talk"}
+            units.append((op, op["expected_s"]))
+        if not units:
+            return None
+        ops = self.pack(units)
+        note = f"takes ({len(ops)} of {len(units)})" + (f", retake round {g['rounds']}" if g.get("rounds") else "")
+        return ("job", note, self.job(rel, ad, "ad_shots", "takes", picks["models"]["talk"], ops,
+                                      sum(o["expected_s"] for o in ops)))
+
+    def step_h3_probe(self, wd, rel, ad, bible, script):
+        """The round's rendered takes, probed by the media worker on the CPU (one job)."""
+        g = self.h3_gate(wd, ad, script)
+        if g["status"] == "failed":
+            return ("fail", g.get("reason") or "the speech gate failed")
+        if g["status"] != "running":
+            return None
+        ops = []
+        for key, u in g["units"].items():
+            take = u["attempts"][-1]
+            meta = self._meta(wd, take["mp4"])
+            if u["status"] != "pending" or meta is None or meta.get("ok") is False or self.h3_probe_of(wd, take):
+                continue
+            ops.append({"op": "probe", "mp4": take["mp4"], "wav": take["wav"], "probe": take["probe"],
+                        "beat": int(u["line"]), "unit": f"probe-{key}-t{take['n']}",
+                        "expected_s": self.cfg.exp("h3_probe")})
+        if not ops:
+            return None
+        return ("job", f"probe ({len(ops)} takes)", self.job(rel, ad, "ad_probe", "probe", ad["picks"]["models"]["cpu"],
+                                                             ops, sum(o["expected_s"] for o in ops)))
+
+    def h3_hint(self, ad: dict) -> str:
+        """The spelling hints a word-timed transcription gets (the timing step's): the template's
+        spellings, the lexicon's display forms and the end card's host."""
+        terms = list(ad.get("spellings") or []) + [e["display"] for e in ad.get("lexicon") or []
+                                                     if isinstance(e, dict) and isinstance(e.get("display"), str)]
+        host = re.sub(r"^[a-z]+://", "", str((ad.get("end_card") or {}).get("url") or "")).split("/")[0]
+        if host:
+            terms.append(host)
+        return ", ".join(dict.fromkeys(terms))[:400]
+
+    def step_h3_hear(self, wd, rel, ad, bible, script):
+        """Each probed take is transcribed twice (hinted with word times; free-running, text only),
+        then judged once the round is all heard: the first take that passes is the beat's; a failed
+        beat gets its next take, or the ad fails as content naming the beat and what was heard."""
+        g = self.h3_gate(wd, ad, script)
+        if g["status"] == "failed":
+            return ("fail", g.get("reason") or "the speech gate failed")
+        if g["status"] != "running":
+            return None
+        beats = self.h3_beats(script)
+        hint = self.h3_hint(ad)
+        ops, ready = [], []
+        for key, u in g["units"].items():
+            if u["status"] != "pending":
+                continue
+            take, beat = u["attempts"][-1], beats[key]
+            meta = self._meta(wd, take["mp4"])
+            if meta is not None and meta.get("ok") is False:
+                ready.append(key)  # the render produced nothing to hear
+                continue
+            probe = self.h3_probe_of(wd, take) if meta is not None else None
+            if probe is None:
+                return self.gate_failed(wd, g, f"speech gate: beat {beat['k']}'s take {take['mp4']} was never "
+                                               f"{'rendered' if meta is None else 'probed'}")
+            if h3core.take_problems(probe, beat.get("seconds")):
+                ready.append(key)  # judged on the probe alone: nothing an ASR could hear
+                continue
+            unit = f"{key}-t{take['n']}"
+            if self._meta(wd, take["hinted"]) is None:
+                op = {"op": "transcribe", "out": take["hinted"], "file_path": take["wav"],
+                      "language": g.get("language") or "en", "expected_s": self.cfg.exp("gate"),
+                      "unit": f"hear-{unit}", "role": "gate", "need_words": True}
+                if hint:
+                    op["prompt"] = hint
+                ops.append(op)
+            if self._meta(wd, take["transcript"]) is None:
+                ops.append(self.gate_op(g, take["wav"], take["transcript"], f"gate-{unit}"))
+            ready.append(key)
+        if ops:
+            self.save_gate(wd, g)
+            return ("job", f"speech gate ({len(ops)} transcriptions)",
+                    self.job(rel, ad, "ad_gate", "gate", ad["picks"]["models"]["asr"], ops,
+                             sum(o["expected_s"] for o in ops)))
+        lex = g["lexicon"]
+        readings = (ad.get("h3") or {}).get("readings") or {}
+        g["spent_s"] = spent = self.h3_spent(wd, g)
+        depth_ok = self.h3_depth_needed(len(beats), int(g.get("rounds") or 0) + 2) <= self.max_depth
+        retakes, why = [], None
+        for key in ready:
+            u, beat = g["units"][key], beats[key]
+            take = u["attempts"][-1]
+            v = self.h3_verdict(wd, take, beat, lex, ad)
+            self.h3_record(wd, take, v)
+            if v["ok"]:
+                u["status"] = "passed"
+                continue
+            try:
+                new, failed = h3core.plan_h3_retake(u, beat, v, lex, self.cfg, spent, readings, depth_ok, ad)
+            except AdError as e:  # the next spelling is one the gate would not take for the line
+                new, failed = None, f"speech gate: beat {beat['k']} ({beat['role']}): {e}"
+            if new is None:
+                u["status"] = "failed"
+                why = why or failed
+            else:
+                g["units"][key] = new
+                retakes.append(key)
+        if why:
+            return self.gate_failed(wd, g, why)
+        if retakes:
+            g["rounds"] = int(g.get("rounds") or 0) + 1
+            self.save_gate(wd, g)
+            return self.step_h3_takes(wd, rel, ad, bible, script)
+        chosen = [self.h3_chosen(g, b) for b in script["beats"]]
+        inner = max([float(number(t.get("wer_inner")) or 0.0) for t in chosen] or [0.0])
+        g["track"] = {"status": "passed", "wer": inner, "wer_inner": inner, "lost": 0.0,
+                      "heard": " ".join(str(t.get("heard") or "") for t in chosen)[:4000],
+                      "from": [t["mp4"] for t in chosen]}
+        g["status"] = "voice_passed"
+        g["voice_passed_wall"] = _now_wall()
+        self.save_gate(wd, g)
+        return None
+
+    def h3_spent(self, wd: str, g: dict) -> float:
+        """Render seconds the ad's takes took (the adapter's own times)."""
+        total = 0.0
+        for u in g["units"].values():
+            for take in u["attempts"]:
+                meta = self._meta(wd, take["mp4"])
+                total += float(number((meta or {}).get("seconds")) or 0.0)
+        return round(total, 1)
+
+    def h3_verdict(self, wd: str, take: dict, beat: dict, lex: list, ad: dict | None = None) -> dict:
+        meta = self._meta(wd, take["mp4"]) or {}
+        # The ComfyUI adapter raises on a render that fails or leaves no file (an infrastructure failure,
+        # retried as is): a sidecar that says ok false comes only from an engine that records one.
+        if meta.get("ok") is False:
+            return {"ok": False, "why": "take: render produced no video", "span": None, "words": [], "heard": "",
+                    "heard_hinted": "", "wer": None, "wer_inner": None, "missing_terms": [], "missing_numbers": [],
+                    "extra_numbers": [], "hands": [], "anchor": None}
+        probe = self.h3_probe_of(wd, take)
+        hinted = unhinted = None
+        if not h3core.take_problems(probe, beat.get("seconds")):
+            hinted = paths.read_json(os.path.join(wd, take["hinted"]))
+            unhinted = paths.read_json(os.path.join(wd, take["transcript"]))
+        return h3core.judge_take(beat, beat.get("words"), lex, hinted, unhinted, probe, self.cfg, ad)
+
+    def h3_record(self, wd: str, take: dict, v: dict) -> None:
+        """The verdict on the take's record. Its "why" stays what the take was planned for; the judge's
+        reason is "verdict"."""
+        meta = self._meta(wd, take["mp4"]) or {}
+        take.update(ok=bool(v["ok"]), verdict=v["why"], span=v["span"], words=v["words"], heard=v["heard"],
+                    heard_hinted=v["heard_hinted"], wer=v["wer"], wer_inner=v["wer_inner"],
+                    missing_terms=v["missing_terms"], missing_numbers=v["missing_numbers"],
+                    extra_numbers=v["extra_numbers"], hands=v["hands"], anchor=v["anchor"],
+                    render_s=number(meta.get("seconds")), status="passed" if v["ok"] else "failed",
+                    judged_wall=_now_wall())
+
+    @staticmethod
+    def h3_chosen(g: dict, beat: dict) -> dict:
+        u = g["units"][f"beat-{beat['k']}"]
+        chosen = [t for t in u["attempts"] if t.get("status") == "passed"]
+        if u.get("status") != "passed" or not chosen:
+            raise AdError(f"beat {beat['k']} has no take that passed the speech gate")
+        return chosen[0]
+
+    def h3_music_s(self, wd: str, g: dict, script: dict) -> float:
+        """At least how long the cut runs: each beat at most its whole take plus its hold (the edit only
+        trims, from the line's acoustic bounds that may start before its first word's time)."""
+        total = 0.0
+        for b in script["beats"]:
+            take = self.h3_chosen(g, b)
+            probe = self.h3_probe_of(wd, take) or {}
+            dur = number(probe.get("duration_s"))
+            span = take.get("span") or [0.0, 0.0, None]
+            seconds = float(dur) if dur is not None else float(span[1]) + 0.30 - float(span[0])
+            total += seconds + float(number(b.get("hold")) or 0.0)
+        return total
+
+    def step_h3_final_gate(self, wd, rel, ad, bible, script):
+        """The final gate of an h3 ad: each beat's finished voice (final/beats/<id>-16k.wav) and the
+        mix are heard again free-running. A beat's finished voice must still say its whole line (an
+        edit that cut a word): the first time it does not, the ad is edited again with no pause
+        removed and no gap closed; a second time, the ad fails as content. The mix is judged as
+        today against the takes' baseline: music masking the voice gets one re-mix, the music held
+        gate_remix_db further under the voice."""
+        g = self.h3_gate(wd, ad, script)
+        if g["status"] == "failed":
+            return ("fail", g.get("reason") or "the speech gate failed")
+        mix, fin = g["mix"], g.setdefault("final", {"round": 0, "safe": False, "beats": {}})
+        if mix["status"] == "passed":
+            return None
+        asm = paths.read_json(os.path.join(wd, "final", "assembly.json"), {}) or {}
+        e = int(number(asm.get("edit_round")) or 0)
+        ops = []
+        outs = {}
+        for b in script["beats"]:
+            out, wav = f"gate/final-{b['id']}-r{e}.json", f"final/beats/{b['id']}-16k.wav"
+            outs[b["id"]] = out
+            if self._meta(wd, out) is None:
+                if not os.path.isfile(os.path.join(wd, wav)):
+                    return self.gate_failed(wd, g, f"speech gate: the finished voice of beat {b['k']} ({wav}) is missing")
+                ops.append(self.gate_op(g, wav, out, f"gate-final-{b['id']}-r{e}"))
+        rec = next((a for a in mix["attempts"] if a.get("r") == e), None)
+        if rec is None:
+            db = number(asm.get("music_db"))
+            rec = {"r": e, "music_db": self.cfg.music_db if db is None else db, "file": "final/audio.wav",
+                   "transcript": f"gate/mix-r{e}.json", "status": "pending"}
+            mix["attempts"].append(rec)
+        if self._meta(wd, rec["transcript"]) is None:
+            if not os.path.isfile(os.path.join(wd, rec["file"])):
+                return self.gate_failed(wd, g, f"speech gate: the final mix {rec['file']} is missing")
+            op = self.gate_op(g, rec["file"], rec["transcript"], f"gate-mix-r{e}")
+            op["expected_s"] = 2 * self.cfg.exp("gate")
+            ops.append(op)
+        if ops:
+            self.save_gate(wd, g)
+            return ("job", f"speech gate on the finished ad ({len(ops)} transcriptions)",
+                    self.job(rel, ad, "ad_gate", "gate", ad["picks"]["models"]["asr"], ops,
+                             sum(o["expected_s"] for o in ops)))
+        lex = g["lexicon"]
+        failed = []
+        for b in script["beats"]:
+            heard = self._heard(wd, outs[b["id"]])
+            v = h3core.judge_line(b["line"], heard, lex, self.cfg, ad)
+            fin["beats"][b["id"]] = {"ok": v["ok"], "why": v["why"], "heard": v["heard"], "wer": v["wer"],
+                                     "wer_inner": v["wer_inner"], "missing_terms": v["missing_terms"],
+                                     "missing_numbers": v["missing_numbers"], "extra_numbers": v["extra_numbers"],
+                                     "said": v["said"], "r": e, "transcript": outs[b["id"]],
+                                     "safe": bool(fin.get("safe"))}
+            if not v["ok"]:
+                failed.append((b, v))
+        if failed:
+            b, v = failed[0]
+            if not fin.get("safe"):
+                fin.update(safe=True, round=e + 1, then=f"beat {b['k']}'s finished voice {v['why']}: edited again "
+                                                        f"with no pause removed")
+                return self.h3_reedit(wd, rel, ad, bible, script, g)
+            return self.gate_failed(wd, g, f"speech gate: beat {b['k']} ({b['role']}): its finished voice {v['why']} "
+                                           f"(heard {v['heard'][:100]!r}), even edited with no pause removed")
+        heard = self._heard(wd, rec["transcript"])
+        ref = [t for ln in script["lines"] for t in gate_tokens(ln["text"], lex)]
+        res = self._judge(g, ref, heard)
+        self._record(rec, heard, res)
+        stem_inner = number(g["track"].get("wer_inner"))
+        stem_inner = float(number(g["track"].get("wer")) or 0.0) if stem_inner is None else float(stem_inner)
+        rec.update(stem_wer=g["track"].get("wer"), stem_wer_inner=stem_inner, stem_lost=0.0)
+        masked = res["wer_inner"] - stem_inner > self.cfg.gate_mix_margin + 1e-9
+        ok = not masked and not res["missing_terms"] and not res["missing_numbers"]
+        rec.update(ok=ok, status="passed" if ok else "failed")
+        if ok:
+            mix.update(status="passed", wer=res["wer"], lost=res["lost"], heard=heard, transcript=rec["transcript"],
+                       music_db=rec["music_db"])
+            fin["ok"] = True
+            g["status"] = "passed"
+            g["passed_wall"] = _now_wall()
+            self.save_gate(wd, g)
+            return None
+        if int(number(mix.get("round")) or 0) == 0:
+            mix["round"] = 1
+            mix["music_db"] = float(rec["music_db"]) - self.cfg.gate_remix_db
+            rec["then"] = f"mixed again with the music {self.cfg.gate_remix_db:g} LU further under the voice"
+            fin["round"] = e + 1
+            return self.h3_reedit(wd, rel, ad, bible, script, g)
+        what = (f"never says {res['missing_terms'][0]['term']!r}" if res["missing_terms"] else
+                f"never says the number {res['missing_numbers'][0]['number']}" if res["missing_numbers"] else
+                f"is heard with a word error rate of {res['wer_inner']:.2f} inside the speech against {stem_inner:.2f} for "
+                f"the takes alone")
+        return self.gate_failed(wd, g, f"speech gate: the music masks the voice: the final mix {what}, even with the "
+                                       f"music {self.cfg.gate_remix_db:g} LU further under the voice")
+
+    def h3_reedit(self, wd, rel, ad, bible, script, g):
+        self.save_gate(wd, g)
+        for victim in ("final/ad.mp4", "final/assembly.json"):
+            try:
+                os.remove(os.path.join(wd, victim))
+            except OSError:
+                pass
+        return self.step_assemble(wd, rel, ad, bible, script)
 
     # ---------------------------------------------------------------- recovery
 
@@ -1294,6 +1848,8 @@ class AdPipeline:
         reply = parse_reply(raw)
         decision = self.review_decision(reply, raw, vision and bool(images), gate_ok=gate["status"] == "passed")
         decision["note"] = f"{self.gate_note(gate)}. {decision['note']}"[:600]
+        if gate.get("mode") == "h3":  # the AI disclosure is a toggle at upload, never burned in: say so every time
+            decision["note"] = decision["note"][:600 - len(H3_PUBLISH_NOTE) - 1].rstrip() + " " + H3_PUBLISH_NOTE
         self._review_manifest(wd, {"model": model, "vision": vision, "images": len(images), "reply": (raw or "")[:1500],
                                    "decision": decision["verdict"], "note": decision["note"], "gate": gate,
                                    "at_wall": _now_wall()})
@@ -1394,13 +1950,16 @@ class AdPipeline:
         p = spec.payload if isinstance(spec.payload, dict) else {}
         try:
             wd = self.workdir(p.get("workdir"))
-            ad, timing = self.load_ad(wd), self.timing(wd)
+            ad = self.load_ad(wd)
+            timing = None if self.is_h3(ad) else self.timing(wd)
             bible = self.bible(wd)
         except AdError as e:
             raise ContentFailure(str(e)) from None
         if not self.ffmpeg:
             raise InfraFailure("ffmpeg is required to assemble an ad (set ffmpeg in config.json)",
                                reason="engine_unconfigured")
+        if timing is None:
+            return self.run_h3_assemble(wd, ad, bible, ctx)
         cfg = self.cfg
         W, H = cfg.out_width, cfg.out_height
         final = os.path.join(wd, "final")
@@ -1536,6 +2095,321 @@ class AdPipeline:
             return os.path.realpath(full)
         raise ContentFailure(f"end card still {still!r} is neither an approved still tag nor a file under assets/")
 
+    # ---------------------------------------------------------------- the h3 chain (local engine)
+
+    def h3_worker(self, ctx, wd: str, command: str, req: dict, expected: float) -> dict:
+        """Run the media worker's `command` on `req` (written to h3/<command>-req.json) under
+        ads_options.media_python, in its own process group (a cancel stops its ffmpeg too). Its last
+        stdout line is its answer; exit 2 is a content failure, 3 the machine's (engine_unconfigured
+        when it names the setup), anything else a crash the ad retries."""
+        py = self.media_python()
+        if not py:
+            raise InfraFailure("the h3 chain needs ads_options.media_python (a Python with numpy and Pillow)",
+                               reason="engine_unconfigured")
+        rel = f"h3/{command}-req.json"
+        paths.atomic_json(paths.out_path(wd, rel), req)
+        try:
+            res = ctx.run([py, "-I", H3_WORKER, command, rel], timeout=max(120.0, 2.0 * expected), cwd=wd,
+                          heartbeat=expected, group=True)
+        except OSError as e:
+            raise InfraFailure(f"ads_options.media_python {py!r} cannot run: {e}", reason="engine_unconfigured") from None
+        lines = [ln for ln in (res.stdout or b"").decode("utf-8", "replace").splitlines() if ln.strip()]
+        try:
+            answer = json.loads(lines[-1]) if lines else None
+        except ValueError:
+            answer = None
+        answer = answer if isinstance(answer, dict) else {}
+        err = str(answer.get("error") or "").strip() or (res.stderr or b"").decode("utf-8", "replace").strip()[-600:]
+        if res.returncode == 0 and answer.get("ok") is True:
+            return answer
+        if res.returncode == 2:
+            raise ContentFailure(f"the h3 {command}: {err}"[:1000])
+        if res.returncode == 3:
+            raise InfraFailure(f"the h3 {command}: {err}"[:1000],
+                               reason="engine_unconfigured" if H3_UNCONFIGURED.search(err) else "engine_error")
+        raise RuntimeError(f"the h3 {command} crashed (exit {res.returncode}): {err}"[:1000])
+
+    def run_probe(self, spec, ctx) -> dict:
+        """ad_probe: the media worker's probe of a round's takes (their 16 kHz WAVs and probe JSONs)."""
+        p = spec.payload if isinstance(spec.payload, dict) else {}
+        try:
+            wd = self.workdir(p.get("workdir"))
+            ad = self.load_ad(wd)
+        except AdError as e:
+            raise ContentFailure(str(e)) from None
+        if not self.ffmpeg:
+            raise InfraFailure("ffmpeg is required to probe a take (set ffmpeg in config.json)",
+                               reason="engine_unconfigured")
+        script = paths.read_json(os.path.join(wd, "script.json")) or {}
+        beats = {int(b["k"]): b for b in script.get("beats") or []}
+        size = (ad.get("picks") or {}).get("h3") or {}
+        render = [int(size.get("width") or self.cfg.h3_width), int(size.get("height") or self.cfg.h3_height)]
+        ops = p.get("ops") if isinstance(p.get("ops"), list) else []
+        takes = []
+        for op in ops:
+            if not isinstance(op, dict) or not isinstance(op.get("beat"), int) or op["beat"] not in beats:
+                raise ContentFailure(f"a probe op names no beat of the script: {str(op)[:200]}")
+            try:
+                for k in ("wav", "probe"):
+                    paths.out_path(wd, op.get(k))
+                paths.input_path(op.get("mp4"), [wd], wd)
+            except paths.PathRefused as e:
+                raise ContentFailure(f"a probe op's files: {e}") from None
+            b = beats[op["beat"]]
+            takes.append({"mp4": op["mp4"], "wav": op["wav"], "probe": op["probe"], "render": render,
+                          "crop": b.get("crop"),
+                          "hands": {"floor": self.cfg.h3_hands_floor, "limit": self.cfg.h3_hands_limit}
+                          if b.get("hands_gate") else None})
+        if not takes:
+            raise ContentFailure("the probe job names no take")
+        ctx.progress(0.05)
+        out = self.h3_worker(ctx, wd, "probe", {"ffmpeg": self.ffmpeg_path(), "takes": takes},
+                             self.cfg.exp("h3_probe") * len(takes))
+        ctx.progress(1.0)
+        done = [os.path.join(wd, t["probe"]) for t in takes]
+        # H3 renders the size it is asked: a take of another size means the machine's graph ignores (or
+        # rounds) {{width}} and {{height}}. Every retake would be the same size, so it is not the takes'
+        # failure to charge to the template.
+        for t, path in zip(takes, done):
+            rec = paths.read_json(path)
+            if isinstance(rec, dict) and number(rec.get("width")) and [rec.get("width"), rec.get("height")] != render:
+                raise InfraFailure(f"the h3 graph {(ad.get('picks') or {}).get('graphs', {}).get('talk')!r} rendered "
+                                   f"{t['mp4']} at {rec.get('width')}x{rec.get('height')}, not the {render[0]}x{render[1]} "
+                                   f"asked (ads_options h3_width / h3_height): the graph must take its size from "
+                                   f"{{{{width}}}} and {{{{height}}}}", reason="engine_unconfigured")
+        return {"path": done[0], "exists": os.path.isfile(done[0]),
+                "paths": done[1:] + [os.path.join(wd, t["wav"]) for t in takes
+                                     if os.path.isfile(os.path.join(wd, t["wav"]))],
+                "checks": [{"check": "probe", "ok": all(os.path.isfile(f) for f in done),
+                            "detail": f"{len(takes)} take(s) probed; "
+                                      + ", ".join(f"{os.path.basename(str(r.get('mp4')))}: "
+                                                  f"{'ok' if r.get('ok') else '; '.join(r.get('problems') or [])[:80]}"
+                                                  for r in out.get("takes") or [] if isinstance(r, dict))[:240]}]}
+
+    def ffmpeg_path(self) -> str:
+        found = shutil.which(self.ffmpeg) if self.ffmpeg and os.sep not in self.ffmpeg else self.ffmpeg
+        return os.path.abspath(found or self.ffmpeg or "")
+
+    def h3_edit_request(self, wd: str, ad: dict, bible, script: dict, g: dict, fonts: dict, music, music_under: float,
+                        safe: bool) -> dict:
+        """The worker's edit request: every beat's chosen take with its line's take-time words and span,
+        its cutaways, and the template's cards, captures, stills and brand (all files resolved here)."""
+        cfg, h3 = self.cfg, ad["h3"]
+        card = ad.get("end_card") or {}
+        size = (ad.get("picks") or {}).get("h3") or {}
+        brand = dict(h3.get("brand") or {})
+        logo = brand.pop("logo", None)
+        brand["logo_png"] = self.asset_png(logo, "the brand's logo") if logo else None
+        captures = {}
+        for key, c in (h3.get("captures") or {}).items():
+            captures[c["id"]] = {"png": self.capture_path(key), "crop": c.get("crop"), "paint": c.get("paint") or [],
+                                 "tap": c.get("tap"), "tap_color": c.get("tap_color")}
+        pc = h3.get("price_card")
+        price = None if not pc else {"big": pc.get("big"), "lines": list(pc.get("lines") or []),
+                                     "png": self.capture_path(pc["capture"]) if pc.get("capture") else None,
+                                     "crop": pc.get("crop"), "underline": pc.get("underline"),
+                                     "pulse_line": int(pc.get("pulse_line") or 0), "lead": int(pc.get("lead") or 0),
+                                     "paint": pc.get("paint") or None}
+        stills = {}
+        for b in script["beats"]:
+            for c in b.get("cutaways") or []:
+                if c.get("kind") == "still" and c.get("still") not in stills:
+                    tag = ((h3.get("stills") or {}).get(c["still"]) or {}).get("still")
+                    found = bible.approved(tag) if tag else []
+                    if not found:
+                        raise ContentFailure(f"the still {c['still']!r} ({tag!r}) is no longer an approved still")
+                    stills[c["still"]] = found[0]
+        lines = " ".join(b["line"] for b in script["beats"])
+        solo = [e["display"] for e in g["lexicon"]] + ([card["url"]] if card.get("url") else []) \
+            + [h3core.word_key(w) for w in lines.split() if re.search(r"[$€£¥₹]\d", w)]
+        beats = []
+        for b in script["beats"]:
+            take = self.h3_chosen(g, b)
+            beats.append({"id": b["id"], "k": b["k"], "take": take["mp4"], "wav16": take["wav"], "line": b["line"],
+                          "words": take["words"], "span": take["span"], "tail": b.get("tail"),
+                          "hold": float(b.get("hold") or 0.0), "crop": b.get("crop"), "caption_pos": b.get("caption_pos"),
+                          "headline": bool(b.get("headline")), "cutaways": b.get("cutaways") or []})
+        cap = h3.get("caption") or {}
+        attribution = size.get("attribution")
+        note = (f"{ad.get('disclosure') or 'AI-generated'}: an AI-generated presenter and voice. Set every platform's "
+                f"AI-content disclosure at upload, upload the SRT, then fill this in"
+                + (f"; credit {attribution} as its license asks, and make sure the disclosure is as clear and "
+                   f"prominent as that license requires (the owner decides whether the platform's toggle is)"
+                   if attribution else "") + ". Not ready until it is.")
+        return {"ffmpeg": self.ffmpeg_path(), "fps": FPS, "out": [cfg.out_width, cfg.out_height],
+                "render": [int(size.get("width") or cfg.h3_width), int(size.get("height") or cfg.h3_height)],
+                "ad_id": str(ad.get("id") or "ad"), "fonts": fonts, "brand": brand,
+                "captions": {"size": cap.get("size", 92), "margin_v": cap.get("margin_v", 710),
+                             "margins": list(cap.get("margins") or [100, 180]), "solo": list(dict.fromkeys(solo))},
+                "headline": script.get("headline"), "music": music, "music_under": float(music_under),
+                "bed_lift": float(cfg.h3_bed_lift), "lufs": float(cfg.loudness_lufs), "tp": float(cfg.true_peak_db),
+                "safe": bool(safe), "captures": captures, "price_card": price,
+                "endcard": dict(h3.get("endcard") or {}, url=card.get("url")), "stills": stills, "beats": beats,
+                "outputs": {"mp4": "final/ad.mp4", "video": "final/video.mp4", "audio": "final/audio.wav",
+                            "voice": "final/voice.wav", "ass": "final/captions.ass", "srt": "final/ad.srt",
+                            "timeline": "final/timeline.json", "beats_dir": "final/beats",
+                            "segments_dir": "final/segments", "publish": "final/publish.json"},
+                "encode": {"crf": int(cfg.h3_crf), "maxrate": "16M", "bufsize": "32M", "audio_kbps": 192,
+                           "max_mb": float(cfg.max_mb)},
+                "publish": {"geo": None, "attribution": attribution, "note": note}}
+
+    def run_h3_assemble(self, wd: str, ad: dict, bible, ctx) -> dict:
+        """ad_assemble for an h3 ad: the worker's edit, then timing.json (Foreman's shape, from the
+        edit's timeline), pick.json and final/assembly.json, and the check that the captions show."""
+        cfg = self.cfg
+        script = paths.read_json(os.path.join(wd, "script.json"))
+        g = paths.read_json(self.gate_path(wd))
+        if not isinstance(script, dict) or not isinstance(g, dict) or g.get("mode") != "h3":
+            raise ContentFailure("the h3 ad has no script or speech gate record to edit from")
+        if g.get("status") not in ("voice_passed", "passed"):
+            raise ContentFailure(f"the speech gate has not passed ({g.get('status')}): nothing to edit")
+        fonts = self.h3_fonts()
+        fin = g.get("final") if isinstance(g.get("final"), dict) else {}
+        edit_round, safe = int(number(fin.get("round")) or 0), bool(fin.get("safe"))
+        music, _ = self.music_out(wd)
+        music = music if os.path.isfile(os.path.join(wd, music)) else None
+        gmix = g.get("mix") if isinstance(g.get("mix"), dict) else {}
+        music_db = number(gmix.get("music_db"))
+        music_db = cfg.music_db if music_db is None else music_db
+        mix_round = int(number(gmix.get("round")) or 0)
+        # The gate's re-mix lowers the bed by gate_remix_db: here, that much further under the voice.
+        music_under = cfg.h3_music_under + max(0.0, cfg.music_db - music_db)
+        try:
+            req = self.h3_edit_request(wd, ad, bible, script, g, fonts, music, music_under, safe)
+        except AdError as e:
+            raise ContentFailure(str(e)) from None
+        for victim in ("final/ad.mp4", "final/assembly.json"):
+            try:
+                os.remove(os.path.join(wd, victim))
+            except OSError:
+                pass
+        ctx.progress(0.02)
+        res = self.h3_worker(ctx, wd, "edit", req, cfg.exp("h3_edit"))
+        tl = paths.read_json(os.path.join(wd, "final", "timeline.json"))
+        if not isinstance(tl, dict) or not os.path.isfile(os.path.join(wd, "final", "ad.mp4")):
+            raise RuntimeError("the h3 edit finished without final/ad.mp4 and final/timeline.json")
+        ctx.progress(0.85)
+        timing = self.h3_timing(tl, script)
+        paths.atomic_json(os.path.join(wd, "timing.json"), timing)
+        pick = self.h3_pick(g, script)
+        paths.atomic_json(os.path.join(wd, "pick.json"), pick)
+        W, H = cfg.out_width, cfg.out_height
+        ff = self._ff(wd, ctx)
+        n_events = int(number((tl.get("captions") or {}).get("events")) or 0)
+        size = float(number(((ad.get("h3") or {}).get("caption") or {}).get("size")) or 92)
+        times, rows = self.h3_caption_samples(tl, size)
+        burned = assembly.burned_in(ff, "final/video.mp4", "final/ad.mp4", W, H, times, False, rows)
+        if not (burned["ok_captions"] or not n_events):
+            try:
+                os.remove(os.path.join(wd, "final", "ad.mp4"))
+            except OSError:
+                pass
+            raise InfraFailure(f"the captions did not show in the encoded ad ({burned}): check the font "
+                               f"({fonts['caption']}) and ffmpeg's libass")
+        ctx.progress(0.95)
+        mixed = tl.get("mix") if isinstance(tl.get("mix"), dict) else {}
+        checks = tl.get("checks") if isinstance(tl.get("checks"), dict) else {}
+        cuts = [c for b in tl.get("beats") or [] for c in b.get("cutaways") or []]
+        record = {"encoder": tl.get("encode"), "picks": {k: {"take": v["take"], "seed": v["seed"], "score": None}
+                                                         for k, v in pick.items()},
+                  "segments": [s.get("path") for s in tl.get("segments") or []],
+                  "font": {"source": fonts["caption"], "family": (tl.get("captions") or {}).get("family")},
+                  "caption_events": n_events, "label": False, "burned_in": burned,
+                  "loudnorm_first_pass": mixed.get("loudnorm") or {k: mixed.get(k) for k in ("I", "TP", "LRA")},
+                  "total_s": timing["total_s"], "frames": int(number(tl.get("frames")) or 0), "music": music,
+                  "music_db": music_db, "mix_round": mix_round, "edit_round": edit_round, "ffmpeg": ff.version(),
+                  "at_wall": _now_wall(),
+                  "h3": {"beats": len(tl.get("beats") or []), "cutaways": len(cuts),
+                         "removals": sum(1 for r in checks.get("removals") or [] if isinstance(r, dict) and r.get("ok")),
+                         "cuts": len(tl.get("cuts") or []), "safe": safe, "music_under": round(music_under, 2),
+                         "bed_lift": cfg.h3_bed_lift, "checks": {k: checks.get(k) for k in ("frames", "freezes",
+                                                                                            "punch_cuts", "color")},
+                         "checks_ok": res.get("checks_ok"), "chosen": {b["id"]: b["take"] for b in req["beats"]}}}
+        if not cfg.keep_segments:
+            shutil.rmtree(os.path.join(wd, "final", "segments"), ignore_errors=True)
+            for tmp in ("final/video.mp4", "final/voice.wav"):
+                try:
+                    os.remove(os.path.join(wd, tmp))
+                except OSError:
+                    pass
+            record["segments_deleted"] = True
+        paths.atomic_json(os.path.join(wd, "final", "assembly.json"), record)
+        ctx.progress(1.0)
+        final = os.path.join(wd, "final")
+        extra = [os.path.join(final, n) for n in ("timeline.json", "ad.srt", "publish.json")
+                 if os.path.isfile(os.path.join(final, n))]
+        return {"path": os.path.join(final, "ad.mp4"), "exists": True,
+                "paths": [os.path.join(final, "assembly.json"), os.path.join(wd, "pick.json"),
+                          os.path.join(final, "captions.ass"), os.path.join(wd, "timing.json")] + extra,
+                "checks": [{"check": "captions", "ok": n_events > 0,
+                            "detail": f"{n_events} caption events, drawn on {burned['captions']} of the caption band"}]}
+
+    @staticmethod
+    def h3_timing(tl: dict, script: dict) -> dict:
+        """timing.json in Foreman's shape from the edit's timeline: the words on the output timeline
+        (line = their beat's line), one window per segment (talk, punch, screen, price, endcard,
+        still), the total and where the end card starts."""
+        beats = script.get("beats") or []
+
+        def line_of(i):
+            i = int(number(i) or 0)
+            return int(beats[i]["k"]) if 0 <= i < len(beats) else i
+        words = [{"text": w.get("text"), "line": line_of(w.get("beat")), "start": float(w.get("start") or 0.0),
+                  "end": float(w.get("end") or 0.0)} for w in tl.get("words") or [] if isinstance(w, dict)]
+        total = round(float(number(tl.get("total")) or 0.0), 4)
+        shots = []
+        for j, s in enumerate(tl.get("segments") or []):
+            a, b = float(number(s.get("start")) or 0.0), float(number(s.get("end")) or 0.0)
+            shots.append({"k": j, "kind": s.get("kind"), "beat": s.get("beat"), "lines": [line_of(s.get("k"))],
+                          "start": round(a, 4), "end": round(b, 4), "seconds": round(b - a, 4),
+                          "frames": int(number(s.get("frames")) or 0)})
+        card = next((s["start"] for s in shots if s["kind"] == "endcard"), total)
+        return {"words": words, "source": "asr", "spans": None, "track_s": total, "shots": shots, "total_s": total,
+                "fps": FPS, "endcard_start": card, "backend": "h3"}
+
+    def h3_pick(self, g: dict, script: dict) -> dict:
+        """pick.json: each beat's take (the first the speech gate passed) and every other take of it as
+        an alternate (retention deletes them after the owner's verdict)."""
+        out = {}
+        for b in script["beats"]:
+            chosen = self.h3_chosen(g, b)
+            takes = g["units"][f"beat-{b['k']}"]["attempts"]
+            out[str(b["k"])] = {"take": chosen["mp4"], "seed": chosen["seed"], "score": None,
+                                "takes": [{"seed": t["seed"], "take": t["mp4"], "score": None, "ok": t.get("ok"),
+                                           "verdict": t.get("verdict")} for t in takes],
+                                "alternates": [t["mp4"] for t in takes if t["mp4"] != chosen["mp4"]]}
+        return out
+
+    @staticmethod
+    def h3_caption_samples(tl: dict, size: float = 92.0) -> tuple:
+        """(times, rows) for assembly.burned_in: up to three times a caption must show (the middle of words
+        outside the hidden ranges: the cards) and where. Words of beats whose captions sit in the bottom
+        band come first (rows None: that band); when every beat moves its captions (caption_pos), the first
+        moved beat's words are sampled in the band its position gives (rows: top and bottom as fractions of
+        the height; the captions hang from their position, one line of `size` px)."""
+        hide = [(float(a), float(b)) for a, b in tl.get("hide") or [] if number(a) is not None and number(b) is not None]
+        beats = tl.get("beats") or []
+        moved = {i: b["caption_pos"] for i, b in enumerate(beats) if isinstance(b, dict) and b.get("caption_pos")}
+        bottom, by_beat = [], {}
+        for w in tl.get("words") or []:
+            s, e = float(number(w.get("start")) or 0.0), float(number(w.get("end")) or 0.0)
+            t = round((s + e) / 2.0, 3)
+            if e <= s or any(a - 0.05 <= t <= b + 0.05 for a, b in hide):
+                continue
+            i = int(number(w.get("beat")) or 0)
+            (by_beat.setdefault(i, []) if i in moved else bottom).append(t)
+
+        def three(seen):
+            return [seen[k] for k in sorted({0, len(seen) // 2, len(seen) - 1})]
+        if bottom:
+            return three(bottom), None
+        for i in sorted(by_beat):
+            pos = moved[i]
+            H = float(number((tl.get("out") or [0, 1920])[1]) or 1920)
+            y = float(number(pos[1]) or 0.0)
+            return three(by_beat[i]), (max(0.0, y / H - 0.01), min(1.0, (y + 1.6 * float(size)) / H + 0.02))
+        return [], None
+
     # ---------------------------------------------------------------- i: QA, manifest (local engine)
 
     def run_finish(self, spec, ctx) -> dict:
@@ -1547,6 +2421,7 @@ class AdPipeline:
         except AdError as e:
             raise ContentFailure(str(e)) from None
         cfg = self.cfg
+        h3 = self.is_h3(ad)
         final = os.path.join(wd, "final")
         mp4 = "final/ad.mp4"
         if not os.path.isfile(os.path.join(wd, mp4)):
@@ -1558,7 +2433,9 @@ class AdPipeline:
         ctx.progress(0.4)
         total, card_at = float(timing["total_s"]), float(timing["endcard_start"])
         det = assembly.detect(ff, mp4, 0.0, card_at)
-        gen = [(float(s["start"]), float(s["end"])) for s in timing["shots"] if s["kind"] in ("talk", "broll")]
+        # Generated pictures: talk and B-roll shots (an h3 ad: its takes, whole or punched in).
+        gen = [(float(s["start"]), float(s["end"])) for s in timing["shots"]
+               if s["kind"] in (("talk", "punch") if h3 else ("talk", "broll"))]
         frozen = [(a, b) for a, b in det["freeze"] if any(min(b, e) - max(a, s) >= 0.5 for s, e in gen)]
         flat = 0
         for s, e in gen:
@@ -1597,6 +2474,8 @@ class AdPipeline:
              "detail": (f"AI label drawn on {burned.get('label')} of its band" if wants_label
                         else "no label (the template does not ask for one)")},
         ]
+        if h3:
+            checks += self.h3_checks(ff, wd, mp4, timing)
         qa_dir = os.path.join(final, "qa")
         os.makedirs(qa_dir, exist_ok=True)
         frames = []
@@ -1620,12 +2499,42 @@ class AdPipeline:
         manifest = self.manifest(wd, ad, timing, qa, asm)
         paths.atomic_json(os.path.join(wd, "manifest.json"), manifest)
         ctx.progress(1.0)
+        # An h3 ad's publish files go with it (never a second .mp4: the phone sends the first one).
+        extra = [os.path.join(final, n) for n in ("ad.srt", "publish.json", "timeline.json")
+                 if h3 and os.path.isfile(os.path.join(final, n))]
         return {"path": os.path.join(final, "ad.mp4"), "exists": True,
                 "paths": [os.path.join(final, "video.json"), os.path.join(wd, "manifest.json"),
                           os.path.join(final, "qa.json")] + [os.path.join(wd, f) for f in frames]
-                + [os.path.join(wd, "ad.json")],
+                + [os.path.join(wd, "ad.json")] + extra,
                 "checks": checks, "duration_s": info.get("duration_s"), "width": info.get("width"),
                 "height": info.get("height")}
+
+    def h3_checks(self, ff, wd: str, mp4: str, timing: dict) -> list:
+        """What the h3 edit promises, measured on the file in one decode: exactly the timeline's
+        frames, no frozen second anywhere (n=0.003), a scene cut within 0.05 s of every punch-in,
+        and bt709 colour tags on the video stream."""
+        tl = paths.read_json(os.path.join(wd, "final", "timeline.json"), {}) or {}
+        want = int(number(tl.get("frames")) or round(float(timing["total_s"]) * FPS))
+        res = ff.run(["-i", mp4, "-map", "0:v:0", "-vf", "freezedetect=n=0.003:d=1.0,scdet=threshold=8",
+                      "-f", "framecrc", "-"], check=False, heartbeat=60.0)
+        got = sum(1 for ln in (res.stdout or b"").decode("utf-8", "replace").splitlines()
+                  if ln.strip() and not ln.startswith("#"))
+        err = (res.stderr or b"").decode("utf-8", "replace")
+        freezes = [round(float(x), 2) for x in re.findall(r"freeze_start: ([0-9.]+)", err)]
+        scenes = [float(x) for x in re.findall(r"lavfi\.scd\.time: ([0-9.]+)", err)]
+        punches = [float(sh["start"]) for sh in timing["shots"] if sh.get("kind") == "punch"]
+        missed = [round(t, 2) for t in punches if not any(abs(c - t) <= 0.05 for c in scenes)]
+        vline = next((ln.strip() for ln in ff.stderr(["-i", mp4]).splitlines() if "Video:" in ln), "")
+        return [
+            {"check": "frames_exact", "ok": res.returncode == 0 and got == want,
+             "detail": f"{got} frames decoded, the timeline has {want}"},
+            {"check": "no_freeze", "ok": res.returncode == 0 and not freezes,
+             "detail": f"frozen from {freezes[:4]} s" if freezes else "no frozen second"},
+            {"check": "punch_cuts", "ok": res.returncode == 0 and not missed,
+             "detail": f"{len(punches)} punch-in(s), no cut seen at {missed}" if missed else
+             f"{len(punches)} punch-in(s), each a cut"},
+            {"check": "color_bt709", "ok": "bt709" in vline, "detail": vline[:200] or "no video stream"},
+        ]
 
     def manifest(self, wd: str, ad: dict, timing: dict, qa: dict, asm: dict) -> dict:
         picks = ad.get("picks") or {}
@@ -1652,7 +2561,7 @@ class AdPipeline:
                 m = paths.read_json(os.path.join(wd, "stills", name), {}) or {}
                 stills[name[:-len(".meta.json")]] = {"seed": m.get("seed"), "direct": m.get("direct", False),
                                                      "graph": m.get("graph")}
-        return {
+        m = {
             "ad_id": ad.get("id"), "template_id": ad.get("template_id"), "consumer": ad.get("consumer"),
             "brief": ad.get("brief"), "created_wall": ad.get("created_wall"), "finished_wall": _now_wall(),
             "length_s": timing.get("total_s"), "resolution": [self.cfg.out_width, self.cfg.out_height],
@@ -1677,6 +2586,36 @@ class AdPipeline:
             "steps": self.state(wd).get("steps") or [], "jobs": records,
             "gate": self.gate_record(wd),
         }
+        if self.is_h3(ad):
+            self.h3_manifest(wd, ad, m)
+        return m
+
+    def h3_manifest(self, wd: str, ad: dict, m: dict) -> None:
+        """An h3 ad's manifest: the graph's license and attribution, every take (seed, why it was taken,
+        the verdict), the chosen ones, the edit's timeline in brief, the final gate, the publish gate."""
+        info = (ad.get("picks") or {}).get("h3") or {}
+        g = paths.read_json(self.gate_path(wd), {}) or {}
+        tl = paths.read_json(os.path.join(wd, "final", "timeline.json"), {}) or {}
+        units = g.get("units") if isinstance(g.get("units"), dict) else {}
+        attempts = {f"b{u.get('line')}": [{k: t.get(k) for k in ("n", "seed", "why", "verdict", "ok", "render_s", "mp4")}
+                                          for t in u.get("attempts") or []] for u in units.values()}
+        chosen = {f"b{u.get('line')}": next((t.get("mp4") for t in u.get("attempts") or [] if t.get("status") == "passed"),
+                                            None) for u in units.values()}
+        m["seeds"]["attempts"] = attempts
+        m["disclosure"]["attribution"] = info.get("attribution")
+        if info.get("graph"):
+            m["licenses"][f"graph:{info['graph']}"] = info.get("license")
+        checks = tl.get("checks") if isinstance(tl.get("checks"), dict) else {}
+        m["h3"] = {"graph": info.get("graph"), "license": info.get("license"), "attribution": info.get("attribution"),
+                   "commercial_ok": info.get("commercial_ok"), "render": [info.get("width"), info.get("height")],
+                   "spent_s": g.get("spent_s"), "rounds": g.get("rounds"), "chosen": chosen,
+                   "timeline": {"beats": [dict({k: b.get(k) for k in ("id", "start", "end", "frames", "take")},
+                                               cutaways=[c.get("kind") for c in b.get("cutaways") or []])
+                                          for b in tl.get("beats") or []],
+                                "removals": [r for r in checks.get("removals") or [] if isinstance(r, dict)
+                                             and r.get("ok")],
+                                "cuts": tl.get("cuts"), "total": tl.get("total"), "frames": tl.get("frames")},
+                   "final_gate": g.get("final"), "publish": "final/publish.json"}
 
     def gate_record(self, wd: str) -> dict | None:
         """The audio gate as the manifest keeps it: every take of every line (what the voice was
@@ -1685,14 +2624,16 @@ class AdPipeline:
         g = paths.read_json(self.gate_path(wd))
         if not isinstance(g, dict):
             return None
-        return {k: g.get(k) for k in ("status", "reason", "mode", "language", "seeded", "settings", "lexicon", "units",
-                                      "rounds", "track", "mix")}
+        keys = ("status", "reason", "mode", "language", "seeded", "settings", "lexicon", "units", "rounds", "track", "mix")
+        return {k: g.get(k) for k in keys + (("spent_s", "final") if g.get("mode") == "h3" else ())}
 
     # ---------------------------------------------------------------- retention
 
     def prune_alternates(self, wd: str) -> int:
-        """After the owner's verdict: delete the takes the cut did not use (their MP4s, sidecars and
-        sampled frames). Returns bytes freed. Idempotent."""
+        """After the owner's verdict: delete the takes the cut did not use: each MP4 and every file
+        beside it named `<stem>.` something (its meta, an h3 take's WAV and probe), its sampled frames
+        `<stem>-f*.png`, and its transcripts gate/<stem>.asr.json, .asr0.json and their metas (an h3
+        take's). Files only (it runs with no configuration). Returns bytes freed. Idempotent."""
         state = self.state(wd)
         if state.get("alternates_pruned"):
             return 0
@@ -1703,10 +2644,15 @@ class AdPipeline:
                 base = os.path.join(wd, alt)
                 victims = [base, base + ".meta.json"]
                 stem = os.path.splitext(base)[0]
+                name = os.path.basename(stem)
                 d = os.path.dirname(base)
                 if os.path.isdir(d):
+                    # "<stem>." never matches a longer stem: beat-1-t1.wav is beat-1-t1's, beat-1-t10.wav is not
                     victims += [os.path.join(d, n) for n in os.listdir(d)
-                                if n.startswith(os.path.basename(stem) + "-f") and n.endswith(".png")]
+                                if (n.startswith(name + "-f") and n.endswith(".png")) or n.startswith(name + ".")]
+                for heard in (f"{name}.asr.json", f"{name}.asr0.json"):
+                    victims += [os.path.join(wd, "gate", heard), os.path.join(wd, "gate", heard + ".meta.json")]
+                victims = list(dict.fromkeys(victims))
                 for f in victims:
                     if paths.inside(f, wd) and os.path.isfile(f) and not os.path.islink(f):
                         freed += os.path.getsize(f)
@@ -1740,6 +2686,7 @@ def _pearson(a: list, b: list) -> float:
 
 STAGES = ("facts", "script", "voice", "gate", "timing", "stills", "shots", "music", "assemble", "mix", "finish",
           "review")
+H3_STAGES = ("facts", "script", "takes", "probe", "hear", "music", "assemble", "mix", "finish", "review")
 
 
 def progress(wd: str) -> dict:
@@ -1747,6 +2694,9 @@ def progress(wd: str) -> dict:
     def has(rel):
         return os.path.isfile(os.path.join(wd, rel))
     manifest = paths.read_json(os.path.join(wd, "manifest.json"), {}) or {}
+    ad = paths.read_json(os.path.join(wd, "ad.json"), {}) or {}
+    if isinstance(ad, dict) and AdPipeline.is_h3(ad):
+        return _h3_progress(wd, has, manifest)
     shots_dir = os.path.join(wd, "shots")
     takes = sorted(n for n in os.listdir(shots_dir) if n.endswith(".mp4")) if os.path.isdir(shots_dir) else []
     stills_dir = os.path.join(wd, "stills")
@@ -1765,6 +2715,24 @@ def progress(wd: str) -> dict:
     current = next((s for s in STAGES if not done[s]), "done")
     return {"done": done, "current": current, "takes": takes, "stills": stills, "gate": gate.get("status"),
             "final": os.path.join(wd, "final", "ad.mp4") if done["assemble"] else None}
+
+
+def _h3_progress(wd: str, has, manifest: dict) -> dict:
+    takes_dir = os.path.join(wd, "takes")
+    names = sorted(os.listdir(takes_dir)) if os.path.isdir(takes_dir) else []
+    gate = paths.read_json(os.path.join(wd, GATE_FILE), {}) or {}
+    gate = gate if isinstance(gate, dict) else {}
+    done = {"facts": has("facts.json"), "script": has("script.json"),
+            "takes": any(n.endswith(".mp4") for n in names), "probe": any(n.endswith(".probe.json") for n in names),
+            "hear": gate.get("status") in ("voice_passed", "passed"),
+            "music": any(n.startswith("bed") and n.endswith(".wav") for n in os.listdir(os.path.join(wd, "music")))
+            if os.path.isdir(os.path.join(wd, "music")) else False,
+            "assemble": has("final/ad.mp4") and has("final/assembly.json"),
+            "mix": (gate.get("mix") or {}).get("status") == "passed", "finish": has("final/qa.json"),
+            "review": bool(manifest.get("review"))}
+    current = next((s for s in H3_STAGES if not done[s]), "done")
+    return {"done": done, "current": current, "takes": [n for n in names if n.endswith(".mp4")], "stills": [],
+            "gate": gate.get("status"), "final": os.path.join(wd, "final", "ad.mp4") if done["assemble"] else None}
 
 
 def ad_items(store, artifacts_dir: str) -> list:

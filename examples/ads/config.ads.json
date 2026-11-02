@@ -10,7 +10,9 @@
     "video_height": 1280,
     "expected": {"still": 60, "talk": 420, "broll": 150, "music": 120},
     "max_job_s": 600,
-    "fonts": ["/System/Library/Fonts/Supplemental/Arial Bold.ttf"]
+    "fonts": ["/System/Library/Fonts/Supplemental/Arial Bold.ttf"],
+    "media_python": "~/ComfyUI/.venv/bin/python",
+    "h3_graph": "h3_ref2va"
   },
   "comfyui_options": {
     "dir": "~/ComfyUI",

@@ -27,6 +27,9 @@ lines); audio it cannot place (the final mix, which ffmpeg re-made) is heard as 
 did place, passed through the next callable or text queued in `asr_unknown`; `asr_rewrite`
 (a callable, or [(regex, replacement)]) then writes the text the way an ASR would (digits for
 numbers, '.com'). `asr_text`, when set, is heard for every transcription (the older tests).
+`asr_resolver(audio, fields)`, when set, is asked first: it answers (text, words or None), or None
+to leave the transcription to the rules above. H3Ear is the one for H3 takes rendered by the fake
+ComfyUI: it reads that fake's registry and hears each take by its tone (needs numpy).
 """
 from __future__ import annotations
 
@@ -144,6 +147,7 @@ class FakeMlxServe:
         self.utterances = []                    # [{"said", "input", "seed", "pcm", "format", "seconds"}]
         self.asr_unknown = collections.deque()  # per transcription of audio it cannot place: callable(text) or text
         self.asr_rewrite = None                 # callable(text) or [(regex, replacement)]: how the ASR writes
+        self.asr_resolver = None                # callable(audio, fields) -> (text, words | None) | None: asked first
         self.heard = []                         # [(fields, text)] of every transcription
         self._placed = []                       # [(seconds, text)] of the audio a transcription placed
         self.image_size_cap = 256
@@ -271,6 +275,142 @@ class FakeMlxServe:
         with self.lock:
             self.heard.append((dict(fields), text))
         return text
+
+
+_PUNCT = ".,!?;:\"'"
+
+
+def _bare(word: str) -> str:
+    return word.strip(_PUNCT)
+
+
+def _pcm_mono(audio: bytes):
+    """(samples as float in [-1, 1], rate) of a s16 WAV, channels averaged; (None, None) if unreadable."""
+    import numpy as np
+    try:
+        with wave.open(io.BytesIO(audio or b""), "rb") as w:
+            ch, width, rate = w.getnchannels(), w.getsampwidth(), w.getframerate()
+            raw = w.readframes(w.getnframes())
+    except Exception:
+        return None, None
+    if width != 2 or not raw:
+        return None, None
+    x = np.frombuffer(raw[:len(raw) // (2 * ch) * 2 * ch], dtype="<i2").astype(np.float32) / 32768.0
+    return x.reshape(-1, ch).mean(axis=1), rate
+
+
+class H3Ear:
+    """The fake ASR's ear for H3 takes: an asr_resolver that hears the takes the fake ComfyUI rendered.
+
+    Each take holds one tone (its registry entry's `freq`), one burst per word it said. A recording is
+    heard as the takes whose tones it holds, in the order they sound (a take's 16 kHz WAV, a beat's
+    finished voice, the final mix with the music under it): their words as an ASR writes them (each
+    `written` phrase, any case, as one word: {"example dot com": "example.com"}), joined. A word-timed
+    request of one take gets each word's time from its bursts as heard (10 ms frames above -35 dBFS,
+    as the probe measures voiced runs), else from the registry. `hook(info)` may rewrite what is heard:
+    info {"takes": [registry entries], "words": bool, "n": how many times these takes were heard this
+    way before, "text": str}; it returns the text (or None to keep it), for a free-running request."""
+
+    def __init__(self, registry: str, written=None, hook=None, min_amp: float = 0.02):
+        self.registry = registry
+        self.written = sorted(((p.lower().split(), w) for p, w in (written or {}).items()), key=lambda r: -len(r[0]))
+        self.hook = hook
+        self.min_amp = min_amp
+        self.counts = collections.Counter()
+        self.log = []                           # [{"takes": [i], "words": bool, "n", "text"}]
+        self.lock = threading.Lock()
+
+    def takes(self) -> list:
+        try:
+            with open(self.registry) as f:
+                return json.load(f).get("takes") or []
+        except (OSError, ValueError):
+            return []
+
+    def __call__(self, audio: bytes, fields: dict):
+        import numpy as np
+        takes = self.takes()
+        x, rate = _pcm_mono(audio)
+        if not takes or x is None:
+            return None
+        found = self.find(np, x, rate, takes)
+        if not found:
+            return None
+        timed = fields.get("timestamp_granularities[]") == "word"
+        words = []
+        for t in found:
+            tokens = [list(tok) for tok in t["tokens"]]
+            if timed and len(found) == 1:
+                runs = self.voiced_runs(np, x, rate)
+                if len(runs) == len(tokens):
+                    for tok, (a, b) in zip(tokens, runs):
+                        tok[1], tok[2] = a, b
+            words += self.write(tokens)
+        text = " ".join(w for w, _, _ in words)
+        key = (tuple(t["i"] for t in found), timed)
+        with self.lock:
+            n = self.counts[key]
+            self.counts[key] += 1
+        if self.hook is not None and not timed:
+            new = self.hook({"takes": found, "words": timed, "n": n, "text": text})
+            text = text if new is None else str(new)
+        with self.lock:
+            self.log.append({"takes": [t["i"] for t in found], "words": timed, "n": n, "text": text})
+        return text, ([(_bare(w), a, b) for w, a, b in words if _bare(w)] if timed else None)
+
+    def write(self, tokens: list) -> list:
+        out, i = [], 0
+        while i < len(tokens):
+            for phrase, w in self.written:
+                seg = tokens[i:i + len(phrase)]
+                if len(seg) == len(phrase) and [_bare(t[0]).lower() for t in seg] == phrase:
+                    trail = seg[-1][0][len(seg[-1][0].rstrip(_PUNCT)):]
+                    out.append((w + trail, seg[0][1], seg[-1][2]))
+                    i += len(phrase)
+                    break
+            else:
+                out.append(tuple(tokens[i]))
+                i += 1
+        return out
+
+    def find(self, np, x, rate: int, takes: list) -> list:
+        """The takes whose tones sound in x, in the order they first sound (40 ms windows, 10 ms hop)."""
+        if rate % 16000 == 0 and rate > 16000:
+            x, rate = x[::rate // 16000], 16000
+        win, hop = int(0.04 * rate), int(0.01 * rate)
+        if len(x) < win:
+            return []
+        nf = 1 + (len(x) - win) // hop
+        frames = x[np.arange(win)[None, :] + hop * np.arange(nf)[:, None]] * np.hanning(win)[None, :]
+        freqs = np.array([float(t["freq"]) for t in takes])
+        basis = np.exp(-2j * np.pi * np.outer(np.arange(win), freqs) / rate)
+        amp = np.abs(frames @ basis) * 2.0 / np.hanning(win).sum()
+        best, top = amp.argmax(axis=1), amp.max(axis=1)
+        first = {}
+        for f in range(nf):
+            if top[f] >= self.min_amp:
+                k = int(best[f])
+                first.setdefault(k, []).append(f)
+        present = [(fs[0], k) for k, fs in first.items() if len(fs) >= 5]
+        return [takes[k] for _, k in sorted(present)]
+
+    @staticmethod
+    def voiced_runs(np, x, rate: int, db: float = -35.0, min_s: float = 0.03) -> list:
+        hop = int(0.01 * rate)
+        n = len(x) // hop
+        if not n:
+            return []
+        rms = np.sqrt(np.mean(x[:n * hop].reshape(n, hop) ** 2, axis=1) + 1e-12)
+        on = 20 * np.log10(rms) > db
+        runs, start = [], None
+        for f in range(n + 1):
+            if f < n and on[f]:
+                start = f if start is None else start
+            elif start is not None:
+                if (f - start) * 0.01 >= min_s - 1e-9:
+                    runs.append((round(start * 0.01, 3), round(f * 0.01, 3)))
+                start = None
+        return runs
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -478,6 +618,16 @@ class _Handler(BaseHTTPRequestHandler):
                 seconds = w.getnframes() / float(w.getframerate())
         except Exception:
             return self._error(400, "file must be a WAV")
+        resolved = s.asr_resolver(audio, fields) if s.asr_resolver is not None else None
+        if resolved is not None:  # the resolver writes as a real ASR does: case, punctuation, its own word times
+            text, timed = resolved
+            with s.lock:
+                s.heard.append((dict(fields), text))
+            out = {"task": "transcribe", "language": fields.get("language") or "en", "duration": seconds,
+                   "text": text, "segments": [{"id": 0, "seek": 0, "start": 0.0, "end": seconds, "text": text}]}
+            if fields.get("timestamp_granularities[]") == "word" and timed is not None:
+                out["words"] = [{"word": w, "start": round(a, 3), "end": round(b, 3)} for w, a, b in timed]
+            return self._json(200, out)
         text = s.hear(audio, fields)
         words = [w for w in text.split() if w]
         if s.asr_lower:

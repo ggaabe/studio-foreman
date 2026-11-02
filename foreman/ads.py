@@ -65,7 +65,7 @@ import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
 
-from . import characters
+from . import characters, paths
 from .policy import number
 from .text import CONTROL_RE, fold, has_bidi, mixed_script_words, skeleton
 
@@ -73,11 +73,11 @@ log = logging.getLogger("foreman.ads")
 
 FPS = 24
 JOB_KINDS = ("ad_facts", "ad_voice", "ad_gate", "ad_timing", "ad_stills", "ad_shots", "ad_music", "ad_assemble",
-             "ad_finish")
+             "ad_finish", "ad_probe")
 BRAIN_KINDS = ("ad_next", "ad_recover", "ad_review")
 KIND_FAMILIES = {"ad_facts": ("cpu",), "ad_assemble": ("cpu",), "ad_finish": ("cpu",), "ad_voice": ("tts",),
                  "ad_gate": ("asr",), "ad_timing": ("asr",), "ad_stills": ("image", "comfy"),
-                 "ad_shots": ("video", "comfy"), "ad_music": ("music",)}
+                 "ad_shots": ("video", "comfy"), "ad_music": ("music",), "ad_probe": ("cpu",)}
 SHOT_KINDS = ("talk", "broll", "screen", "endcard")
 ROLES = ("tts", "tts_clone", "asr", "image", "video", "music", "cpu", "comfy")
 BACKENDS = ("mlx", "comfyui")
@@ -103,7 +103,7 @@ BANNED_CLAIMS = (
         r"[\"”»“’]\s*[,.!?]?\s*(says|said|writes|wrote|explains|explained|adds|added|according to)\b",
         r"\b(says|said|writes|wrote)\s+[a-z]+,\s+(a|an|the|one|our)\s",
         r"\baccording to (our )?(customers?|clients?|users?|reviews?|people)\b",
-        r"\b(as an? (happy |satisfied |longtime |long-time |real )?(customer|user|client|member)"
+        r"\b(as an? ((happy|satisfied|longtime|long-time|real|loyal|regular) )*(customer|user|client|member)"
         r"|i (use|used|tried|switched to|rely on) (it|them|this)( myself)?|it saved me|saved me (hours|time|money|days|a ton)"
         r"|i saved|my (experience|results) (with|were|was))\b",
     )),
@@ -234,6 +234,22 @@ class AdsConfig:
     gate_mix_margin: float = 0.05      # the mix may lose at most this share of words more than the voice stem
     gate_remix_db: float = 8.0         # the one re-mix lowers the music bed by this much
     lexicon_file: str = ""             # the owner's pronunciation lexicon (default: $FOREMAN_HOME/lexicon.json)
+    # The h3 chain (a template whose ad block has an "h3" block): talking takes from a ComfyUI graph,
+    # each judged by ASR (foreman/h3core.py), then cut by the media worker foreman/h3/worker.py.
+    media_python: str = ""             # the interpreter (numpy + Pillow) that runs foreman/h3/worker.py
+    h3_graph: str = "h3_ref2va"        # the ComfyUI graph template of an h3 take
+    h3_width: int = 576
+    h3_height: int = 1024
+    h3_attempts: int = 3               # renders of one beat at most
+    h3_budget_s: float = 1200.0        # render seconds per ad at most (the takes' own times)
+    h3_music_under: float = 14.0       # the bed is held this many LU under the voice
+    h3_bed_lift: float = 5.0           # and lifted this much between lines
+    h3_crf: int = 16
+    h3_hands_floor: float = 0.74       # hands: skin-coloured pixels below this share of the take's height
+    h3_hands_limit: int = 30           # in more than this many pixels of a sampled frame
+    h3_anchor_tol_s: float = 0.06      # a cut word starts within this of a voiced onset
+    h3_anchor_gap_s: float = 0.10      # that follows at least this much quiet
+    h3_runon_s: float = 0.15           # a word starting sooner after the line's last one runs on
 
     @classmethod
     def from_dict(cls, data, **base) -> "AdsConfig":
@@ -286,6 +302,24 @@ class AdsConfig:
                 problems.append(f"{k} must be an integer in {lo}..{hi}")
         if not isinstance(self.lexicon_file, str):
             problems.append("lexicon_file must be a path")
+        if not isinstance(self.media_python, str) or CONTROL_RE.search(self.media_python):
+            problems.append("media_python must be the path of a Python interpreter with numpy and Pillow")
+        if not isinstance(self.h3_graph, str) or not paths.SAFE_NAME.match(self.h3_graph):
+            problems.append("h3_graph must be a graph template name")
+        for k in ("h3_width", "h3_height"):
+            v = getattr(self, k)
+            if not isinstance(v, int) or isinstance(v, bool) or v % 32 or not 64 <= v <= 2048:
+                problems.append(f"{k} must be a multiple of 32 in 64..2048")
+        for k, lo, hi in (("h3_attempts", 1, 6), ("h3_crf", 10, 30), ("h3_hands_limit", 1, 10000)):
+            v = getattr(self, k)
+            if not isinstance(v, int) or isinstance(v, bool) or not lo <= v <= hi:
+                problems.append(f"{k} must be an integer in {lo}..{hi}")
+        for k, lo, hi in (("h3_budget_s", 60.0, 7200.0), ("h3_music_under", 6.0, 30.0), ("h3_bed_lift", 0.0, 12.0),
+                          ("h3_hands_floor", 0.5, 0.95), ("h3_anchor_tol_s", 0.01, 0.5), ("h3_anchor_gap_s", 0.0, 1.0),
+                          ("h3_runon_s", 0.0, 1.0)):
+            v = number(getattr(self, k))
+            if v is None or not lo <= v <= hi:
+                problems.append(f"{k} must be a number in [{lo:g}, {hi:g}]")
         if problems:
             raise ValueError("ads options: " + "; ".join(problems))
 
@@ -295,13 +329,13 @@ class AdsConfig:
 
 EXPECTED = {"facts": 30.0, "script": 300.0, "line": 6.0, "full": 20.0, "asr": 40.0, "gate": 15.0, "still": 60.0,
             "talk": 420.0, "broll": 150.0, "music": 120.0, "assemble": 300.0, "finish": 120.0, "review": 240.0,
-            "dispatch": 90.0}
+            "dispatch": 90.0, "h3_take": 140.0, "h3_probe": 15.0, "h3_edit": 240.0}
 
 
 # ---------------------------------------------------------------- the template's "ad" block
 
 AD_KEYS = ("concept", "character", "facts", "cta", "end_card", "disclosure", "ai_label", "captures", "banned_marks",
-           "banned_words", "music", "style", "language", "spellings", "talk_seeds", "lexicon")
+           "banned_words", "music", "style", "language", "spellings", "talk_seeds", "lexicon", "h3")
 END_CARD_KEYS = ("price", "url", "cta", "still", "background")
 
 
@@ -397,6 +431,9 @@ def parse_ad_block(block, problems: list) -> dict | None:
             if isinstance(txt, str):
                 problems.extend(f"{where}: {p}" for p in spoken_problems(txt, ad_view, None, where)
                                 if not p.startswith(where))
+    if block.get("h3") is not None:  # the h3 talk chain (foreman/h3core.py): opt in per template
+        from .h3core import parse_h3_block
+        out["h3"] = parse_h3_block(block["h3"], problems, out)
     return out
 
 
@@ -409,16 +446,27 @@ def facts_file_ok(rel) -> bool:
     return len(parts) >= 2 and all(p and p not in (".", "..") for p in parts[1:])
 
 
-def longest_ad_s(max_shots: int, cfg: AdsConfig | None = None) -> float:
+def longest_ad_s(max_shots: int, cfg: AdsConfig | None = None, h3: bool = False) -> float:
     """The longest cut the shot rules allow: every shot but the end card at most max_shot_s (plus
-    plan_shots' 0.75 s of slack), then the end card. A template asking for more is refused."""
+    plan_shots' 0.75 s of slack), then the end card. A template asking for more is refused. An h3
+    ad has no end-card shot (the card is a cutaway in the last beat): every beat at most
+    max_shot_s, then the call to action's hold."""
     cfg = cfg or AdsConfig()
+    if h3:
+        return max(1, int(max_shots)) * cfg.max_shot_s + 3.0
     return (max(1, int(max_shots)) - 1) * (cfg.max_shot_s + 0.75) + cfg.endcard_s
 
 
 def estimate(spec: dict, cfg: AdsConfig | None = None) -> tuple:
     """(GPU seconds, bytes) one ad of this spec may take: the planner prices and admits with it."""
     cfg = cfg or AdsConfig()
+    if spec.get("h3"):  # one H3 take per beat, about one beat in two taken again; probed, heard twice
+        beats = int(spec.get("shots") or 4)
+        takes = 1.5 * beats
+        gpu = (cfg.exp("script") + takes * (cfg.exp("h3_take") + cfg.exp("h3_probe") + 2 * cfg.exp("gate"))
+               + cfg.exp("music") + cfg.exp("h3_edit") + (beats + 1) * cfg.exp("gate") + cfg.exp("finish")
+               + cfg.exp("review"))
+        return gpu, takes * 60e6 + 40e6
     shots = int(spec.get("shots") or 5)
     talk, other = 2, max(0, shots - 3)
     seeds = int(spec.get("talk_seeds") or cfg.talk_seeds)
@@ -431,8 +479,10 @@ def estimate(spec: dict, cfg: AdsConfig | None = None) -> tuple:
     return gpu, (talk * seeds + other) * take + raw + 200e6
 
 
-def root_request(template, model: str, consumer: str, brief: str, params: dict, key: str) -> dict:
-    """The planned (or enqueued) job: read the facts. Everything after it is the dispatcher's."""
+def root_request(template, model: str, consumer: str, brief: str, params: dict, key: str,
+                 cfg: AdsConfig | None = None) -> dict:
+    """The planned (or enqueued) job: read the facts. Everything after it is the dispatcher's.
+    `cfg`: the deployment's ads options, so the plan's price uses its expected times."""
     ad = dict(template.ad or {})
     bounds = (template.params or {}).get("seconds") or {}
     shot_bounds = (template.params or {}).get("shots") or {}
@@ -444,7 +494,7 @@ def root_request(template, model: str, consumer: str, brief: str, params: dict, 
                 length={"min": float(bounds.get("min", 15.0)), "max": float(bounds.get("max", 60.0))},
                 shot_range={"min": int(shot_bounds.get("min", 4)), "max": int(shot_bounds.get("max", 6))},
                 commercial=bool(template.commercial), style_prefix=template.style_prefix or "")
-    gpu_s, nbytes = estimate(spec)
+    gpu_s, nbytes = estimate(spec, cfg)
     workdir = f"ads/{ad_id}"
     payload = {"goal": f"[{template.id}] ad for {consumer}: {brief[:160]}", "expected_s": EXPECTED["facts"],
                "workdir": workdir, "stage": "facts", "ad": spec, "template_id": template.id, "consumer": consumer,
@@ -505,6 +555,7 @@ _DIGITS = re.compile(r"(?<![\d.,])(?:(\d{1,3}(?:,\d{3})+(?!\d)|\d+)(?:\.(\d+))?|
 _AFTER = re.compile(r"(?:\s?(thousand|million|billion|trillion)\b|(k|mm|mn|m|bn|b)\b)?"
                     r"(\s*(?:%|percent\b|per cent\b)|\s*(?:" + "|".join(MONEY_AFTER) + r")\b|\s*cents?\b)?")
 _BEFORE_MONEY = re.compile(r"(?:[" + CURRENCY + r"]\s?|\b(?:usd|eur|gbp|cad|aud)\s?)$")
+_PAUSE = re.compile(r"[.!?;:,]")   # punctuation a spelled number does not continue across
 
 
 def _scan_numbers(text) -> list:
@@ -533,9 +584,11 @@ def _scan_numbers(text) -> list:
         if kind == "count" and _BEFORE_MONEY.search(t[max(0, m.start() - 5):m.start()]):
             kind = "money"
         found.append((_norm_num(val), kind))
-    words = re.findall(r"[a-z]+", re.sub(r"(\d)", " ", t).replace("-", " "))
-    for val, kind, _a, _b in _word_numbers(words):
-        found.append((_norm_num(val), kind))
+    # A spelled number never runs on across punctuation: 'nine fifty. One form' is 9 and 50, not 9
+    # and 51. (The digits were read above, so their own dots and commas are not breaks: '1,000'.)
+    for part in _PAUSE.split(re.sub(r"(\d)", " ", t)):
+        for val, kind, _a, _b in _word_numbers(re.findall(r"[a-z]+", part.replace("-", " "))):
+            found.append((_norm_num(val), kind))
     return found
 
 
@@ -1345,15 +1398,19 @@ def term_index(tok: str) -> int | None:
         return None
 
 
-def _gate_raw(text) -> list:
+def _gate_text(text) -> str:
     t = _seen(text)
     t = re.sub("[‘’ʼ`´]", "'", t)
     for rx, rep in _CONTRACTIONS:
         t = rx.sub(rep, t)
     t = t.replace("'", "")
     t = re.sub(r"(?<=[^\W_])\.(?=[^\W\d_])", " dot ", t)  # example.com -> example dot com (not 9.50)
-    t = t.replace("&", " and ")
-    return [(m.group(0), m.start(), m.end()) for m in _GATE_TOKEN.finditer(t)]
+    return t.replace("&", " and ")
+
+
+def _gate_raw(text) -> list:
+    """[(token, start, end)] with positions in _gate_text(text)."""
+    return [(m.group(0), m.start(), m.end()) for m in _GATE_TOKEN.finditer(_gate_text(text))]
 
 
 def gate_key(text) -> str:
@@ -1407,7 +1464,9 @@ def _num_token(val: float, kind: str, cur: str | None = None) -> str:
     return "#" + _norm_num(val) + unit
 
 
-def _mark_numbers(toks: list) -> list:
+def _mark_numbers(toks: list, text: str | None = None) -> list:
+    """`toks` with every number one token. `text`: the string the token positions index (a spelled
+    number stops at punctuation there: 'nine fifty. One form' is 9 and 50)."""
     out, i, n = [], 0, len(toks)
     while i < n:
         tok, s, e = toks[i]
@@ -1440,8 +1499,9 @@ def _mark_numbers(toks: list) -> list:
             i = j
             continue
         if tok.isalpha():
-            k = i
-            while k < n and toks[k][0].isalpha():
+            k = i + 1
+            while k < n and toks[k][0].isalpha() and not (text is not None
+                                                          and _PAUSE.search(text, toks[k - 1][2], toks[k][1])):
                 k += 1
             pos = 0
             words = [t for t, _, _ in toks[i:k]]
@@ -1461,7 +1521,9 @@ def _mark_numbers(toks: list) -> list:
 def gate_tokens(text, lexicon=()) -> list:
     """`text` as the audio gate compares it: lower-case words without punctuation, every number one
     token ('#9.5$'), every lexicon term one token ('§<entry index>')."""
-    toks = _mark_numbers(_mark_terms(_gate_raw(text), list(lexicon or [])))
+    t = _gate_text(text)
+    toks = [(m.group(0), m.start(), m.end()) for m in _GATE_TOKEN.finditer(t)]
+    toks = _mark_numbers(_mark_terms(toks, list(lexicon or [])), t)
     # A bare count of one is the word 'one' on both sides: a spelled 'one' is a number only before
     # a unit, a scale or a point ('one dollar'), and an ASR writes 'one minute' as '1 minute'.
     return [_SAME_WORD.get(t, "one" if t == "#1" else t) for t, _, _ in toks if t[0] in "§#" or t[0].isalnum()]

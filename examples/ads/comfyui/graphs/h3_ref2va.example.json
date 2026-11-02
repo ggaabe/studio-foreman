@@ -1,0 +1,504 @@
+{
+ "notes": "A MiniMax H3 Ref2VA talking-take graph for the h3 talk chain (README, H3 talking shots): the API graph of a macOS ComfyUI H3 workflow (int8 transformer, the turbo 4-step LoRA, Spectrum, SolAttn), with its constant switches folded and unused nodes dropped. Foreman fills prompt (the structured H3 prompt with the line), image_1 (the scene still: Picture 1), image_2 (the hero still: Picture 2), image_3 (the face close-up: Picture 3), audio_1 (the character's reference voice: Audio 1), seed, seconds (node 131 rounds the frames up to 17k+5 itself), width and height (multiples of 32). Copy it to $FOREMAN_HOME/comfyui/graphs/h3_ref2va.json and set license and commercial_ok yourself after reading the model license.",
+ "license": "MiniMax H3 Community License Agreement (read it in full before use): it grants rights only outside its Excluded Territories (the European Union, the United Kingdom, the Republic of Korea and the United States), where neither the weights nor their outputs may be used without a separate license from MiniMax; a commercial product or service that uses it must display 'MiniMax H3' (attribution); large commercial users need MiniMax's written authorization. Whether this graph runs, and for what, is the owner's decision. The Spectrum custom nodes it uses are GPL-3.0-or-later.",
+ "attribution": "MiniMax H3",
+ "commercial_ok": false,
+ "outputs": [
+  "92"
+ ],
+ "defaults": {
+  "lora": "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"
+ },
+ "graph": {
+  "92": {
+   "inputs": {
+    "filename_prefix": "video/foreman_h3",
+    "format": "auto",
+    "format.codec": "auto",
+    "codec": "auto",
+    "video": [
+     "130",
+     0
+    ]
+   },
+   "class_type": "SaveVideo",
+   "_meta": {
+    "title": "Save Video",
+    "cnr_id": "comfy-core",
+    "ver": "0.33.0"
+   }
+  },
+  "119": {
+   "inputs": {
+    "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+   },
+   "class_type": "VAELoader",
+   "_meta": {
+    "title": "Load VAE",
+    "cnr_id": "comfy-core",
+    "ver": "0.33.0"
+   }
+  },
+  "120": {
+   "inputs": {
+    "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+   },
+   "class_type": "VAELoader",
+   "_meta": {
+    "title": "Load VAE",
+    "cnr_id": "comfy-core",
+    "ver": "0.33.0"
+   }
+  },
+  "121": {
+   "inputs": {
+    "samples": [
+     "125",
+     0
+    ],
+    "vae": [
+     "120",
+     0
+    ]
+   },
+   "class_type": "VAEDecodeAudio",
+   "_meta": {
+    "title": "VAE Decode Audio",
+    "cnr_id": "comfy-core",
+    "ver": "0.33.0"
+   }
+  },
+  "122": {
+   "inputs": {
+    "samples": [
+     "125",
+     0
+    ],
+    "vae": [
+     "119",
+     0
+    ]
+   },
+   "class_type": "VAEDecode",
+   "_meta": {
+    "title": "VAE Decode",
+    "cnr_id": "comfy-core",
+    "ver": "0.33.0"
+   }
+  },
+  "123": {
+   "inputs": {
+    "sampler_name": "euler"
+   },
+   "class_type": "KSamplerSelect",
+   "_meta": {
+    "title": "KSamplerSelect",
+    "cnr_id": "comfy-core",
+    "ver": "0.33.0"
+   }
+  },
+  "124": {
+   "inputs": {
+    "scheduler": "beta",
+    "steps": [
+     "142",
+     0
+    ],
+    "denoise": 1,
+    "model": [
+     "127",
+     0
+    ]
+   },
+   "class_type": "BasicScheduler",
+   "_meta": {
+    "title": "BasicScheduler",
+    "cnr_id": "comfy-core",
+    "ver": "0.33.0"
+   }
+  },
+  "125": {
+   "inputs": {
+    "noise": [
+     "129",
+     0
+    ],
+    "guider": [
+     "126",
+     0
+    ],
+    "sampler": [
+     "123",
+     0
+    ],
+    "sigmas": [
+     "124",
+     0
+    ],
+    "latent_image": [
+     "136",
+     1
+    ]
+   },
+   "class_type": "SamplerCustomAdvanced",
+   "_meta": {
+    "title": "SamplerCustomAdvanced",
+    "cnr_id": "comfy-core",
+    "ver": "0.33.0"
+   }
+  },
+  "126": {
+   "inputs": {
+    "model": [
+     "150",
+     0
+    ],
+    "conditioning": [
+     "136",
+     0
+    ]
+   },
+   "class_type": "BasicGuider",
+   "_meta": {
+    "title": "Basic Guider",
+    "cnr_id": "comfy-core",
+    "ver": "0.33.0"
+   }
+  },
+  "127": {
+   "inputs": {
+    "unet_name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+    "weight_dtype": "default"
+   },
+   "class_type": "UNETLoader",
+   "_meta": {
+    "title": "Load Diffusion Model",
+    "cnr_id": "comfy-core",
+    "ver": "0.33.0"
+   }
+  },
+  "128": {
+   "inputs": {
+    "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+    "type": "minimax",
+    "device": "default"
+   },
+   "class_type": "CLIPLoader",
+   "_meta": {
+    "title": "Load CLIP",
+    "cnr_id": "comfy-core",
+    "ver": "0.33.0"
+   }
+  },
+  "129": {
+   "inputs": {
+    "noise_seed": "{{seed}}"
+   },
+   "class_type": "RandomNoise",
+   "_meta": {
+    "title": "RandomNoise",
+    "cnr_id": "comfy-core",
+    "ver": "0.33.0"
+   }
+  },
+  "130": {
+   "inputs": {
+    "fps": 24,
+    "bit_depth": 8,
+    "color_space": "sRGB",
+    "codec": "none",
+    "images": [
+     "122",
+     0
+    ],
+    "audio": [
+     "121",
+     0
+    ]
+   },
+   "class_type": "CreateVideo",
+   "_meta": {
+    "title": "Create Video",
+    "cnr_id": "comfy-core",
+    "ver": "0.33.0"
+   }
+  },
+  "131": {
+   "inputs": {
+    "expression": "max(5, round(a * 24)) + (5 - (max(5, round(a * 24)) % 17)) % 17",
+    "values.a": [
+     "132",
+     0
+    ]
+   },
+   "class_type": "ComfyMathExpression",
+   "_meta": {
+    "title": "Math Expression",
+    "cnr_id": "comfy-core",
+    "ver": "0.33.0"
+   }
+  },
+  "132": {
+   "inputs": {
+    "value": "{{seconds}}"
+   },
+   "class_type": "PrimitiveFloat",
+   "_meta": {
+    "title": "Float (Duration)",
+    "cnr_id": "comfy-core",
+    "ver": "0.33.0"
+   }
+  },
+  "136": {
+   "inputs": {
+    "prompt": [
+     "138",
+     0
+    ],
+    "width": "{{width}}",
+    "height": "{{height}}",
+    "length": [
+     "131",
+     1
+    ],
+    "ref_image_size": "match",
+    "clip": [
+     "128",
+     0
+    ],
+    "vae": [
+     "119",
+     0
+    ],
+    "audio_vae": [
+     "120",
+     0
+    ],
+    "ref_images.ref_image_0": [
+     "137",
+     0
+    ],
+    "ref_images.ref_image_1": [
+     "139",
+     0
+    ],
+    "ref_images.ref_image_2": [
+     "902",
+     0
+    ],
+    "ref_audios.ref_audio_0": [
+     "901",
+     0
+    ]
+   },
+   "class_type": "MiniMaxH3ReferenceToVideo",
+   "_meta": {
+    "title": "MiniMax H3 Reference to Video",
+    "cnr_id": "comfy-core",
+    "ver": "0.33.0"
+   }
+  },
+  "137": {
+   "inputs": {
+    "image": "{{image_1}}"
+   },
+   "class_type": "LoadImage",
+   "_meta": {
+    "title": "Load Image",
+    "cnr_id": "comfy-core",
+    "ver": "0.33.0"
+   }
+  },
+  "138": {
+   "inputs": {
+    "value": "{{prompt}}"
+   },
+   "class_type": "PrimitiveStringMultiline",
+   "_meta": {
+    "title": "Input Text (Prompt)",
+    "cnr_id": "comfy-core",
+    "ver": "0.33.0"
+   }
+  },
+  "139": {
+   "inputs": {
+    "image": "{{image_2}}"
+   },
+   "class_type": "LoadImage",
+   "_meta": {
+    "title": "Load Image",
+    "cnr_id": "comfy-core",
+    "ver": "0.33.0"
+   }
+  },
+  "142": {
+   "inputs": {
+    "switch": [
+     "146",
+     0
+    ],
+    "on_false": [
+     "143",
+     0
+    ],
+    "on_true": [
+     "144",
+     0
+    ]
+   },
+   "class_type": "ComfySwitchNode",
+   "_meta": {
+    "title": "If/Else Switch (Steps)",
+    "cnr_id": "comfy-core",
+    "ver": "0.33.0"
+   }
+  },
+  "143": {
+   "inputs": {
+    "value": 14
+   },
+   "class_type": "PrimitiveInt",
+   "_meta": {
+    "title": "Int (Full)",
+    "cnr_id": "comfy-core",
+    "ver": "0.33.0"
+   }
+  },
+  "144": {
+   "inputs": {
+    "value": 4
+   },
+   "class_type": "PrimitiveInt",
+   "_meta": {
+    "title": "Int (Lightning LoRA)",
+    "cnr_id": "comfy-core",
+    "ver": "0.33.0"
+   }
+  },
+  "145": {
+   "inputs": {
+    "lora_name": "{{lora}}",
+    "strength_model": 1,
+    "model": [
+     "127",
+     0
+    ]
+   },
+   "class_type": "LoraLoaderModelOnly",
+   "_meta": {
+    "title": "Load LoRA",
+    "cnr_id": "comfy-core",
+    "ver": "0.33.0"
+   }
+  },
+  "146": {
+   "inputs": {
+    "value": true
+   },
+   "class_type": "PrimitiveBoolean",
+   "_meta": {
+    "title": "Boolean (Enable Lightning LoRA)",
+    "cnr_id": "comfy-core",
+    "ver": "0.33.0"
+   }
+  },
+  "149": {
+   "inputs": {
+    "enabled": true,
+    "blend_weight": 0.5,
+    "degree": 1,
+    "ridge_lambda": 0.1,
+    "window_size": 2,
+    "flex_window": 0.75,
+    "warmup_steps": 1,
+    "tail_actual_steps": 1,
+    "max_history": 8,
+    "debug": false,
+    "history_storage": "system_ram",
+    "bootstrap_first_forecast": true,
+    "anchor_residual_feedback": false,
+    "selective_rollback_correction": false,
+    "offline_smoothing_replay": true,
+    "audio_blend_weight": 0,
+    "offline_archive_storage": "system_ram",
+    "model_aware_mode": "off",
+    "model_aware_risk_threshold": 0.65,
+    "model_aware_trust_shrinkage": false,
+    "model_aware_replay_generic_correction": false,
+    "generic_correction_mode": "coordinate_rls",
+    "generic_correction_limiter": "hard_clip",
+    "generic_correction_limit": 0.4,
+    "generic_correction_attenuation": "no_attenuation",
+    "sa_pece_forecast_policy": "balanced",
+    "model": [
+     "145",
+     0
+    ]
+   },
+   "class_type": "SpectrumApplyMiniMaxH3",
+   "_meta": {
+    "title": "Spectrum Apply MiniMax H3"
+   }
+  },
+  "150": {
+   "inputs": {
+    "max_resolution": 1024,
+    "jpeg_quality": 80,
+    "suppress_default_preview": true,
+    "preview_frames": 124,
+    "preview_fps": 12,
+    "tiny_vae": "taeh3madebyollin.safetensors",
+    "model": [
+     "154",
+     0
+    ]
+   },
+   "class_type": "ModelPreviewOverrideKJ",
+   "_meta": {
+    "title": "Model Preview Override"
+   }
+  },
+  "154": {
+   "inputs": {
+    "tau": 1.3,
+    "start_percent": 0.2,
+    "end_percent": 0.9,
+    "min_tokens": 4096,
+    "int8_qk": true,
+    "sink_conditioning": "exact_kv_and_rows",
+    "morton": false,
+    "morton_curve": "2d_frame",
+    "int8_pv": true,
+    "verbose": false,
+    "use_tma": false,
+    "dense_blocks": "",
+    "model": [
+     "149",
+     0
+    ]
+   },
+   "class_type": "SolAttnPatch",
+   "_meta": {
+    "title": "Patch Sol-Attn"
+   }
+  },
+  "901": {
+   "class_type": "LoadAudio",
+   "inputs": {
+    "audio": "{{audio_1}}"
+   },
+   "_meta": {
+    "title": "Load Audio (voice reference)"
+   }
+  },
+  "902": {
+   "class_type": "LoadImage",
+   "inputs": {
+    "image": "{{image_3}}"
+   },
+   "_meta": {
+    "title": "Load Image (face close-up)"
+   }
+  }
+ }
+}

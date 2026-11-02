@@ -5,7 +5,9 @@ the moment gpud asks for it. Each job kind maps to a handler `fn(spec, ctx) -> a
 a worker thread. The context gives the handler what a render has: `ctx.progress(fraction)`
 (only an increase renews the lease), `ctx.log(line)` for the log tail, `ctx.cancelled`, and
 `ctx.run(cmd)` for subprocesses (ffmpeg), which a cancel stops (SIGTERM, then SIGKILL: these are
-Foreman's own children, kept in gpud's process group so they die with it). A handler raises
+Foreman's own children, kept in gpud's process group so they die with it; a worker that starts
+children of its own runs with group=True, in a group of its own that is stopped whole, and must watch
+for its parent's death itself, as foreman/h3/worker.py does). A handler raises
 ContentFailure when the work itself cannot be done (gpud records Poll.reason "rejected", a content
 failure), InfraFailure when the host or the network is at fault (Poll.reason engine_error or
 engine_unconfigured: infrastructure, never charged to the template); any other exception is a
@@ -74,14 +76,21 @@ class LocalContext:
         with self._engine._lock:
             self._run.log.append(f"[local] {line}")
 
-    def run(self, cmd: list, timeout: float = 1800.0, cwd: str | None = None, heartbeat: float | None = None):
+    def run(self, cmd: list, timeout: float = 1800.0, cwd: str | None = None, heartbeat: float | None = None,
+            group: bool = False):
         """subprocess.run with capture, killed on cancel. `heartbeat` (seconds): while it runs,
         progress creeps toward the next tenth (bounded), so a long ffmpeg pass is not mistaken for a
-        stall but one that never ends still is."""
+        stall but one that never ends still is. `group`: the command starts children of its own (a
+        media worker running ffmpeg): it gets a session and process group of its own, and a cancel,
+        a timeout or its exit stops the whole group, so no grandchild outlives the step."""
         self.check()
-        # In gpud's own process group (no new session): when launchd stops or kills gpud's group,
-        # its ffmpeg goes with it instead of racing the retried step on the same files.
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd, stdin=subprocess.DEVNULL)
+        # Otherwise in gpud's own process group (no new session): when launchd stops or kills gpud's
+        # group, its ffmpeg goes with it instead of racing the retried step on the same files. A
+        # command with a group of its own is out of launchd's reach: it must notice gpud is gone (its
+        # parent changes) and stop its group itself.
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd, stdin=subprocess.DEVNULL,
+                                start_new_session=bool(group))
+        proc.foreman_group = bool(group)
         with self._engine._lock:
             self._run.procs.append(proc)
         t0 = time.monotonic()
@@ -94,6 +103,8 @@ class LocalContext:
                     out, err = out + (o or b""), err + (e or b"")
                     break
                 except subprocess.TimeoutExpired:
+                    if group and proc.poll() is not None:
+                        _kill_group(proc)  # it exited, and what it left running still holds its pipes
                     if self._run.cancel.is_set():
                         _stop(proc)
                         raise Cancelled("cancelled") from None
@@ -108,26 +119,47 @@ class LocalContext:
                                 self._run.progress = target
             return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
         finally:
+            if group:
+                _kill_group(proc)  # what it left running (it exited, or was stopped above)
             with self._engine._lock:
                 if proc in self._run.procs:
                     self._run.procs.remove(proc)
 
 
 def _stop(proc, wait_s: float = 5.0) -> None:
-    """SIGTERM a child of ours, then SIGKILL if it lingers (only that process: it shares gpud's
-    process group, so the group is never signalled)."""
+    """SIGTERM a child of ours, then SIGKILL if it lingers. A child in gpud's process group is
+    signalled alone (the group is gpud's); one started with a group of its own is signalled as
+    that group, its children included."""
+    group = getattr(proc, "foreman_group", False)
     for sig in (signal.SIGTERM, signal.SIGKILL):
         if proc.poll() is not None:
-            return
+            break
         try:
-            proc.send_signal(sig)
+            if group:
+                os.killpg(proc.pid, sig)
+            else:
+                proc.send_signal(sig)
         except OSError:
             pass
         try:
             proc.wait(timeout=wait_s)
-            return
+            break
         except subprocess.TimeoutExpired:
             continue
+    if group:
+        _kill_group(proc)
+
+
+def _kill_group(proc) -> None:
+    """SIGKILL whatever is left of the process group a child of ours leads. Only a group this
+    process started with its own session is signalled: its id is the child's pid, which is not
+    reused while any member of the group lives."""
+    if not getattr(proc, "foreman_group", False):
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
 
 
 class _Run:

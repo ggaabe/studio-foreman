@@ -841,14 +841,18 @@ def changed_share(a: bytes, b: bytes, width: int, rows: tuple, threshold: int = 
 
 
 def burned_in(ff: Ffmpeg, plain: str, final: str, width: int, height: int, caption_times: list,
-              label: bool) -> dict:
+              label: bool, rows: tuple | None = None) -> dict:
     """Did the captions and the label actually get drawn? Frames of the final cut are compared with
     the same frames of the cut before captions and label (drawtext or libass can fail silently: a
-    font libass cannot match, text drawtext would not render). Returns {"captions": share or None,
-    "label": share or None, "ok_captions", "ok_label"}."""
+    font libass cannot match, text drawtext would not render). `rows`: (top, bottom) as fractions of
+    the height where the sampled captions sit (default: the caption band above the bottom band).
+    Returns {"captions": share or None, "label": share or None, "ok_captions", "ok_label"}."""
     w = min(width, 360) // 2 * 2
     h = max(2, int(round(height * w / float(width)))) // 2 * 2
     cap_rows = (int((1 - SAFE_BOTTOM - 0.36) * h), int((1 - SAFE_BOTTOM + 0.02) * h))
+    if rows is not None:
+        top, bottom = max(0.0, float(rows[0])), min(1.0, float(rows[1]))
+        cap_rows = (int(top * h), max(int(top * h) + 1, int(round(bottom * h))))
     label_rows = (int((LABEL_Y - 0.01) * h), int((LABEL_Y + 2.8 * LABEL_SIZE + 0.01) * h))
     caps, labs = [], []
     for t in list(caption_times[:3]) or ([0.5] if label else []):

@@ -51,8 +51,12 @@ LOCAL = "foreman/local-cpu"                                             # CPU wo
 COMFYUI = "comfyui/graphs"                                              # an on-demand ComfyUI server
 LOCAL_ENGINE = "foreman-local"
 COMFY_ENGINE = "comfyui"
-# MiniMax-H3 derived; its license excludes US users. Never in the catalog, and the adapter
-# refuses anything matching it even if someone adds it.
+# mlx-serve builds derived from MiniMax H3 (FastH3): never in the catalog, and the mlx-serve adapter
+# refuses any model id matching these even if someone adds one. This guards model ids only. The
+# ComfyUI H3 graph of the h3 talk chain is gated by its graph template instead: the wrapper's
+# `license` (required) and `commercial_ok` (required true for a commercial template), which the
+# owner writes after reading the MiniMax H3 license (it excludes some territories, the US among
+# them, and asks for attribution: README, "H3 talking shots"). Whether it runs is the owner's call.
 FORBIDDEN = ("FastH3", "MiniMax-H3")
 # Models whose licenses allow commercial use of their output (Kokoro Apache-2.0, ACE-Step MIT,
 # LTX-2.x community license below its revenue threshold). The planner refuses to route a
