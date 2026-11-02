@@ -12,7 +12,7 @@
 The planner's loop (see README "Planner"):
 
     python3 -m foreman.cli review [--all]                 items awaiting your verdict, with their files
-    python3 -m foreman.cli verdict JOB accept|reject [--minutes M] [--note TEXT]
+    python3 -m foreman.cli verdict JOB accept|reject [--minutes M] [--note TEXT] [--tags voice,pacing]
     python3 -m foreman.cli verdict JOB retract [--note TEXT]   undo a verdict given by mistake
     python3 -m foreman.cli ship JOB [--usd X]             you used it (and what it earned)
     python3 -m foreman.cli resolve [PAGE ...] [--note TEXT]   close pages (no id: list open pages)
@@ -199,6 +199,7 @@ def cmd_review(cfg, show_all: bool) -> None:
         now = sup._now()
         queue = ledger.review_queue(sup.store)
         recent = [i for i in ledger.items(sup.store) if i["state"] != "review"][-15:] if show_all else []
+        tags = ledger.reject_tag_counts(sup.store)
     finally:
         sup.close()
     if not queue:
@@ -216,30 +217,39 @@ def cmd_review(cfg, show_all: bool) -> None:
                   + (f": {_p(it['brain_note'], 200)}" if it.get("brain_note") else ""))
         for label, path in _files(it.get("artifacts")):
             print(f"    {label:<4} {_p(path)}")
-        print(f"    -> python3 -m foreman.cli verdict {it['job_id']} accept|reject [--minutes M] [--note TEXT]")
+        print(f"    -> python3 -m foreman.cli verdict {it['job_id']} accept|reject [--minutes M] [--note TEXT] "
+              "[--tags voice,pacing]")
     for it in recent:
         extra = it.get("verdict_note") or it.get("fail_reason") or ""
         print(f"  [{it['state']:<8}] job {it['job_id']:<5} {_p(it['template_id'], 80)}: {_p(it['brief'], 80)}"
               + (f"  ({_p(extra, 80)})" if extra else ""))
         if it["state"] == "failed" and it.get("count_note"):
             print(f"             {it.get('fail_class') or '?'} failure; {_p(it['count_note'], 200)}")
+    tagged = {tid: c for tid, c in sorted(tags.items()) if c["tagged"]}
+    if tagged:  # what the owner said was wrong with the rejects that stand, per template
+        print("reject reasons by template:")
+        for tid, c in tagged.items():
+            print(f"  {_p(tid, 80)}: {ledger.tag_summary(c)}")
 
 
 # The owner's actions, without printing. The phone service (foreman/phone.py) records verdicts,
 # retracts, shipments, notes and page resolutions through these same functions, so both paths
 # share the ledger's validation, its events (the phone's carry by="phone") and the kill criteria.
 
-def apply_verdict(cfg, job_id: int, verdict: str, minutes=None, note=None, by=None) -> dict:
-    """accept | reject | retract. Returns {"item", "p_ship", "killed"}; raises ledger.LedgerError."""
+def apply_verdict(cfg, job_id: int, verdict: str, minutes=None, note=None, by=None, tags=None) -> dict:
+    """accept | reject | retract. `tags`: a reject's reasons (ledger.parse_tags). Returns {"item",
+    "p_ship", "killed"}; raises ledger.LedgerError."""
     templates, _ = _templates(cfg)
     sup = _client(cfg)
     try:
         now = sup._now()
         if verdict == "retract":
+            if tags:
+                raise ledger.LedgerError("a retract takes no reason tags")
             it = ledger.retract_verdict(sup.store, job_id, note, now, by=by)
             killed = []
         else:
-            it = ledger.record_verdict(sup.store, job_id, verdict, minutes, note, now, by=by)
+            it = ledger.record_verdict(sup.store, job_id, verdict, minutes, note, now, by=by, tags=tags)
             killed = ledger.kill_check(sup.store, templates, now, cfg.planner_config()) if templates else []
         t = templates.get(it["template_id"])
         p = ledger.posterior(t, ledger.items(sup.store, template=t.id))[2] if t else None
@@ -252,6 +262,15 @@ def apply_ship(cfg, job_id: int, usd=None, by=None) -> dict:
     sup = _client(cfg)
     try:
         return ledger.record_ship(sup.store, job_id, usd, sup._now(), by=by)
+    finally:
+        sup.close()
+
+
+def apply_tags(cfg, job_id: int, tags, by=None) -> dict:
+    """Set the reasons of a reject already recorded (ledger.tag_verdict: idempotent)."""
+    sup = _client(cfg)
+    try:
+        return ledger.tag_verdict(sup.store, job_id, tags, sup._now(), by=by)
     finally:
         sup.close()
 
@@ -290,15 +309,34 @@ def apply_planner(cfg, action: str, note=None) -> dict:
         sup.close()
 
 
-def cmd_verdict(cfg, job_id: int, verdict: str, minutes, note) -> None:
-    res = apply_verdict(cfg, job_id, verdict, minutes, note)
+def cmd_verdict(cfg, job_id: int, verdict: str, minutes, note, tags=None) -> None:
+    if tags is not None:  # the reasons for a reject: with the verdict, or added to one already recorded
+        tags = ledger.parse_tags(tags)
+        if not tags:
+            raise ledger.LedgerError("--tags needs one or more of: " + ", ".join(t for t, _n in ledger.REASON_TAGS))
+        if verdict != "reject":
+            raise ledger.LedgerError("--tags gives the reasons for a reject (verdict JOB reject --tags voice,pacing)")
+        sup = _client(cfg)
+        try:
+            cur = ledger.item_for_job(sup.store, job_id)
+        finally:
+            sup.close()
+        if cur is not None and cur["state"] == "rejected":
+            if minutes is not None or note is not None:
+                raise ledger.LedgerError(f"job {job_id} is already rejected: only --tags can be added to its verdict")
+            it = apply_tags(cfg, job_id, tags)
+            print(f"job {job_id}: reasons recorded for its reject ({_p(it['template_id'], 80)}): "
+                  + ", ".join(ledger.TAG_NAMES[t] for t in it["verdict_tags"] or []))
+            return
+    res = apply_verdict(cfg, job_id, verdict, minutes, note, tags=tags)
     it, p = res["item"], res["p_ship"]
     if verdict == "retract":
         print(f"job {job_id}: verdict retracted; {_p(it['template_id'], 80)} item back in the review queue"
               + (f"; P(ship) is now {p:.2f}" if p is not None else ""))
         return
     print(f"job {job_id}: {verdict} recorded for {it['template_id']} ({it['verdict_minutes']:g} review min)"
-          + (f"; P(ship) is now {p:.2f}" if p is not None else ""))
+          + (f"; P(ship) is now {p:.2f}" if p is not None else "")
+          + (f"; {ledger.reasons_text(it['verdict_tags'])}" if it.get("verdict_tags") else ""))
     for tid, reason, detail in res["killed"]:
         print(f"template {tid} paused by a kill criterion: {reason} ({detail})")
 
@@ -613,6 +651,8 @@ def main(argv=None) -> int:
     vd.add_argument("verdict", choices=("accept", "reject", "retract"))
     vd.add_argument("--minutes", type=float, help="review minutes you spent (default: the template's estimate)")
     vd.add_argument("--note")
+    vd.add_argument("--tags", help="reject: what was wrong, comma-separated (" + ", ".join(
+        t for t, _n in ledger.REASON_TAGS) + "); on a rejected item, sets its reasons")
     sh = sub.add_parser("ship", help="record that an accepted item was used")
     sh.add_argument("job_id", type=int)
     sh.add_argument("--usd", type=float, help="what it earned (default: the template's value_usd)")
@@ -696,7 +736,7 @@ def main(argv=None) -> int:
         elif args.cmd == "review":
             cmd_review(cfg, args.all)
         elif args.cmd == "verdict":
-            cmd_verdict(cfg, args.job_id, args.verdict, args.minutes, args.note)
+            cmd_verdict(cfg, args.job_id, args.verdict, args.minutes, args.note, args.tags)
         elif args.cmd == "ship":
             cmd_ship(cfg, args.job_id, args.usd)
         elif args.cmd == "resolve":

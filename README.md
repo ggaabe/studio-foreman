@@ -804,6 +804,7 @@ gives a verdict, which is the only thing that teaches the planner anything:
 ```bash
 python3 -m foreman.cli review [--all]                     # items awaiting a verdict: brief, brain note, MP4/WAV/PNG paths
 python3 -m foreman.cli verdict 41 accept --minutes 3      # or reject; --note TEXT; minutes default to the template's estimate
+python3 -m foreman.cli verdict 41 reject --tags voice,pacing   # what was wrong ("Reasons for a reject")
 python3 -m foreman.cli verdict 41 retract                 # undo a mistaken verdict (not after ship or pruning)
 python3 -m foreman.cli ship 41 --usd 60                   # you used it (usd defaults to the template's value_usd)
 python3 -m foreman.cli resolve                            # list open pages; resolve 12 13 --note "old scenario tests"
@@ -825,7 +826,8 @@ queue; P(ship) and the kill criteria are computed from the items, so they forget
 a `verdict_retracted` event follows the original one in the log. The scoreboard
 lists, per template, what was admitted, produced, passed by the brain, accepted, rejected and
 shipped, with dollars, review minutes, GPU-hours, P(ship) and failures split
-infrastructure/content (and how many infrastructure failures did not count); then GPU-hours and
+infrastructure/content (and how many infrastructure failures did not count); the owner's reasons
+for the rejects (reason tags per template); then GPU-hours and
 the idle share, the five biggest GPU sinks nobody used (items still awaiting a verdict, or still
 in flight, are not sinks yet), rejections by reason code, paused templates and the planner's
 ideas.
@@ -1153,8 +1155,23 @@ previews are off, and the caption stays inside Telegram's 1024 characters.
 
 - **Approve / Reject** record `verdict JOB accept|reject` (the review minutes default to the
   item's estimate, as on the CLI). After Approve the message offers **Used it** (`ship JOB`, at the
-  template's value) and **Undo** (`verdict JOB retract`); after Reject, **Undo**. The answer shows
-  the new P(ship); a template a kill criterion paused is announced in the chat.
+  template's value) and **Undo** (`verdict JOB retract`); after Reject, the reasons (below), then
+  **Undo**. The answer shows the new P(ship); a template a kill criterion paused is announced in
+  the chat.
+- **Reasons for a reject.** Reject records the verdict exactly as before (once, the same
+  `verdict JOB reject`); then the message's buttons ask what was wrong: **Script, Voice,
+  Pronunciation, Music, Lip-sync, Faces/consistency, Stills, Motion, B-roll, Captions/text, Pacing,
+  End card, Other**, then **Done** and **Undo**. A tap toggles a reason (a check mark shows it) and
+  only changes the message; **Done** stores the picked reasons with the verdict (the ledger's
+  `verdict_tags`, and "reasons: voice, pacing" appended to the verdict note; a `verdict_tagged`
+  event) and the message goes back to **Undo**, which also clears them. Done with nothing picked
+  stores nothing. A tap on an older drawing of the buttons (a double tap, or a tap before the last
+  edit reached the phone) changes nothing and says so; the buttons on screen keep working. An Undo,
+  a retract on the CLI or the pruning ends the picking, and its buttons do nothing after it. On the
+  CLI, `verdict JOB reject --tags voice,pacing` gives them with the verdict (on an item already
+  rejected, it sets them). `review` and `report` show the reasons per template, and
+  `ledger.reject_tag_counts` counts them for the planner to read later (the planner's prompt does
+  not carry them yet). `"reject_tags": false` in `phone_options` turns the question off.
 - The message's status line and buttons follow the item: a verdict, retract or pruning done
   elsewhere (the CLI, retention) redraws it within a minute (`refresh_s`).
 - **A reply to a draft** adds a note: kept until the verdict while the draft waits, added to the
@@ -1191,14 +1208,15 @@ previews are off, and the caption stays inside Telegram's 1024 characters.
   any bot, and every update type other than a message or a button press get no reply and are
   logged without their content.
 - **Signed buttons.** Button data is about 40 bytes: the action, the draft or page, the message's
-  issue counter and a 96-bit HMAC-SHA256 over them and the chat id, keyed by the pairing (a new key
-  at every pairing and unpairing). Forged or garbled data, data from an earlier pairing, a press on
-  an older copy, a press on an older drawing of the buttons (the counter moved on) or on an item
-  whose state changed meanwhile records nothing: it is answered with what happened and the message
-  is redrawn for the current state. Only the canonical spelling of the data verifies (no leading
-  zeros, nothing after the MAC). Every send, a resend after a crash included, draws a new issue, so
-  two copies never carry the same data. The ledger's compare-and-set states are the last guard, so
-  a double tap or a race with the CLI records one verdict.
+  issue counter (a reason toggle also its reason's letter) and a 96-bit HMAC-SHA256 over them and
+  the chat id, keyed by the pairing (a new key at every pairing and unpairing). Forged or garbled
+  data, data from an earlier pairing, a press on an older copy, a press on an older drawing of the
+  buttons (the counter moved on) or on an item whose state changed meanwhile records nothing: it is
+  answered with what happened and the message is redrawn for the current state. Only the canonical
+  spelling of the data verifies (no leading zeros, nothing after the MAC). Every send, a resend
+  after a crash included, draws a new issue, so two copies never carry the same data. The ledger's
+  compare-and-set states are the last guard, so a double tap or a race with the CLI records one
+  verdict.
 - **Files.** Only regular files strictly inside the artifacts directory are uploaded (resolved;
   never a symlink, never a file with a second hard link). The upload opens the file itself without
   following links and checks it is the very file that was checked (device and inode), so a file
@@ -1254,6 +1272,9 @@ for example `{"phone_options": {"digest": true, "digest_hour": 8, "pages": false
 - A note replied before a verdict that is then given on the CLI stays with the phone: it only goes
   with a verdict given by button.
 - A press is answered after the verdict is recorded; while Telegram is slow the button spins.
+- Reasons picked after a Reject are kept on the message until Done: reasons left without Done are
+  not stored (the verdict is). Each toggle redraws the buttons, so a second reason tapped before
+  the first edit reached the phone is not counted (its answer says so; tap it again).
 - Defusing host-shaped text in briefs and notes is deliberately broad: a word like `Node.js` or
   `final.mix` becomes `[link removed]` (Telegram links about 1500 TLDs, and that list changes); a
   few file extensions that are no TLD (`json`, `wav`, `png`, ...) are kept.

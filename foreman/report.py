@@ -3,7 +3,8 @@ cost. Markdown, written under $FOREMAN_HOME/reports/ (never into the repository)
 
 Per template: produced, passed by the brain, accepted and rejected by the owner, failed (split
 into infrastructure and content failures: only content failures count against the caps), shipped,
-dollars, review minutes, GPU-hours, P(ship). Then GPU-hours and the idle share, the biggest GPU
+dollars, review minutes, GPU-hours, P(ship); the owner's reasons for the window's rejects (reason
+tags, counted per template). Then GPU-hours and the idle share, the biggest GPU
 sinks that nobody used (items still awaiting a verdict or still in flight are not sinks yet),
 rejections by reason code, templates paused by the kill criteria, and the planner's ideas for new
 templates.
@@ -80,6 +81,19 @@ def build(store, templates: dict, now: float, wall: float, days: float = 7.0, cf
     total_min = sum(stats[t][key]["review_min"] for t in stats)
     out += ["", f"Shipped value ${total_usd:.2f} for {total_min:g} review minutes"
             + (f" (${total_usd / total_min:.2f} per minute)." if total_min else "."), ""]
+    tags = ledger.reject_tag_counts(store, since=lo)
+    out += ["## Reject reasons", "",
+            "What you said was wrong with the rejects given in the window (the phone's reason tags, "
+            "`verdict JOB reject --tags`).", ""]
+    if tags:
+        out += ["| template | rejected | tagged | reasons |", "|---|---|---|---|"]
+        for tid, c in sorted(tags.items()):
+            reasons = ", ".join(f"{ledger.TAG_NAMES[t]} {n}" for t, n in sorted(
+                c["tags"].items(), key=lambda x: -x[1])) or "-"
+            out.append(f"| {_cell(tid)} | {c['rejected']} | {c['tagged']} | {_cell(reasons)} |")
+    else:
+        out.append("None.")
+    out.append("")
     idle = 1.0 - gpu["total"] / span if span > 0 else 1.0
     out += ["## GPU", "",
             f"- GPU-hours: {_h(gpu['total'])} (planner items {_h(planner_s)}, plan ticks {_h(plan_s)}, "

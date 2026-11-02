@@ -30,6 +30,11 @@ infra_budget_week), after which it counts again so a persistently failing enviro
 recycle the same slots forever. Each failed item records whether it counted and why (counted,
 count_note). An uncounted infrastructure failure produced nothing, so its brief may be proposed
 again (its row keeps its history under a retired content hash).
+
+A reject can carry the owner's reasons (verdict_tags: ids from REASON_TAGS, picked on the phone
+after Reject or given as `verdict JOB reject --tags voice,pacing`), also appended to the verdict
+note in readable form ("reasons: voice, pacing"). They describe what was wrong; they do not move
+P(ship) or the kill criteria. reject_tag_counts() counts them per template.
 """
 from __future__ import annotations
 
@@ -63,6 +68,8 @@ def _item(row) -> dict:
     for k in ITEM_JSON:
         if d.get(k) is not None:
             d[k] = json.loads(d[k])
+    if "verdict_tags" in d:
+        d["verdict_tags"] = _stored_tags(d["verdict_tags"])
     return d
 
 
@@ -396,6 +403,85 @@ class LedgerError(ValueError):
     pass
 
 
+# The owner's reasons for a reject, in the order the phone shows them: (the id kept in
+# verdict_tags, its readable name). Ids are stable: stored rows and signed buttons name them.
+REASON_TAGS = (("script", "script"), ("voice", "voice"), ("pronunciation", "pronunciation"), ("music", "music"),
+               ("lipsync", "lip-sync"), ("faces", "faces/consistency"), ("stills", "stills"), ("motion", "motion"),
+               ("broll", "B-roll"), ("captions", "captions/text"), ("pacing", "pacing"), ("endcard", "end card"),
+               ("other", "other"))
+TAG_NAMES = dict(REASON_TAGS)
+_TAG_ORDER = {t: i for i, (t, _n) in enumerate(REASON_TAGS)}
+# Other spellings `--tags` accepts (after lower-casing and dropping spaces, '-', '_' and '/').
+_TAG_ALIASES = {"facesconsistency": "faces", "face": "faces", "consistency": "faces", "captionstext": "captions",
+                "caption": "captions", "text": "captions", "subtitles": "captions", "lips": "lipsync",
+                "lipsynch": "lipsync", "still": "stills", "endcards": "endcard", "card": "endcard"}
+
+
+def _tag_id(name) -> str | None:
+    if not isinstance(name, str):
+        return None
+    key = "".join(ch for ch in name.strip().lower() if ch not in " -_/")
+    key = _TAG_ALIASES.get(key, key)
+    return key if key in TAG_NAMES else None
+
+
+def parse_tags(value) -> list:
+    """Reason tags in REASON_TAGS order without repeats, from a list of names or one comma-separated
+    string ('voice, Lip-sync, b-roll'). An unknown name is a LedgerError naming the known ones."""
+    if value is None:
+        return []
+    parts = value.split(",") if isinstance(value, str) else list(value)
+    out, bad = set(), []
+    for p in parts:
+        if isinstance(p, str) and not p.strip():
+            continue
+        t = _tag_id(p)
+        if t is None:
+            bad.append(str(p)[:40])
+        else:
+            out.add(t)
+    if bad:
+        raise LedgerError(f"unknown reason tag(s) {bad}; known: {', '.join(t for t, _n in REASON_TAGS)}")
+    return sorted(out, key=_TAG_ORDER.get)
+
+
+def _stored_tags(raw) -> list | None:
+    """verdict_tags as stored (JSON text) to a list of known tags; anything else reads as none."""
+    if raw is None:
+        return None
+    try:
+        v = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        return None
+    if not isinstance(v, list):
+        return None
+    tags = sorted({t for t in v if isinstance(t, str) and t in TAG_NAMES}, key=_TAG_ORDER.get)
+    return tags or None
+
+
+def reasons_text(tags) -> str:
+    """The readable form of reason tags, as appended to the verdict note: 'reasons: voice, pacing'."""
+    return "reasons: " + ", ".join(TAG_NAMES[t] for t in tags)
+
+
+def _note_with_reasons(note, old_tags, tags) -> str | None:
+    """The verdict note with its readable reasons replaced. A note is ' | '-joined parts (the
+    owner's notes, then the reasons): the part naming the old reasons is dropped and the new one
+    appended, kept whole within NOTE_MAX (the owner's text is shortened instead)."""
+    parts = [p for p in (note or "").split(" | ") if p]
+    if old_tags:
+        old = reasons_text(old_tags)
+        parts = [p for p in parts if p != old]
+    base = " | ".join(parts)
+    if not tags:
+        return base or None
+    r = reasons_text(tags)
+    if not base:
+        return r[:NOTE_MAX]
+    room = NOTE_MAX - len(r) - 3
+    return f"{base[:room].rstrip()} | {r}" if room > 0 else r[:NOTE_MAX]
+
+
 def _item_or_raise(store, job_id: int) -> dict:
     it = item_for_job(store, job_id)
     if it is None:
@@ -422,21 +508,28 @@ def resolve_page(store, page_id: int, note: str | None, now: float, by: str | No
 
 
 def record_verdict(store, job_id: int, verdict: str, minutes: float | None, note: str | None, now: float,
-                   by: str | None = None) -> dict:
+                   by: str | None = None, tags=None) -> dict:
+    """`tags`: the reasons for a reject (parse_tags), kept in verdict_tags and appended to the note."""
     if verdict not in ("accept", "reject"):
         raise LedgerError("a verdict is accept or reject")
     if minutes is not None and (number(minutes) is None or minutes < 0 or minutes > 600):
         raise LedgerError("--minutes must be a number between 0 and 600")
+    tags = parse_tags(tags)
+    if tags and verdict != "reject":
+        raise LedgerError("reason tags say what was wrong: they go with a reject, not an accept")
     it = _item_or_raise(store, job_id)
     if it["state"] != "review":
         raise LedgerError(f"item {it['id']} (job {it['job_id']}) is {it['state']}, not awaiting a verdict")
     mins = float(it["review_minutes"] or 0.0) if minutes is None else float(minutes)
+    if tags:
+        note = _note_with_reasons(note, None, tags)
     with store.tx():
         if not update_item(store, it["id"], expect_state="review", state="accepted" if verdict == "accept" else "rejected",
-                           verdict=verdict, verdict_at=now, verdict_minutes=mins, verdict_note=note):
+                           verdict=verdict, verdict_at=now, verdict_minutes=mins, verdict_note=note,
+                           verdict_tags=json.dumps(tags) if tags else None):
             raise LedgerError(f"item {it['id']} changed while recording the verdict; try again")
         store.event(now, "verdict_recorded", it["job_id"], item=it["id"], template=it["template_id"],
-                    verdict=verdict, minutes=mins, **_by(by))
+                    verdict=verdict, minutes=mins, **({"tags": tags} if tags else {}), **_by(by))
         if it.get("review_job_id"):  # the brain asked for a person about this item: that is this verdict
             for page in store.children(it["review_job_id"]):
                 if page.requires == "human" and page.state == "awaiting_human":
@@ -461,7 +554,7 @@ def retract_verdict(store, job_id: int, note: str | None, now: float, by: str | 
         raise LedgerError(f"item {it['id']} (job {it['job_id']}) was rejected and its files are already pruned")
     with store.tx():
         if not update_item(store, it["id"], expect_state=it["state"], state="review", verdict=None, verdict_at=None,
-                           verdict_minutes=None, verdict_note=None):
+                           verdict_minutes=None, verdict_note=None, verdict_tags=None):
             raise LedgerError(f"item {it['id']} changed while retracting the verdict; try again")
         store.event(now, "verdict_retracted", it["job_id"], item=it["id"], template=it["template_id"],
                     retracted=it.get("verdict"), note=note, **_by(by))
@@ -506,6 +599,57 @@ def annotate_verdict(store, job_id: int, note: str, now: float, window_s: float,
 
 def _noted(store, job_id: int, ref: str) -> bool:
     return any(e["data"].get("ref") == ref for e in store.events("verdict_noted", job_id))
+
+
+def tag_verdict(store, job_id: int, tags, now: float, by: str | None = None) -> dict:
+    """Set the reasons of a reject already recorded (the phone's Done after Reject, or `verdict JOB
+    reject --tags` on a rejected item): verdict_tags, and the note's readable reasons replaced. The
+    verdict itself, P(ship) and the kill criteria are unchanged; a verdict_tagged event records it.
+    Idempotent: the same tags again (a Done delivered twice) change nothing and log nothing."""
+    tags = parse_tags(tags)
+    it = _item_or_raise(store, job_id)
+    with store.tx():
+        it = item(store, it["id"])
+        if it["state"] != "rejected" or it.get("verdict") != "reject":
+            raise LedgerError(f"item {it['id']} (job {it['job_id']}) is {it['state']}: reasons go with a rejected item")
+        old = it.get("verdict_tags") or []
+        if old == tags:
+            return it
+        note = _note_with_reasons(it.get("verdict_note"), old, tags)
+        if not update_item(store, it["id"], expect_state="rejected", verdict_tags=json.dumps(tags) if tags else None,
+                           verdict_note=note):
+            raise LedgerError(f"item {it['id']} changed while recording its reasons; try again")
+        store.event(now, "verdict_tagged", it["job_id"], item=it["id"], template=it["template_id"], tags=tags,
+                    **_by(by))
+    return item(store, it["id"])
+
+
+def reject_tag_counts(store, template: str | None = None, since: float | None = None) -> dict:
+    """{template_id: {"rejected": n, "tagged": m, "tags": {tag: count}}} over the items whose
+    standing verdict is a reject (verdict_at >= since when given); tags in REASON_TAGS order, only
+    those given at least once. What the owner said was wrong, for the planner and the reports."""
+    out: dict = {}
+    for it in items(store, template=template):
+        if it.get("verdict") != "reject" or (since is not None and (it.get("verdict_at") is None
+                                                                    or it["verdict_at"] < since)):
+            continue
+        d = out.setdefault(it["template_id"], {"rejected": 0, "tagged": 0, "tags": {}})
+        d["rejected"] += 1
+        tags = it.get("verdict_tags") or []
+        if tags:
+            d["tagged"] += 1
+        for t in tags:
+            d["tags"][t] = d["tags"].get(t, 0) + 1
+    for d in out.values():
+        d["tags"] = {t: d["tags"][t] for t in sorted(d["tags"], key=_TAG_ORDER.get)}
+    return out
+
+
+def tag_summary(counts: dict) -> str:
+    """'voice 3, pacing 2 (4 of 6 rejects tagged)' for one template's reject_tag_counts entry."""
+    tags = sorted(counts["tags"].items(), key=lambda x: (-x[1], _TAG_ORDER[x[0]]))
+    text = ", ".join(f"{TAG_NAMES[t]} {n}" for t, n in tags) or "no reasons given"
+    return f"{text} ({counts['tagged']} of {counts['rejected']} reject(s) tagged)"
 
 
 def record_ship(store, job_id: int, usd: float | None, now: float, by: str | None = None) -> dict:
@@ -553,7 +697,13 @@ def template_stats(store, templates: dict, now: float, gpu_by_root: dict | None 
                                        if i["created_at"] >= lo) / 3600.0, 3)}
         t = templates.get(tid)
         post = posterior(t, its) if t is not None else None
+        tag_n: dict = {}
+        for i in its:
+            if i.get("verdict") == "reject":
+                for tag in i.get("verdict_tags") or []:
+                    tag_n[tag] = tag_n.get(tag, 0) + 1
         out[tid] = {"7d": window(7), "28d": window(28),
+                    "reject_tags": {tag: tag_n[tag] for tag in sorted(tag_n, key=_TAG_ORDER.get)},
                     "stock": sum(1 for i in its if i["state"] in STOCK_STATES),
                     "week": sum(1 for i in its if i["created_at"] >= now - 7 * DAY and counted(i)),
                     "awaiting_review": sum(1 for i in its if i["state"] == "review"),

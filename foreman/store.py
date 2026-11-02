@@ -204,6 +204,7 @@ CREATE TABLE IF NOT EXISTS plan_items (
   verdict_at      REAL,
   verdict_minutes REAL,
   verdict_note    TEXT,
+  verdict_tags    TEXT,                          -- a reject's reasons: JSON list of ledger.REASON_TAGS ids (NULL: none)
   shipped_at      REAL,
   usd             REAL,
   pruned_at       REAL
@@ -254,6 +255,7 @@ CREATE TABLE IF NOT EXISTS phone_messages (
   acted_at    REAL,
   note        TEXT,                              -- a reply that waits for the verdict
   note_ids    TEXT NOT NULL DEFAULT '[]',        -- the replies already in `note` (a redelivery adds nothing)
+  tags        TEXT,                              -- reasons being picked after a Reject (JSON; NULL: not picking)
   attempts    INTEGER NOT NULL DEFAULT 0,
   next_try_at REAL,
   error       TEXT,
@@ -294,8 +296,8 @@ _MIGRATIONS = {
     "planner_state": [("engine_fail_streak", "INTEGER NOT NULL DEFAULT 0")],
     "model_owners": [("server_id", "TEXT")],
     "plan_items": [("reserved_slot", "INTEGER NOT NULL DEFAULT 0"), ("fail_class", "TEXT"), ("counted", "INTEGER"),
-                   ("count_note", "TEXT")],
-    "phone_messages": [("note_ids", "TEXT NOT NULL DEFAULT '[]'")],
+                   ("count_note", "TEXT"), ("verdict_tags", "TEXT")],
+    "phone_messages": [("note_ids", "TEXT NOT NULL DEFAULT '[]'"), ("tags", "TEXT")],
     "phone_state": [("pair_id", "TEXT"), ("bot_id", "INTEGER")],
 }
 

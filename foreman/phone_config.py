@@ -77,6 +77,7 @@ class PhoneConfig:
     transcode_timeout_s: float = 120.0
     hint_every_s: float = 600.0       # at most one polite answer to text it does not understand per this
     resend_max: int = 20              # /queue and `phone resend`: at most this many messages
+    reject_tags: bool = True          # after Reject, the buttons ask what was wrong (reason tags, then Done)
 
     @classmethod
     def from_dict(cls, data) -> "PhoneConfig":

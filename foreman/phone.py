@@ -19,7 +19,8 @@ What it sends to the paired chat, each exactly once (the phone_messages table, U
     frame as a document; speech and music as an M4A (ffmpeg) for sendAudio, else the WAV as a
     document; nothing above the Bot API's 50 MB upload limit; text only when the files are gone.
     The caption is plain text (no parse_mode): template, job, the brief, the brain's note, review
-    minutes. Buttons: Approve / Reject; then Used it / Undo, or Undo.
+    minutes. Buttons: Approve / Reject; then Used it / Undo, or after Reject the reason tags (what
+    was wrong: voice, pacing, ...) with Done and Undo, then Undo.
   * every page (human_review, engine_lost, SAFE mode, planner suspended, ...) with a Resolve button;
   * optionally (off by default) a daily digest.
 
@@ -612,10 +613,18 @@ def pairing_open(d: dict | None, now: float) -> bool:
 
 # ---------------------------------------------------------------- signed callback data
 
-ACTIONS = {"a": "approve", "r": "reject", "u": "used", "z": "undo", "s": "resolve"}
+ACTIONS = {"a": "approve", "r": "reject", "u": "used", "z": "undo", "s": "resolve", "t": "tag", "k": "done"}
 KINDS = {"d": "draft", "p": "page"}
-# Canonical spellings only (no leading zeros, nothing after the MAC): one button, one string.
-_DATA_RE = re.compile(r"([aruzs])([dp])(0|[1-9a-z][0-9a-z]{0,11})\.(0|[1-9a-z][0-9a-z]{0,7})\.([A-Za-z0-9_-]{16})")
+# The reason tags offered after Reject (ledger.REASON_TAGS), one letter each in the button data.
+# Fixed letters, not positions: a button always names the tag it was drawn for.
+TAG_CODES = {"a": "script", "b": "voice", "c": "pronunciation", "d": "music", "e": "lipsync", "f": "faces",
+             "g": "stills", "h": "motion", "i": "broll", "j": "captions", "k": "pacing", "l": "endcard", "m": "other"}
+TAG_LETTERS = {v: k for k, v in TAG_CODES.items()}
+assert set(TAG_LETTERS) == set(ledger.TAG_NAMES), "every reason tag has a button letter"
+# Canonical spellings only (no leading zeros, nothing after the MAC): one button, one string. A tag
+# toggle (action t) carries its tag's letter before the MAC; no other action carries one.
+_DATA_RE = re.compile(r"([aruzstk])([dp])(0|[1-9a-z][0-9a-z]{0,11})\.(0|[1-9a-z][0-9a-z]{0,7})\.(?:([a-z])\.)?"
+                      r"([A-Za-z0-9_-]{16})")
 
 
 def _b36(n: int) -> str:
@@ -630,31 +639,36 @@ def _b36(n: int) -> str:
     return out
 
 
-def _sig(key: str, chat_id, action: str, kind: str, ref: int, issue: int) -> str:
-    msg = f"{chat_id}|{action}{kind}{ref}|{issue}".encode()
-    return base64.urlsafe_b64encode(hmac.new(bytes.fromhex(key), msg, hashlib.sha256).digest()[:12]).decode()
+def _sig(key: str, chat_id, action: str, kind: str, ref: int, issue: int, tag: str | None = None) -> str:
+    msg = f"{chat_id}|{action}{kind}{ref}|{issue}" + (f"|{tag}" if tag else "")
+    return base64.urlsafe_b64encode(hmac.new(bytes.fromhex(key), msg.encode(), hashlib.sha256).digest()[:12]).decode()
 
 
-def make_data(key: str, chat_id, action: str, kind: str, ref: int, issue: int) -> str:
-    """At most about 40 bytes (Telegram allows 64): action, kind, id and issue in base 36, then a
-    96-bit HMAC over them and the chat id."""
-    return f"{action}{kind}{_b36(ref)}.{_b36(issue)}.{_sig(key, chat_id, action, kind, ref, issue)}"
+def make_data(key: str, chat_id, action: str, kind: str, ref: int, issue: int, tag: str | None = None) -> str:
+    """At most about 42 bytes (Telegram allows 64): action, kind, id and issue in base 36, a tag
+    toggle's tag letter (TAG_CODES), then a 96-bit HMAC over all of them and the chat id."""
+    return (f"{action}{kind}{_b36(ref)}.{_b36(issue)}." + (f"{tag}." if tag else "")
+            + _sig(key, chat_id, action, kind, ref, issue, tag))
 
 
 def parse_data(key: str, chat_id, data) -> tuple | None:
-    """(action, kind, ref, issue) for data this pairing signed, else None (forged, garbled, from an
-    earlier pairing, or for an action that does not exist on that kind)."""
+    """(action, kind, ref, issue, tag) for data this pairing signed, else None (forged, garbled,
+    from an earlier pairing, or for an action that does not exist on that kind). `tag` is the
+    reason tag a toggle names (ledger.REASON_TAGS), None for every other action."""
     if not isinstance(data, str) or len(data) > 64 or not key:
         return None
     m = _DATA_RE.fullmatch(data)
     if not m:
         return None
-    action, kind, ref, issue, sig = m.group(1), m.group(2), int(m.group(3), 36), int(m.group(4), 36), m.group(5)
+    action, kind, ref, issue = m.group(1), m.group(2), int(m.group(3), 36), int(m.group(4), 36)
+    letter, sig = m.group(5), m.group(6)
     if (kind == "p") != (action == "s"):
         return None
-    if not hmac.compare_digest(sig, _sig(key, chat_id, action, kind, ref, issue)):
+    if (action == "t") != (letter is not None) or (letter is not None and letter not in TAG_CODES):
         return None
-    return ACTIONS[action], KINDS[kind], ref, issue
+    if not hmac.compare_digest(sig, _sig(key, chat_id, action, kind, ref, issue, letter)):
+        return None
+    return ACTIONS[action], KINDS[kind], ref, issue, (TAG_CODES[letter] if letter else None)
 
 
 # ---------------------------------------------------------------- captions (plain text, never parse_mode)
@@ -807,14 +821,38 @@ DRAFT_STATUS = {"accepted": "Approved. Tap Used it once you have used it.", "rej
 DESCRIBE = {"review": "waiting for your verdict", "accepted": "approved", "rejected": "rejected",
             "rejected-pruned": "rejected and pruned", "shipped": "used", "expired": "expired", "failed": "failed",
             "gone": "gone", "awaiting_human": "open", "resolved": "resolved"}
-ALLOWED = {"approve": ("review",), "reject": ("review",), "used": ("accepted",), "undo": ("accepted", "rejected")}
+ALLOWED = {"approve": ("review",), "reject": ("review",), "used": ("accepted",), "undo": ("accepted", "rejected"),
+           "tag": ("rejected",), "done": ("rejected",)}
+PICKING = "Rejected. What was wrong? Tap every reason that applies, then Done. Undo takes the verdict back."
+TAGS_PER_ROW = 3
 
 
-def status_line(kind: str, view: str, last_action: str | None) -> str:
+def tag_label(tag: str) -> str:
+    name = ledger.TAG_NAMES.get(tag, tag)
+    return name[:1].upper() + name[1:]
+
+
+def row_tags(row: dict | None) -> list | None:
+    """The reason tags picked so far on a draft's message after Reject; None when it is not picking."""
+    raw = (row or {}).get("tags")
+    if raw is None:
+        return None
+    try:
+        return ledger.parse_tags(json.loads(raw))
+    except (ValueError, TypeError, ledger.LedgerError):
+        return []
+
+
+def status_line(kind: str, view: str, last_action: str | None, picking: list | None = None,
+                tags: list | None = None) -> str:
     if kind == "page":
         return "" if view == "awaiting_human" else ("Resolved." if view == "resolved" else f"Closed ({view}).")
     if view == "review":
         return "Undone: back in the review queue." if last_action == "undo" else ""
+    if view == "rejected" and picking is not None:
+        return PICKING
+    if view == "rejected" and tags:
+        return f"Rejected; {ledger.reasons_text(tags)}."
     return DRAFT_STATUS.get(view, f"Now {view}.")
 
 
@@ -1546,7 +1584,18 @@ class Phone:
 
     # ------------------------------------------------------------ buttons
 
-    def keyboard(self, kind: str, ref: int, issue: int, view: str) -> dict:
+    def keyboard(self, kind: str, ref: int, issue: int, view: str, picking: list | None = None) -> dict:
+        """The buttons for a draft or page in this state. A rejected draft whose reasons are being
+        picked (`picking`, the tags chosen so far) shows every reason tag (a check mark on those
+        picked), then Done and Undo; all of it signed with this drawing's issue."""
+        if kind == "draft" and view == "rejected" and picking is not None:
+            tags = [{"text": ("\u2713 " if t in picking else "") + tag_label(t),
+                     "callback_data": make_data(self.key, self.chat_id, "t", "d", ref, issue, TAG_LETTERS[t])}
+                    for t, _name in ledger.REASON_TAGS]
+            rows = [tags[i:i + TAGS_PER_ROW] for i in range(0, len(tags), TAGS_PER_ROW)]
+            rows.append([{"text": t, "callback_data": make_data(self.key, self.chat_id, a, "d", ref, issue)}
+                         for t, a in (("Done", "k"), ("Undo", "z"))])
+            return {"inline_keyboard": rows}
         if kind == "draft":
             buttons = DRAFT_BUTTONS.get(view, ())
         else:
@@ -1589,30 +1638,41 @@ class Phone:
             self.redraw(known, view)
             return
         try:
-            self.api.edit_markup(self.chat_id, mid, self.keyboard(known["kind"], known["item"], known["issue"], view))
+            self.api.edit_markup(self.chat_id, mid, self.keyboard(known["kind"], known["item"], known["issue"], view,
+                                                                  row_tags(known)))
         except TelegramError as e:
             if not e.not_modified:
                 LOG.info("could not restore the buttons of a message: %s", e)
 
     def redraw(self, row: dict, view: str | None = None, last_action: str | None = None, **cols) -> dict | None:
         """Draw the row's message again for the current state: a new issue (old buttons go stale),
-        the status line and the buttons that state allows. Terminal states close the row."""
+        the status line and the buttons that state allows. Terminal states close the row. The
+        reason tags being picked (`tags`, JSON) survive only while the draft stays rejected: an
+        Undo, a retract or a pruning elsewhere ends the picking, and its buttons go stale."""
         view = view or self.view_of(row["kind"], row["item"])
         issue = row["issue"] + 1
         last = last_action if last_action is not None else row.get("last_action")
         terminal = (view in TERMINAL_DRAFT) if row["kind"] == "draft" else view != "awaiting_human"
         state = "closed" if terminal else row["state"]
+        tags = cols.pop("tags", row.get("tags"))
+        if row["kind"] != "draft" or view != "rejected":
+            tags = None
         if not self._update_row(row["id"], expect={"issue": row["issue"]}, issue=issue, shown=view, state=state,
-                                last_action=last, **cols):
+                                last_action=last, tags=tags, **cols):
             return None  # someone else drew it meanwhile
+        picking = row_tags({"tags": tags})
+        given = None
+        if row["kind"] == "draft" and view == "rejected" and picking is None:
+            it = ledger.item(self.db(), row["item"])
+            given = (it or {}).get("verdict_tags")
         text = row.get("body") or ""
-        line = status_line(row["kind"], view, last)
+        line = status_line(row["kind"], view, last, picking, given)
         if line:
             text = f"{text}\n\n{line}"
         if row.get("message_id"):
             try:
                 self.api.edit(self.chat_id, row["message_id"], row.get("media") or "text", fit(text, CAPTION_MAX),
-                              self.keyboard(row["kind"], row["item"], issue, view))
+                              self.keyboard(row["kind"], row["item"], issue, view, picking))
             except TelegramError as e:
                 if e.retriable:  # the refresh pass draws it again (shown no longer matches any state)
                     self._update_row(row["id"], shown=None)
@@ -1640,7 +1700,7 @@ class Phone:
             self._answer(cq_id, "This button is not valid any more.")
             self._restore(mid)
             return
-        action, kind, ref, issue = parsed
+        action, kind, ref, issue, tag = parsed
         row = self._row(kind, ref)
         if row is None or row["state"] not in ("sent", "closed") or not row.get("message_id"):
             self._answer(cq_id, "This message is not known any more.")
@@ -1653,11 +1713,33 @@ class Phone:
         view = self.view_of(kind, ref)
         if issue != row["issue"]:
             same = row.get("last_action") == action and view in self._after(action)
+            picking = row_tags(row) if kind == "draft" else None
+            if picking is not None and view == row["shown"] == "rejected":
+                # Picking reasons: a tap on an older drawing (a double tap, or a tap before the
+                # last edit reached the phone) changes nothing, and the buttons on screen are put
+                # back with the current issue, so the next genuine tap still counts.
+                if action == "tag":
+                    text = (f"That tap was on an older drawing of the buttons and changed nothing: {tag_label(tag)} "
+                            f"is {'marked' if tag in picking else 'not marked'}.")
+                elif same:
+                    text = f"Already done: {DESCRIBE.get(view, view)}."
+                else:
+                    text = "That tap was on an older drawing of the buttons and changed nothing; tap again."
+                self._answer(cq_id, text)
+                self._restore(mid)
+                return
             self._answer(cq_id, f"Already done: {DESCRIBE.get(view, view)}." if same
                          else "This message was out of date; it shows the current state now.")
             self.redraw(row, view)
             return
         if view != row["shown"]:
+            if action == "reject" and view == "rejected" and self.pc.reject_tags and self._rejected_here(ref):
+                # This very press, delivered again: its Reject was recorded before the service
+                # stopped and the buttons were never redrawn. Nothing is recorded again; the
+                # message asks for the reasons now.
+                self._answer(cq_id, "Rejected. What was wrong? Tap the reasons, then Done.")
+                self.redraw(row, view, last_action="reject", acted_at=self.clock(), note=None, tags="[]")
+                return
             self._answer(cq_id, f"This changed meanwhile: it is {DESCRIBE.get(view, view)} now.")
             self.redraw(row, view)
             return
@@ -1670,8 +1752,14 @@ class Phone:
             self._answer(cq_id, f"Not possible: this draft is {DESCRIBE.get(view, view)}.")
             self.redraw(row, view)
             return
+        if action in ("tag", "done") and row_tags(row) is None:
+            self._answer(cq_id, "The reasons for this reject are no longer being picked.")
+            self.redraw(row, view)
+            return
         if not self._still_bound(binding):
             return
+        if action in ("tag", "done"):
+            return self._on_reason(cq_id, row, it, view, action, tag)
         try:
             if action in ("approve", "reject"):
                 res = cli.apply_verdict(self.cfg, it["job_id"], "accept" if action == "approve" else "reject",
@@ -1679,6 +1767,8 @@ class Phone:
                 p, killed = res["p_ship"], res["killed"]
                 answer = ("Approved." if action == "approve" else "Rejected.") + (
                     f" P(ship) for {clean(it['template_id'], 64)} is now {p:.2f}." if p is not None else "")
+                if action == "reject" and self.pc.reject_tags:
+                    answer += " What was wrong? Tap the reasons, then Done."
             elif action == "undo":
                 res = cli.apply_verdict(self.cfg, it["job_id"], "retract", by="phone")
                 p, killed = res["p_ship"], []
@@ -1692,16 +1782,55 @@ class Phone:
             return
         LOG.info("%s recorded from the phone for draft %d (job %d)", action, it["id"], it["job_id"])
         self._answer(cq_id, fit(answer, ANSWER_MAX))
+        # After a Reject recorded here, the buttons ask what was wrong (picking starts empty).
         self.redraw(row, last_action=action, acted_at=self.clock(),
-                    note=None if action in ("approve", "reject") else row.get("note"))
+                    note=None if action in ("approve", "reject") else row.get("note"),
+                    tags="[]" if action == "reject" and self.pc.reject_tags else None)
         for tid, reason, detail in killed:
             self._say(f"Template {clean(tid, 64)} was paused by a kill criterion: {clean(reason, 40)} "
                       f"({clean(detail, 300)}).")
 
+    def _rejected_here(self, item_id: int) -> bool:
+        """The draft's standing verdict is a reject given from the phone (its latest verdict event)."""
+        it = ledger.item(self.db(), item_id)
+        if it is None or it.get("verdict") != "reject":
+            return False
+        ev = self.db().events("verdict_recorded", it["job_id"])
+        return bool(ev) and ev[-1]["data"].get("by") == "phone" and ev[-1]["data"].get("verdict") == "reject"
+
+    def _on_reason(self, cq_id, row: dict, it: dict, view: str, action: str, tag: str | None) -> None:
+        """A reason tag toggled, or Done, on a draft rejected from this message. A toggle changes
+        only the message (the picks live in its phone_messages row until Done); Done stores the
+        picks with the verdict (ledger.tag_verdict: verdict_tags and the note's readable reasons,
+        idempotent, so a Done delivered twice records once) and the message goes back to its
+        post-verdict buttons (Undo, which also clears the reasons)."""
+        from . import cli
+        picked = row_tags(row) or []
+        if action == "tag":
+            new = ledger.parse_tags(set(picked) ^ {tag})
+            self._answer(cq_id, f"{tag_label(tag)}: {'marked' if tag in new else 'unmarked'}. Tap Done when you are "
+                                "finished.")
+            self.redraw(row, view, tags=json.dumps(new))
+            return
+        if picked:
+            try:
+                cli.apply_tags(self.cfg, it["job_id"], picked, by="phone")
+            except ledger.LedgerError as e:
+                self._answer(cq_id, clean(str(e), ANSWER_MAX))
+                self.redraw(row)
+                return
+            LOG.info("reasons recorded from the phone for draft %d (job %d): %s", it["id"], it["job_id"],
+                     ",".join(picked))
+            answer = f"Recorded with the reject: {', '.join(ledger.TAG_NAMES[t] for t in picked)}."
+        else:
+            answer = "Done: no reasons recorded."
+        self._answer(cq_id, fit(answer, ANSWER_MAX))
+        self.redraw(row, view, last_action="done", tags=None)
+
     @staticmethod
     def _after(action: str) -> tuple:
         return {"approve": ("accepted", "shipped"), "reject": ("rejected", "rejected-pruned"), "used": ("shipped",),
-                "undo": ("review",), "resolve": ("resolved",)}.get(action, ())
+                "undo": ("review",), "resolve": ("resolved",), "done": ("rejected", "rejected-pruned")}.get(action, ())
 
     def _resolve(self, cq_id, row: dict, page_id: int) -> None:
         from . import cli
@@ -1842,7 +1971,8 @@ class Phone:
             old = (old + [prev["message_id"]])[-10:]
         now = self.clock()
         cols = dict(state="sent", claim=None, message_id=mid if isinstance(mid, int) else None, media=media, body=body,
-                    issue=issue, shown=view, sent_at=now, next_try_at=None, error=None, old_ids=json.dumps(old))
+                    issue=issue, shown=view, sent_at=now, next_try_at=None, error=None, old_ids=json.dumps(old),
+                    tags=None)
         for attempt in range(3):  # the message is out: recording it must not lose to a busy database
             try:
                 ok = self._update_row(self._row(kind, ref)["id"], expect={"claim": claim}, **cols)
