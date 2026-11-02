@@ -216,7 +216,21 @@ memory, and that a brain is resident (or the system is in SAFE mode) at the end.
 ## Inverted red-team tests
 
 The ads red team (`tests/test_ads_adversarial_robustness.py`, `tests/test_ads_adversarial_compliance.py`,
-96 tests) passes as written: none of its tests was changed.
+96 tests) passes as written: none of its assertions was changed (one fixture gained an audio gate
+record, below).
+
+The audio gate and reason tags red team (`tests/test_gate_tags_adversarial.py`, 41 tests) passes as
+written: none of its tests was changed, including the two whose causes were already known (a price
+read "nine fifty", and the music-masking check comparing word error rates as the task asked rather
+than lost words only). Two older tests changed with its fixes:
+`test_ads_audio_gate.G6Review.test_without_a_gate_record_the_brain_cannot_accept` asserted that a
+review with no gate record goes to `human_review`, which still put an ad nobody heard in front of
+the owner (one of the red team's design concerns). It is now
+`test_without_a_gate_record_or_a_checked_mix_the_ad_never_reaches_the_owner`: such an ad is given
+up without asking the brain, and so is one whose final mix was never checked.
+`test_ads_adversarial_compliance.R8Injection.test_the_facts_cannot_close_the_untrusted_block_in_the_review_prompt`
+built a finished ad without a gate record, so the review now gives up before writing the prompt
+the test inspects; its fixture gained a passed `gate.json`, and its assertion is unchanged.
 
 Two of the red team's attacks, `P4Assorted.test_transient_engine_outage_mid_render_recovers_without_rerun`
 and `P4Assorted.test_pager_outage_does_not_stop_the_brain_returning`, originally opened with
@@ -1158,20 +1172,27 @@ previews are off, and the caption stays inside Telegram's 1024 characters.
   template's value) and **Undo** (`verdict JOB retract`); after Reject, the reasons (below), then
   **Undo**. The answer shows the new P(ship); a template a kill criterion paused is announced in
   the chat.
-- **Reasons for a reject.** Reject records the verdict exactly as before (once, the same
-  `verdict JOB reject`); then the message's buttons ask what was wrong: **Script, Voice,
-  Pronunciation, Music, Lip-sync, Faces/consistency, Stills, Motion, B-roll, Captions/text, Pacing,
-  End card, Other**, then **Done** and **Undo**. A tap toggles a reason (a check mark shows it) and
-  only changes the message; **Done** stores the picked reasons with the verdict (the ledger's
+- **Reasons for a reject.** Reject records the verdict exactly as before (once, the same `verdict
+  JOB reject`); then the message's buttons ask what was wrong: **Script, Voice, Pronunciation,
+  Music, Lip-sync, Faces/consistency, Stills, Motion, B-roll, Captions/text, Pacing, End card,
+  Other**, then **Done** and **Undo**. A tap toggles a reason (a check mark shows it) and only
+  changes the message; **Done** stores the picked reasons with the verdict (the ledger's
   `verdict_tags`, and "reasons: voice, pacing" appended to the verdict note; a `verdict_tagged`
   event) and the message goes back to **Undo**, which also clears them. Done with nothing picked
   stores nothing. A tap on an older drawing of the buttons (a double tap, or a tap before the last
   edit reached the phone) changes nothing and says so; the buttons on screen keep working. An Undo,
-  a retract on the CLI or the pruning ends the picking, and its buttons do nothing after it. On the
+  a retract on the CLI or the pruning ends the picking, and its buttons do nothing after it. The
+  picking belongs to that very Reject (its `verdict_recorded` event, kept as
+  `phone_messages.pick_of`), so a retract and a new reject on the CLI end it too, even before the
+  next refresh: its tags never attach to the new reject. A Reject recorded just before the service
+  stopped (the verdict committed, the buttons never redrawn) asks for the reasons on the service's
+  first pass after the restart, and the press Telegram delivers again then records nothing. On the
   CLI, `verdict JOB reject --tags voice,pacing` gives them with the verdict (on an item already
-  rejected, it sets them). `review` and `report` show the reasons per template, and
-  `ledger.reject_tag_counts` counts them for the planner to read later (the planner's prompt does
-  not carry them yet). `"reject_tags": false` in `phone_options` turns the question off.
+  rejected, it sets them, replacing the earlier reasons in the note; an owner's own note that reads
+  the same stays). An unknown tag is refused naming a few of them, however many were given. `review`
+  and `report` show the reasons per template, and `ledger.reject_tag_counts` counts them for the
+  planner to read later (the planner's prompt does not carry them yet). `"reject_tags": false` in
+  `phone_options` turns the question off.
 - The message's status line and buttons follow the item: a verdict, retract or pruning done
   elsewhere (the CLI, retention) redraws it within a minute (`refresh_s`).
 - **A reply to a draft** adds a note: kept until the verdict while the draft waits, added to the
@@ -1357,41 +1378,60 @@ with or without spaces or hyphens inside and with look-alike letters read as Lat
 `spoken` spelling (default: the display), and the `respellings` (best first) are what the audio
 gate tries next. The ad's own address is a term too (said as written, then spelled out, "example
 dot com"), and a brand written inside the address is said with its own spoken spelling there too
-(and its respellings are tried once the address's own run out). Every spelling is
+(and its respellings are tried once the address's own run out); only an address is spelled again
+inside, so another term's chosen spelling is said as given (a `CO` entry never turns "Example Co"
+into "Example Colorado"). Every spelling is
 checked like a spoken line when the template loads (no markup, symbols or look-alike letters, no
-claim, other brand or other address; at most 40 entries of at most 6 respellings); the owner's file
+claim, other brand or other address; at most 40 entries of at most 6 respellings), and the display
+too (no look-alike letters: it goes into the gate's reasons, the manifest and the timing's spelling
+hints). A spelling says exactly the display's numbers, perhaps another way ("Form 1099" may be said
+"Form ten ninety nine"), never another one: "Example Co, 50% off" is refused, and so is a display
+that is a price or a percentage (a number is never a term: the gate checks it as a number). The
+voice step checks every line again as it will be said: a line whose spoken text would state a
+number its display does not fails the ad before the voice runs. The owner's file
 is checked when an ad's facts step reads it, and one that does not hold stops the ad there, before
 any GPU work, as the machine's configuration (`engine_unconfigured`), not as content. `ipa` and
 `arpabet` are kept for reference and the manifest: no MLX-Serve voice is known to read them.
 
-**The audio gate** (code, on the ASR model: `ad_gate`). Every voice line, then the voice track,
-then the final mix, is transcribed free-running by Qwen3-ASR (`/v1/audio/transcriptions`,
+**The audio gate** (code, on the ASR model: `ad_gate`). Every voice line, then the voice track, then
+the final mix, is transcribed free-running by Qwen3-ASR (`/v1/audio/transcriptions`,
 `response_format` json, the ad's language, no prompt and no spelling hints, no word times) and
-compared with the script. Both are normalized the same way: case, punctuation and contractions;
-a number in words or in digits is one number with its unit ("nine dollars and fifty cents" is
-"$9.50", "twenty percent" is "20%", "2 million" is "2,000,000"); "dot com" is ".com"; and a lexicon
-term heard as any of its spellings is the term. A take passes when every lexicon term and every
-number of its line was heard (as often as the line says it) and its word error rate is at most
-`gate_wer_max` (0.08). The forced aligner's word times are never a check: they assume the script.
-A take that fails is said again: with a new seed when the voice varies by seed (Qwen3-TTS;
+compared with the script. Both are normalized the same way: case, punctuation and contractions; a
+number in words or in digits is one number with its unit ("nine dollars and fifty cents" is "$9.50",
+"twenty percent" is "20%", "2 million" and "two million" are "2,000,000", "one point five million"
+is "1.5 million"; a price the script states, read as "nine fifty", is that price, and a number read
+in digit groups, "twenty twenty six" or "ten ninety nine", is the number); "dot com" is ".com"; and
+a lexicon term heard as any of its spellings is the term (heard with an "s" after it, "form files",
+it is the term and a word error). A take passes when every lexicon term of its line was heard as
+often as the line says it; every number was heard with its unit (a price in its currency: "$9.50"
+heard as "9.50 euros" is another price; a percentage as a percentage: "20%" heard as "20 dollars" is
+another number) and in the line's order (two prices swapped fail); no number the line does not state
+was heard (a voice that adds "$5" fails); and its word error rate is at most `gate_wer_max` (0.08).
+The ad's address must be heard as itself: "example.com.au" or "shop.example.com" is another address.
+A brand heard written as its own address ("<brand>.com" for a correctly said brand, as Qwen3-ASR
+writes it at times) is the brand. The forced aligner's word times are never a check: they assume the
+script. A take that fails is said again: with a new seed when the voice varies by seed (Qwen3-TTS;
 `gate_rerolls` per spelling), then with the next respelling of each term it did not hear, up to
-`gate_attempts` (4)
-takes of a line; Kokoro reads the same words the same way, so a line it misreads with no spelling
-left (a wrong number, say) fails at once. When every line passes alone, the track made of the
-passing takes is checked too, and a line it loses is said again the same way. A line that still
-fails fails the ad as content, before anything renders, with a reason that names the term and what
-was heard ("audio gate: line 0 never said 'ExampleCo': heard 'example cove' (2 take(s), said as
-'Example Co', 'Eggs Ample Co')"): the owner never gets that ad. After the cut, the final mix is
-transcribed the same way: it must still say every term and number and may not lose more than
-`gate_mix_margin` (0.05) of the script's words beyond what the voice track alone lost (music
-masking the voice; extra words heard in the music do not count). If it does, the ad is mixed once
-more with the music `gate_remix_db` (8 dB) lower and checked again; a second loss is a content
-failure. Every take (what the voice was given, its seed, why it was taken, what was heard, the word
-error rate, the terms and numbers it missed), every track and mix check, and the verdicts are kept
-in `gate.json` and the gate's files in `gate/`, and go into the manifest. The transcriptions need no
-word times, so a companion model their requests loaded (the forced aligner) is unloaded as soon as
-the gate's job ends, through the adapter's companion record (one that was resident before is never
-touched).
+`gate_attempts` (4) takes of a line; Kokoro reads the same words the same way, so a line it misreads
+with no spelling left (a wrong number, say) fails at once. When every line passes alone, the track
+made of the passing takes is checked too, and a line it loses is said again the same way. Each line
+gets all its takes even when lines are found failing one at a time (alone, then in the track):
+retake rounds are bounded per line, and as a safety net by the lines times `gate_attempts` and by
+the ad's continuation depth (a round that would take the ad past it fails the gate, naming the
+line). A line that still fails fails the ad as content, before anything renders, with a reason that
+names the term and what was heard ("audio gate: line 0 never said 'ExampleCo': heard 'example cove'
+(2 take(s), said as 'Example Co', 'Eggs Ample Co')"): the owner never gets that ad. After the cut,
+the final mix is transcribed the same way: it must still say every term and number, and its word
+error rate may not exceed the voice track's by more than `gate_mix_margin` (0.05): words the music
+hid and the music heard as words between them both count (music masking the voice), while words an
+ASR writes over the music alone before the voice starts or after it ends (the end card) do not. If
+the mix fails, the ad is mixed once more with the music `gate_remix_db` (8 dB) lower and checked again; a
+second loss is a content failure. Every take (what the voice was given, its seed, why it was taken,
+what was heard, the word error rate, the terms and numbers it missed), every track and mix check,
+and the verdicts are kept in `gate.json` and the gate's files in `gate/`, and go into the manifest.
+The transcriptions need no word times, so a companion model their requests loaded (the forced
+aligner) is unloaded as soon as the gate's job ends, through the adapter's companion record (one
+that was resident before is never touched).
 
 **Timing.** The voice track is the line takes the audio gate passed, joined with short pauses
 (`voice_track: "lines"`, the default; `"full"` uses the full read instead, and the gate then judges
@@ -1441,7 +1481,8 @@ flag). Then `ad_review` runs on the vision brain: it reads
 the facts, the spoken words, what the audio gate heard in the final mix, the gate's verdict, the end
 card and the QA, and compares sampled frames with the bible's hero still. It can accept only when
 the facts and the character both check out, it saw the images and the audio gate passed; an ad whose
-gate failed is given up without asking it, and one with no gate record cannot be accepted.
+gate did not pass is given up without asking it: one the gate failed, and one nobody heard end to
+end (no gate record, or the final mix never checked), so the owner never gets an unheard ad.
 Otherwise the ad goes to the owner flagged (`human_review`) or fails (`give_up`). The item's note
 (and so the phone's caption) starts with the gate's result ("audio gate passed (voice WER 0.00, mix
 WER 0.02, 1 retake(s))").
@@ -1454,14 +1495,19 @@ every step's job and duration, and the review.
 
 **Failures.** An infrastructure failure of a step (a crash, a timeout, an engine lost, a load that
 never fit, a restart) is retried by `ad_recover` with the same request; its finished outputs are
-kept. Engines say when the host is at fault (Poll.reason `engine_error` or `engine_unconfigured`:
-no ffmpeg or font, a model without the capability its role needs, a facts site answering 429 or
-5xx, an mlx-serve media model beside a running ComfyUI, a download that is not the file), and
-those stay infrastructure however often they repeat. The ledger classifies the item as usual,
-per logical task, so infrastructure failures do not use the template's weekly cap or the review
-budget, and a take the ad carried on without does not make a later infrastructure failure count
-as content. The dispatcher keeps three retries' worth of continuation hops free: an ad whose
-planned jobs would leave fewer is refused at its timing step.
+kept. Engines say when the host is at fault (Poll.reason `engine_error` or `engine_unconfigured`: no
+ffmpeg or font, a model without the capability its role needs, a facts site answering 429 or 5xx, an
+mlx-serve media model beside a running ComfyUI, a download that is not the file, an mlx-serve answer
+that says it is busy or unavailable (HTTP 429, 502, 503), a transcription answer without its text,
+and an ASR that hears no word in any of a gate job's two or more recordings though none is silent),
+and those stay infrastructure however often they repeat; gpud now keeps that reason from the
+engine's poll (it used to record every such failure as a crash, which a repeat turned into content).
+So an ASR outage fails the ad as infrastructure, never as the template's content, and the gate never
+passes on a transcription it did not get. The ledger classifies the item as usual, per logical task,
+so infrastructure failures do not use the template's weekly cap or the review budget, and a take the
+ad carried on without does not make a later infrastructure failure count as content. The dispatcher
+keeps three retries' worth of continuation hops free: an ad whose planned jobs would leave fewer is
+refused at its timing step.
 
 **Retention.** Raw frames are deleted after each take is muxed, scratch files after each op (and
 a job first deletes the scratch a killed attempt left), and the assembly's intermediate segments
@@ -1622,8 +1668,11 @@ an ad whose planned jobs would not fit.
   mishears looks like a voice error: such a line fails the ad (raise `gate_wer_max`, or add the
   word to the lexicon with a spelling both get right). Its normalization covers the usual forms
   (numbers in words or digits with their unit, ".com", contractions, compounds such as "e-mail"),
-  not every one ("nine fifty" for $9.50 is two numbers), and a lexicon term that is also a common
-  phrase counts wherever the phrase is said. The music-masking check compares the ASR's view of the
+  not every one ("nine oh five" is two numbers; a price read "nine fifty" counts only where the
+  script states that price), and a lexicon term that is also a common phrase counts wherever the
+  phrase is said. A bare count of one is compared as the word "one" (an ASR writes "one minute"
+  as "1 minute"), so a voice that drops or changes it is only a word error, unless it says
+  another number. The music-masking check compares the ASR's view of the
   mix with its view of the voice track; it does not measure the loudness of the voice against the
   music. Whether MLX-Serve's Qwen3-ASR loads the forced aligner for a plain JSON transcription is
   not verified (the gate unloads it either way), and whether its Kokoro reads `ipa` or `arpabet`

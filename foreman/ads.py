@@ -542,9 +542,28 @@ def _scan_numbers(text) -> list:
 def _word_numbers(words: list) -> list:
     """Spelled-out numbers [(value, kind, first word, end word)] with money and percent context: 'nine dollars and fifty
     cents' -> 9.5 money, 'forty two' -> 42, 'ten percent' -> 10 percent, 'a hundred dollars' -> 100
-    money, 'two million' -> 2000000. A bare 'one' (a pronoun as often as a number) counts only
-    before a unit or a scale ('one dollar', 'one hundred'), 'a' only before a scale."""
+    money, 'two million' -> 2000000, 'one point five million' -> 1500000. A bare 'one' (a pronoun
+    as often as a number) counts only before a unit, a scale or a decimal point ('one dollar', 'one
+    hundred', 'one point five'), 'a' only before a scale."""
     out, i, n = [], 0, len(words)
+
+    def digit(k):
+        return k < n and words[k] in SMALL_NUMBERS and SMALL_NUMBERS[words[k]] < 10
+
+    def decimals(k):
+        """'point five', 'point two five' (or 'point twenty five') at k: (digits, words used)."""
+        if not (k + 1 < n and words[k] == "point"):
+            return "", 0
+        digits, kk = "", k + 1
+        while digit(kk):
+            digits += str(SMALL_NUMBERS[words[kk]])
+            kk += 1
+        if not digits:
+            b, bu = basic(k + 1)
+            if b is None:
+                return "", 0
+            digits, kk = str(b), k + 1 + bu
+        return digits, kk - k
 
     def basic(k):
         if k >= n:
@@ -566,7 +585,8 @@ def _word_numbers(words: list) -> list:
             val, used = basic(j)
         if val is None:
             return None, 0
-        if w in ("one", "a", "an") and used == 1 and not (j + 1 < n and words[j + 1] in UNIT_WORDS):
+        if w in ("one", "a", "an") and used == 1 and not (j + 1 < n and words[j + 1] in UNIT_WORDS) \
+                and not (w == "one" and decimals(j + 1)[1]):
             return None, 0
         k = j + used
         if k < n and words[k] == "hundred":
@@ -576,6 +596,9 @@ def _word_numbers(words: list) -> list:
             b, bu = basic(kk)
             if b is not None:
                 val, k = val + b, kk + bu
+        digits, du = decimals(k)
+        if du:
+            val, k = float(f"{int(val)}.{digits}"), k + du
         if k < n and words[k] in SCALES:
             val *= SCALES[words[k]]
             k += 1
@@ -612,12 +635,6 @@ def _word_numbers(words: list) -> list:
             out.append((float(val), "percent", i0, end))
             i = end
             continue
-        if j < n and words[j] == "point":
-            dec, du = basic(j + 1)
-            if dec is not None:
-                out.append((float(f"{val}.{dec}"), "count", i0, j + 1 + du))
-                i = j + 1 + du
-                continue
         out.append((float(val), "count", i0, j))
         i = j
     return out
@@ -1058,6 +1075,8 @@ def parse_lexicon(value, where: str, problems: list, ad_view: dict | None = None
         display = e.get("display")
         if not _plain_text(display) or len(display) > 60 or not re.search(r"[^\W_]", display):
             bad.append(f"{at}.display must be the term as written, at most 60 characters")
+        else:  # the display goes into the gate's reasons, the manifest and the timing's spelling hints
+            bad += text_problems(display, f"{at}.display")
         spoken = e.get("spoken", display)
         if not _plain_text(spoken) or len(spoken) > 120:
             bad.append(f"{at}.spoken must be text of at most 120 characters: the way the voice should say it")
@@ -1076,8 +1095,16 @@ def parse_lexicon(value, where: str, problems: list, ad_view: dict | None = None
             continue
         display = _clean(display)
         forms_ = list(dict.fromkeys([_clean(spoken)] + [_clean(r) for r in resp]))
+        if any(num_parts(t)[1] for t in _gate_numbers(display)):
+            bad.append(f"{at}.display {display!r} states a price or a percentage: a number is never a term (the "
+                       f"audio gate checks it as a number)")
         for j, f in enumerate(forms_):
-            bad += _speakable(f, f"{at}.{'spoken' if j == 0 else 'respellings'} {f!r}", ad_view)
+            where_ = f"{at}.{'spoken' if j == 0 else 'respellings'} {f!r}"
+            bad += _speakable(f, where_, ad_view)
+            changed = number_change(display, f)
+            if changed:
+                bad.append(f"{where_} says other numbers than {display!r} ({'; '.join(changed)}): a spelling may say "
+                           f"the term's numbers another way, never add, drop or change one")
         key = gate_key(display)
         if not key:
             bad.append(f"{at}.display {display!r} has no word to listen for")
@@ -1094,6 +1121,28 @@ def parse_lexicon(value, where: str, problems: list, ad_view: dict | None = None
             entry["arpabet"] = " ".join(arpa.split())
         out.append(entry)
     return out
+
+
+def _gate_numbers(text) -> list:
+    return [t for t in gate_tokens(text) if num_parts(t)]
+
+
+def number_change(written: str, said: str) -> list:
+    """How the numbers `said` states differ from those `written` states, as the audio gate reads
+    them (empty: the same numbers). A price keeps its currency and a percentage stays one; counts
+    read in digit groups are the same number ('Form 1099' said 'Form ten ninety nine')."""
+    a, b = _gate_numbers(written), _gate_numbers(said)
+    if Counter(a) == Counter(b):
+        return []
+    units_a = Counter(t for t in a if num_parts(t)[1])
+    units_b = Counter(t for t in b if num_parts(t)[1])
+    plain_a = [num_parts(t)[0] for t in a if not num_parts(t)[1]]
+    plain_b = [num_parts(t)[0] for t in b if not num_parts(t)[1]]
+    if units_a == units_b and all("." not in v for v in plain_a + plain_b) and "".join(plain_a) == "".join(plain_b):
+        return []
+    out = [f"adds {show_token(t, [])}" for t in (Counter(b) - Counter(a)).elements()]
+    out += [f"drops {show_token(t, [])}" for t in (Counter(a) - Counter(b)).elements()]
+    return out[:6]
 
 
 def read_lexicon_file(path: str, ad_view: dict | None = None) -> tuple:
@@ -1138,7 +1187,7 @@ def match_forms(entry: dict) -> list:
     """Every way a term may be written or heard: its display, its spellings, and for a web address
     the same with www. in front."""
     forms_ = [entry["display"]] + lex_forms(entry)
-    if re.fullmatch(r"[^\s/]+\.[a-z]{2,}(/\S*)?", entry["display"].lower()):
+    if is_address(entry["display"]):
         forms_.append("www." + entry["display"])
     return list(dict.fromkeys(forms_))
 
@@ -1197,7 +1246,10 @@ def _substitute(text: str, lexicon: list, choice: dict, exclude=None, depth: int
         except (TypeError, ValueError):
             pick = 0
         form = ladder[min(max(0, pick), len(ladder) - 1)]
-        if depth == 0:  # a term inside the chosen spelling (a brand inside its address) gets its own
+        if depth == 0 and is_address(lexicon[idx]["display"]):
+            # A brand inside the ad's address gets its own spelling there ('Example Co dot com').
+            # Only an address: any other term's chosen spelling is already the way to say it (a
+            # 'CO' entry must not turn 'Example Co' into 'Example Colorado').
             form, inner = _substitute(form, lexicon, choice, exclude=idx, depth=1)
             used.update(inner)
         out.append(text[pos:m.start()])
@@ -1260,6 +1312,37 @@ _CONTRACTIONS = tuple((re.compile(a), b) for a, b in (
 _SAME_WORD = {"okay": "ok", "alright": "allright"}
 _CURRENCY_TOKENS = frozenset(CURRENCY)
 _CURRENCY_CODES = ("usd", "eur", "gbp", "cad", "aud")
+# Which currency a price is in, as the gate compares them: '$9.50' heard as '9.50 euros' is another
+# price. Cents with no currency named are dollar cents.
+_CURRENCY_OF = {"$": "$", "usd": "$", "dollar": "$", "dollars": "$", "buck": "$", "bucks": "$",
+                "€": "€", "eur": "€", "euro": "€", "euros": "€", "£": "£", "gbp": "£", "pound": "£", "pounds": "£",
+                "¥": "¥", "₹": "₹", "cad": "C$", "aud": "A$"}
+_UNITS = ("%", "C$", "A$", "$", "€", "£", "¥", "₹")
+_NUM_TOKEN = re.compile(r"#(\d+(?:\.\d+)?)(%|C\$|A\$|[$€£¥₹])?")
+_HOST = re.compile(r"[^\s/]+\.[a-z]{2,}(/\S*)?")
+
+
+def is_address(display: str) -> bool:
+    """A lexicon term that is a web address (example.com, www.example.com/forms)."""
+    return bool(_HOST.fullmatch(str(display or "").strip().lower()))
+
+
+def num_parts(tok: str) -> tuple:
+    """('9.5', '$') for the gate's number token '#9.5$'; ('20', '%'); ('2', ''). None for any
+    other token."""
+    m = _NUM_TOKEN.fullmatch(tok)
+    return (m.group(1), m.group(2) or "") if m else None
+
+
+def term_index(tok: str) -> int | None:
+    """The lexicon entry a gate token stands for: '§3' and '§3+s' (the term with an s after it, a
+    possessive or a plural) are entry 3."""
+    if not tok.startswith("§"):
+        return None
+    try:
+        return int(tok[1:].split("+", 1)[0])
+    except ValueError:
+        return None
 
 
 def _gate_raw(text) -> list:
@@ -1289,6 +1372,7 @@ def _mark_terms(toks: list, lexicon: list) -> list:
     if not keys:
         return toks
     longest = max(len(k) for k in keys)
+    address = {idx for idx, e in enumerate(lexicon) if is_address(e["display"])}
     out, i, n = [], 0, len(toks)
     while i < n:
         hit, joined = None, ""
@@ -1299,13 +1383,18 @@ def _mark_terms(toks: list, lexicon: list) -> list:
             joined += t
             if len(joined) > longest + 1:
                 break
-            k = keys.get(joined)
+            k, plural = keys.get(joined), False
             if k is None and joined.endswith("s"):
-                k = keys.get(joined[:-1])  # a plural or possessive: ExampleCo's
+                k, plural = keys.get(joined[:-1]), True  # a possessive or a plural: ExampleCo's
             if k is not None:
-                hit = (j, k)  # keep going: the longest match wins
+                hit = (j, k, plural)  # keep going: the longest match wins
+        if hit and hit[1] in address and ((i > 0 and toks[i - 1][0] == "dot") or (
+                hit[0] + 2 < n and toks[hit[0] + 1][0] == "dot" and toks[hit[0] + 2][0][0].isalpha())):
+            hit = None  # inside a longer host (example.com.au, shop.example.com): another address
         if hit:
-            out.append((f"§{hit[1]}", toks[i][1], toks[hit[0]][2]))
+            # The s is kept apart from the term: the term was heard, but 'form files' is not an exact
+            # hearing of 'FormFile' (it counts as a word error where the script has no s).
+            out.append((f"§{hit[1]}" + ("+s" if hit[2] else ""), toks[i][1], toks[hit[0]][2]))
             i = hit[0] + 1
         else:
             out.append(toks[i])
@@ -1313,8 +1402,9 @@ def _mark_terms(toks: list, lexicon: list) -> list:
     return out
 
 
-def _num_token(val: float, kind: str) -> str:
-    return "#" + _norm_num(val) + {"money": "$", "percent": "%"}.get(kind, "")
+def _num_token(val: float, kind: str, cur: str | None = None) -> str:
+    unit = "%" if kind == "percent" else (cur or "$") if kind == "money" else ""
+    return "#" + _norm_num(val) + unit
 
 
 def _mark_numbers(toks: list) -> list:
@@ -1328,9 +1418,9 @@ def _mark_numbers(toks: list) -> list:
                 out.append(toks[i])
                 i += 1
                 continue
-            kind, j = "count", i + 1
+            kind, cur, j = "count", None, i + 1
             if out and (out[-1][0] in _CURRENCY_TOKENS or out[-1][0] in _CURRENCY_CODES):
-                out.pop()
+                cur = _CURRENCY_OF.get(out.pop()[0])
                 kind = "money"
             if j < n and toks[j][1] == e and toks[j][0] in SUFFIX_SCALES:
                 val *= SUFFIX_SCALES[toks[j][0]]
@@ -1345,8 +1435,8 @@ def _mark_numbers(toks: list) -> list:
             elif j < n and toks[j][0] in ("cent", "cents"):
                 val, kind, j = val / 100.0, "money", j + 1
             elif j < n and toks[j][0] in MONEY_AFTER:
-                kind, j = "money", j + 1
-            out.append((_num_token(val, kind), s, toks[j - 1][2]))
+                kind, cur, j = "money", cur or _CURRENCY_OF.get(toks[j][0]), j + 1
+            out.append((_num_token(val, kind, cur), s, toks[j - 1][2]))
             i = j
             continue
         if tok.isalpha():
@@ -1354,9 +1444,11 @@ def _mark_numbers(toks: list) -> list:
             while k < n and toks[k][0].isalpha():
                 k += 1
             pos = 0
-            for val, kind, a, b in _word_numbers([t for t, _, _ in toks[i:k]]):
+            words = [t for t, _, _ in toks[i:k]]
+            for val, kind, a, b in _word_numbers(words):
                 out.extend(toks[i + pos:i + a])
-                out.append((_num_token(val, kind), toks[i + a][1], toks[i + b - 1][2]))
+                cur = next((_CURRENCY_OF[w] for w in words[a:b] if w in _CURRENCY_OF), None)
+                out.append((_num_token(val, kind, cur), toks[i + a][1], toks[i + b - 1][2]))
                 pos = b
             out.extend(toks[i + pos:k])
             i = k
@@ -1370,7 +1462,9 @@ def gate_tokens(text, lexicon=()) -> list:
     """`text` as the audio gate compares it: lower-case words without punctuation, every number one
     token ('#9.5$'), every lexicon term one token ('§<entry index>')."""
     toks = _mark_numbers(_mark_terms(_gate_raw(text), list(lexicon or [])))
-    return [_SAME_WORD.get(t, t) for t, _, _ in toks if t[0] in "§#" or t[0].isalnum()]
+    # A bare count of one is the word 'one' on both sides: a spelled 'one' is a number only before
+    # a unit, a scale or a point ('one dollar'), and an ASR writes 'one minute' as '1 minute'.
+    return [_SAME_WORD.get(t, "one" if t == "#1" else t) for t, _, _ in toks if t[0] in "§#" or t[0].isalnum()]
 
 
 def _edit_ops(ref: list, hyp: list) -> list:
@@ -1412,16 +1506,16 @@ def _merge_compounds(a: list, b: list) -> list:
 
 def show_token(tok: str, names: list) -> str:
     if tok.startswith("§"):
-        try:
-            return names[int(tok[1:])]
-        except (ValueError, IndexError):
+        idx = term_index(tok)
+        if idx is None or not 0 <= idx < len(names):
             return tok
-    if tok.startswith("#"):
-        v = tok[1:]
-        if v.endswith("$"):
-            v = v[:-1]
-            return "$" + (f"{float(v):.2f}" if "." in v else v)
-        return v
+        return names[idx] + ("s" if tok.endswith("+s") else "")
+    parts = num_parts(tok) if tok.startswith("#") else None
+    if parts:
+        v, unit = parts
+        if unit == "%" or not unit:
+            return v + unit
+        return unit + (f"{float(v):.2f}" if "." in v else v)
     return tok
 
 
@@ -1429,12 +1523,130 @@ def _cap_heard(ref: list, hyp: list) -> list:
     return hyp[: 4 * len(ref) + 40]  # an answer far longer than the script is garbage: the rest adds nothing
 
 
+def _spoken_prices(ref: list, hyp: list) -> list:
+    """'nine fifty' for '$9.50': two plain numbers heard where the script states a price whose
+    whole part and cents they are (how a price is commonly read aloud) are that price. Only a price
+    the script states, and only as often as it states it."""
+    want = Counter(t for t in ref if (num_parts(t) or ("", ""))[1] not in ("", "%") and "." in num_parts(t)[0])
+    if not want:
+        return hyp
+    out, i = [], 0
+    while i < len(hyp):
+        a, b = num_parts(hyp[i]) if i + 1 < len(hyp) else None, num_parts(hyp[i + 1]) if i + 1 < len(hyp) else None
+        if a and b and not a[1] and not b[1] and a[0].isdigit() and b[0].isdigit() and 0 < int(a[0]) < 1000 \
+                and 10 <= int(b[0]) <= 99:
+            val = _norm_num(int(a[0]) + int(b[0]) / 100.0)
+            hit = next((t for t in want if want[t] > 0 and num_parts(t)[0] == val), None)
+            if hit is not None:
+                out.append(hit)
+                want[hit] -= 1
+                i += 2
+                continue
+        out.append(hyp[i])
+        i += 1
+    return out
+
+
+def _join_groups(a: list, b: list) -> list:
+    """A number said in digit groups ('twenty twenty six' for 2026, 'ten ninety nine' for 1099):
+    two or three plain numbers in a row in `a` whose digits run together are a plain number that
+    `b` states, as often as `b` states it more than `a` does, are that number."""
+    plain = [t for t in b if num_parts(t) and not num_parts(t)[1] and num_parts(t)[0].isdigit()]
+    want = Counter(plain) - Counter(a)
+    if not want:
+        return a
+    out, i = [], 0
+    while i < len(a):
+        hit = None
+        for size in (3, 2):
+            run = a[i:i + size]
+            parts = [num_parts(t) for t in run]
+            if len(run) == size and all(p and not p[1] and p[0].isdigit() for p in parts):
+                tok = "#" + "".join(p[0] for p in parts)
+                if want[tok] > 0:
+                    hit = (tok, size)
+                    break
+        if hit:
+            out.append(hit[0])
+            want[hit[0]] -= 1
+            i += hit[1]
+        else:
+            out.append(a[i])
+            i += 1
+    return out
+
+
+def _labels(display: str) -> list:
+    """The words of a web address between its dots, without the top-level domain:
+    'www.example.com' -> ['www', 'example']."""
+    out, cur = [], ""
+    for tok, _, _ in _gate_raw(display):
+        if tok == "dot":
+            out.append(cur)
+            cur = ""
+        elif tok[0].isalnum():
+            cur += tok
+    return [x for x in out if x]
+
+
+def _terms_in_addresses(ref: list, hyp: list, names: list) -> list:
+    """A brand the script says, heard written as its own address ('<brand>.com' for a correctly
+    said 'ExampleCo': an ASR writes a brand that way): where the script has the brand and not that
+    many addresses, the heard address is the brand. Never the other way: an address heard as the
+    bare brand lost its 'dot com'."""
+    need = Counter(term_index(t) for t in ref if term_index(t) is not None)
+    got = Counter(term_index(t) for t in hyp if term_index(t) is not None)
+    short = {t: need[t] - got[t] for t in need if need[t] > got[t]}
+    if not short:
+        return hyp
+    out = list(hyp)
+    for j, tok in enumerate(out):
+        u = term_index(tok)
+        if u is None or got[u] <= need[u] or not (0 <= u < len(names)) or not is_address(names[u]):
+            continue
+        labels = _labels(names[u])
+        t = next((t for t in short if short[t] > 0 and 0 <= t < len(names) and gate_key(names[t]) in labels), None)
+        if t is None:
+            continue
+        out[j] = f"§{t}"
+        short[t] -= 1
+        got[u] -= 1
+        got[t] += 1
+    return out
+
+
+def _lcs(a: list, b: list) -> tuple:
+    """Indexes of a and of b in one longest common subsequence: what was heard in its order."""
+    n, m = len(a), len(b)
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n - 1, -1, -1):
+        for j in range(m - 1, -1, -1):
+            dp[i][j] = dp[i + 1][j + 1] + 1 if a[i] == b[j] else max(dp[i + 1][j], dp[i][j + 1])
+    ia, ib, i, j = set(), set(), 0, 0
+    while i < n and j < m:
+        if a[i] == b[j]:
+            ia.add(i)
+            ib.add(j)
+            i, j = i + 1, j + 1
+        elif dp[i + 1][j] >= dp[i][j + 1]:
+            i += 1
+        else:
+            j += 1
+    return ia, ib
+
+
 def judge_heard(ref: list, hyp: list, wer_max: float, names: list) -> dict:
     """The audio gate's verdict on one transcription. `ref`: the script's tokens, `hyp`: the heard
-    tokens (both gate_tokens). Every lexicon term and every number of the script must be heard, as
-    often as the script says it, and the word error rate must be at most wer_max. `lost` counts
-    only the script's words that were not heard (substituted or dropped), not extra words."""
+    tokens (both gate_tokens). Every lexicon term of the script must be heard, as often as the
+    script says it; every number must be heard with its unit (a price in its currency, a
+    percentage as one) and in the script's order, and no number the script does not say may be
+    heard; the word error rate must be at most wer_max. `lost` counts only the script's words that
+    were not heard (substituted or dropped), not extra words; `wer_inner` leaves out the extra
+    words heard before the first and after the last script word (music or an end card around the
+    speech)."""
     hyp = _cap_heard(ref, hyp)
+    hyp = _terms_in_addresses(ref, _join_groups(_spoken_prices(ref, hyp), ref), names)
+    ref = _join_groups(ref, hyp)
     ref2 = _merge_compounds(ref, hyp)
     hyp2 = _merge_compounds(hyp, ref2)
     ops = _edit_ops(ref2, hyp2)
@@ -1442,6 +1654,13 @@ def judge_heard(ref: list, hyp: list, wer_max: float, names: list) -> dict:
     for op, _, _ in ops:
         if op != "eq":
             count[op] += 1
+    edge = 0
+    for seq in (ops, ops[::-1]):
+        for op, _, _ in seq:
+            if op != "ins":
+                break
+            edge += 1
+    edge = min(edge, count["ins"])
     total = max(1, len(ref2))
     runs, run = {}, []  # each script position that was not heard -> what was heard around it
 
@@ -1458,28 +1677,35 @@ def judge_heard(ref: list, hyp: list, wer_max: float, names: list) -> dict:
             run.append(o)
     close(run)
 
-    def heard_at(token):
-        for i, t in enumerate(ref2):
-            if t == token and i in runs:
-                return " ".join(show_token(x, names) for x in runs[i]) or "(nothing)"
-        return "(not heard as often as written)"
-    missing_terms, missing_numbers = [], []
-    need = Counter(t for t in ref2 if t.startswith("§"))
-    got = Counter(t for t in hyp2 if t.startswith("§"))
+    def heard_at(i):
+        if i in runs:
+            return " ".join(show_token(x, names) for x in runs[i]) or "(nothing)"
+        return "(not heard in its place)"
+    missing_terms, missing_numbers, extra_numbers = [], [], []
+    need = Counter(term_index(t) for t in ref2 if term_index(t) is not None)
+    got = Counter(term_index(t) for t in hyp2 if term_index(t) is not None)
     for t, c in need.items():
         if got[t] < c:
-            missing_terms.append({"idx": int(t[1:]), "term": show_token(t, names), "heard_as": heard_at(t)})
-    nval = Counter(t[1:].rstrip("$%") for t in ref2 if t.startswith("#"))
-    gval = Counter(t[1:].rstrip("$%") for t in hyp2 if t.startswith("#"))
-    for v, c in nval.items():
-        if gval[v] < c:
-            tok = next(t for t in ref2 if t.startswith("#") and t[1:].rstrip("$%") == v)
-            missing_numbers.append({"number": show_token(tok, names), "heard_as": heard_at(tok)})
+            first = next((i for i, x in enumerate(ref2) if term_index(x) == t and i in runs),
+                         next(i for i, x in enumerate(ref2) if term_index(x) == t))
+            missing_terms.append({"idx": t, "term": show_token(f"§{t}", names),
+                                  "heard_as": heard_at(first) if first in runs else "(not heard as often as written)"})
+    rn = [i for i, t in enumerate(ref2) if num_parts(t)]
+    hn = [j for j, t in enumerate(hyp2) if num_parts(t)]
+    ia, ib = _lcs([ref2[i] for i in rn], [hyp2[j] for j in hn])
+    for k, i in enumerate(rn):
+        if k not in ia:
+            missing_numbers.append({"number": show_token(ref2[i], names), "heard_as": heard_at(i)})
+    for k, j in enumerate(hn):
+        if k not in ib:
+            extra_numbers.append({"number": show_token(hyp2[j], names)})
     wer = (count["sub"] + count["del"] + count["ins"]) / float(total)
+    inner = (count["sub"] + count["del"] + count["ins"] - edge) / float(total)
     lost = (count["sub"] + count["del"]) / float(total)
-    return {"ok": not missing_terms and not missing_numbers and wer <= wer_max + 1e-9,
-            "wer": round(wer, 4), "lost": round(lost, 4), "words": len(ref2), "errors": count,
-            "missing_terms": missing_terms, "missing_numbers": missing_numbers,
+    return {"ok": not missing_terms and not missing_numbers and not extra_numbers and wer <= wer_max + 1e-9,
+            "wer": round(wer, 4), "wer_inner": round(inner, 4), "lost": round(lost, 4), "words": len(ref2),
+            "errors": count, "missing_terms": missing_terms, "missing_numbers": missing_numbers,
+            "extra_numbers": extra_numbers[:10],
             "expected": " ".join(show_token(t, names) for t in ref2)[:1200],
             "heard": " ".join(show_token(t, names) for t in hyp2)[:1200]}
 

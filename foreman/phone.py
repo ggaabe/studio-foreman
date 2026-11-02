@@ -1634,12 +1634,13 @@ class Phone:
             self._strip(mid)
             return
         view = self.view_of(known["kind"], known["item"])
-        if view != known["shown"]:
-            self.redraw(known, view)
+        picking = self._picking(known)
+        if view != known["shown"] or (row_tags(known) is not None and picking is None):
+            self.redraw(known, view)  # the state changed, or the picking belongs to a reject that no longer stands
             return
         try:
             self.api.edit_markup(self.chat_id, mid, self.keyboard(known["kind"], known["item"], known["issue"], view,
-                                                                  row_tags(known)))
+                                                                  picking))
         except TelegramError as e:
             if not e.not_modified:
                 LOG.info("could not restore the buttons of a message: %s", e)
@@ -1647,14 +1648,18 @@ class Phone:
     def redraw(self, row: dict, view: str | None = None, last_action: str | None = None, **cols) -> dict | None:
         """Draw the row's message again for the current state: a new issue (old buttons go stale),
         the status line and the buttons that state allows. Terminal states close the row. The
-        reason tags being picked (`tags`, JSON) survive only while the draft stays rejected: an
-        Undo, a retract or a pruning elsewhere ends the picking, and its buttons go stale."""
+        reason tags being picked (`tags`, JSON) survive only while the phone Reject they were asked
+        for (`pick_of`) is the draft's standing verdict: an Undo, a retract (even one followed by a
+        new reject) or a pruning elsewhere ends the picking, and its buttons go stale."""
         view = view or self.view_of(row["kind"], row["item"])
         issue = row["issue"] + 1
         last = last_action if last_action is not None else row.get("last_action")
         terminal = (view in TERMINAL_DRAFT) if row["kind"] == "draft" else view != "awaiting_human"
         state = "closed" if terminal else row["state"]
-        tags = cols.pop("tags", row.get("tags"))
+        if "tags" in cols:  # given by the caller, with the reject it belongs to (pick_of) when it starts
+            tags = cols.pop("tags")
+        else:
+            tags = row.get("tags") if self._picking(row) is not None else None
         if row["kind"] != "draft" or view != "rejected":
             tags = None
         if not self._update_row(row["id"], expect={"issue": row["issue"]}, issue=issue, shown=view, state=state,
@@ -1713,7 +1718,7 @@ class Phone:
         view = self.view_of(kind, ref)
         if issue != row["issue"]:
             same = row.get("last_action") == action and view in self._after(action)
-            picking = row_tags(row) if kind == "draft" else None
+            picking = self._picking(row) if kind == "draft" else None
             if picking is not None and view == row["shown"] == "rejected":
                 # Picking reasons: a tap on an older drawing (a double tap, or a tap before the
                 # last edit reached the phone) changes nothing, and the buttons on screen are put
@@ -1733,12 +1738,13 @@ class Phone:
             self.redraw(row, view)
             return
         if view != row["shown"]:
-            if action == "reject" and view == "rejected" and self.pc.reject_tags and self._rejected_here(ref):
+            asked = self._to_ask(row, view)
+            if action == "reject" and asked is not None:
                 # This very press, delivered again: its Reject was recorded before the service
                 # stopped and the buttons were never redrawn. Nothing is recorded again; the
                 # message asks for the reasons now.
                 self._answer(cq_id, "Rejected. What was wrong? Tap the reasons, then Done.")
-                self.redraw(row, view, last_action="reject", acted_at=self.clock(), note=None, tags="[]")
+                self.redraw(row, view, **self._ask_cols(asked))
                 return
             self._answer(cq_id, f"This changed meanwhile: it is {DESCRIBE.get(view, view)} now.")
             self.redraw(row, view)
@@ -1752,7 +1758,7 @@ class Phone:
             self._answer(cq_id, f"Not possible: this draft is {DESCRIBE.get(view, view)}.")
             self.redraw(row, view)
             return
-        if action in ("tag", "done") and row_tags(row) is None:
+        if action in ("tag", "done") and self._picking(row) is None:
             self._answer(cq_id, "The reasons for this reject are no longer being picked.")
             self.redraw(row, view)
             return
@@ -1782,21 +1788,48 @@ class Phone:
             return
         LOG.info("%s recorded from the phone for draft %d (job %d)", action, it["id"], it["job_id"])
         self._answer(cq_id, fit(answer, ANSWER_MAX))
-        # After a Reject recorded here, the buttons ask what was wrong (picking starts empty).
+        # After a Reject recorded here, the buttons ask what was wrong (picking starts empty), for
+        # this very reject (its verdict event): a retract and a new reject elsewhere end it.
+        asked = self._phone_reject(ref) if action == "reject" and self.pc.reject_tags else None
         self.redraw(row, last_action=action, acted_at=self.clock(),
                     note=None if action in ("approve", "reject") else row.get("note"),
-                    tags="[]" if action == "reject" and self.pc.reject_tags else None)
+                    **(dict(tags="[]", pick_of=asked) if asked is not None else dict(tags=None)))
         for tid, reason, detail in killed:
             self._say(f"Template {clean(tid, 64)} was paused by a kill criterion: {clean(reason, 40)} "
                       f"({clean(detail, 300)}).")
 
-    def _rejected_here(self, item_id: int) -> bool:
-        """The draft's standing verdict is a reject given from the phone (its latest verdict event)."""
+    def _phone_reject(self, item_id: int) -> int | None:
+        """The events.id of the draft's standing verdict when it is a reject given from the phone
+        (its latest verdict_recorded event), else None. A picking belongs to exactly one such event."""
         it = ledger.item(self.db(), item_id)
-        if it is None or it.get("verdict") != "reject":
-            return False
+        if it is None or it.get("state") != "rejected" or it.get("verdict") != "reject":
+            return None
         ev = self.db().events("verdict_recorded", it["job_id"])
-        return bool(ev) and ev[-1]["data"].get("by") == "phone" and ev[-1]["data"].get("verdict") == "reject"
+        if ev and ev[-1]["data"].get("by") == "phone" and ev[-1]["data"].get("verdict") == "reject":
+            return int(ev[-1]["id"])
+        return None
+
+    def _picking(self, row: dict | None) -> list | None:
+        """The reasons picked so far on a draft's message, or None when it is not picking. Picks
+        stored on the row count only while the phone Reject they were asked for (pick_of) is still
+        the draft's standing verdict: after a retract, a retract and a new reject, or a pruning, the
+        picking is over and its buttons record nothing."""
+        tags = row_tags(row)
+        if tags is None or row.get("kind") != "draft" or row.get("pick_of") is None:
+            return None
+        return tags if self._phone_reject(row["item"]) == row["pick_of"] else None
+
+    def _to_ask(self, row: dict, view: str) -> int | None:
+        """A phone Reject whose reasons this message never asked for (a crash after the verdict
+        was committed and before the buttons were redrawn): its event id, else None."""
+        if row.get("kind") != "draft" or view != "rejected" or not self.pc.reject_tags or row_tags(row) is not None:
+            return None
+        ev = self._phone_reject(row["item"])
+        return ev if ev is not None and ev != row.get("pick_of") else None
+
+    def _ask_cols(self, ev: int) -> dict:
+        # The verdict took the row's waiting note with it (the phone gives it to every verdict).
+        return dict(last_action="reject", acted_at=self.clock(), note=None, tags="[]", pick_of=ev)
 
     def _on_reason(self, cq_id, row: dict, it: dict, view: str, action: str, tag: str | None) -> None:
         """A reason tag toggled, or Done, on a draft rejected from this message. A toggle changes
@@ -1805,7 +1838,7 @@ class Phone:
         idempotent, so a Done delivered twice records once) and the message goes back to its
         post-verdict buttons (Undo, which also clears the reasons)."""
         from . import cli
-        picked = row_tags(row) or []
+        picked = self._picking(row) or []
         if action == "tag":
             new = ledger.parse_tags(set(picked) ^ {tag})
             self._answer(cq_id, f"{tag_label(tag)}: {'marked' if tag in new else 'unmarked'}. Tap Done when you are "
@@ -2173,9 +2206,15 @@ class Phone:
         for r in rows:
             row = dict(r)
             view = self.view_of(row["kind"], row["item"])
-            if view == row["shown"]:
-                continue
-            self.redraw(row, view)
+            cols: dict = {}
+            asked = self._to_ask(row, view) if view != row["shown"] else None
+            if asked is not None:
+                # A phone Reject recorded just before a crash, its buttons never redrawn: ask for
+                # the reasons now (the redelivered press then finds them, and records nothing).
+                cols = self._ask_cols(asked)
+            elif view == row["shown"] and (row_tags(row) is None or self._picking(row) is not None):
+                continue  # unchanged (a picking whose reject no longer stands is redrawn without it)
+            self.redraw(row, view, **cols)
             n += 1
             if n >= self.pc.max_refresh_per_pass:
                 break

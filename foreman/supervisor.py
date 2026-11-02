@@ -220,7 +220,7 @@ def _poll(result) -> Poll:
     reason = getattr(result, "reason", None)
     return Poll(status, progress if progress is not None else 0.0, getattr(result, "artifact", None),
                 None if err is None else str(err), tuple(str(x) for x in tail),
-                reason if reason in ENGINE_FAILURE_REASONS else None)
+                reason if reason in ENGINE_FAILURE_REASONS + ENGINE_INFRA_REASONS else None)
 
 
 def _opt_int(req: dict, key: str) -> int | None:

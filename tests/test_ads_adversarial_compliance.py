@@ -566,7 +566,11 @@ class R8Injection(TmpCase):
                          ("ad.json", {"end_card": {"price": "$9.50", "url": "example.com", "cta": "Go"},
                                       "disclosure": "AI-generated", "ai_label": True}),
                          ("script.json", {"lines": [{"i": 0, "role": "hook", "text": "Hello there."}]}),
-                         ("facts.json", {"text": self.BREAKOUT, "numbers": ["9.5"]})):
+                         ("facts.json", {"text": self.BREAKOUT, "numbers": ["9.5"]}),
+                         # the audio gate passed: without it the review gives up before any prompt
+                         ("gate.json", {"version": 1, "status": "passed", "units": {},
+                                        "track": {"wer": 0.0, "heard": "hello there"},
+                                        "mix": {"wer": 0.0, "heard": "hello there"}})):
             with open(os.path.join(wd, rel), "w") as f:
                 json.dump(obj, f)
         seen = []

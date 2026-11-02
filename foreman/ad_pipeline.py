@@ -487,7 +487,13 @@ class AdPipeline:
         when they load, but a spelling next to the script's words could still make one."""
         def found(text):
             return set(ads_mod.spoken_problems(text, ad, None, "the voice"))
-        return sorted(found(spoken) - found(display))
+        out = sorted(found(spoken) - found(display))
+        # A number: the voice may say the line's numbers another way, never one the line does not
+        # state (the script's number checks only ever saw the display text).
+        added = [c for c in ads_mod.number_change(display, spoken) if c.startswith("adds ")]
+        if added:
+            out.append(f"the voice would say a number the line does not state ({'; '.join(added)})")
+        return out
 
     def build_track(self, wd: str, ad: dict, script: dict, wavs: list | None = None) -> None:
         """voice/track.wav: the takes the audio gate passed, joined with short pauses (or the full
@@ -576,7 +582,7 @@ class AdPipeline:
         """A free-running transcription: plain JSON text, no word times (the forced aligner is not
         needed), and never a prompt or spelling hints (they would make the ASR hear the script)."""
         return {"op": "transcribe", "out": out, "file_path": wav, "language": g.get("language") or "en",
-                "response_format": "json", "words": False, "release_companions": True,
+                "response_format": "json", "words": False, "release_companions": True, "speech": True,
                 "expected_s": self.cfg.exp("gate"), "unit": unit, "role": "gate"}
 
     def _heard(self, wd: str, rel: str) -> str:
@@ -592,10 +598,11 @@ class AdPipeline:
 
     @staticmethod
     def _record(take: dict, heard: str, res: dict) -> None:
-        take.update(heard=heard[:1500], heard_norm=res["heard"], wer=res["wer"], lost=res["lost"], errors=res["errors"],
+        take.update(heard=heard[:1500], heard_norm=res["heard"], wer=res["wer"], wer_inner=res.get("wer_inner"),
+                    lost=res["lost"], errors=res["errors"],
                     missing_terms=[{"term": m["term"], "heard_as": m["heard_as"]} for m in res["missing_terms"]],
-                    missing_numbers=res["missing_numbers"], ok=res["ok"], status="passed" if res["ok"] else "failed",
-                    judged_wall=_now_wall())
+                    missing_numbers=res["missing_numbers"], extra_numbers=res.get("extra_numbers") or [],
+                    ok=res["ok"], status="passed" if res["ok"] else "failed", judged_wall=_now_wall())
 
     def gate_reason(self, key: str, u: dict, res: dict, where: str = "") -> str:
         what = "the full read" if key == "full" else f"line {u.get('line')}"
@@ -610,6 +617,10 @@ class AdPipeline:
             m = res["missing_numbers"][0]
             return (f"audio gate: {what} never said the number {m['number']}{loc}: heard {m['heard_as'][:60]!r} "
                     f"({takes} take(s))")
+        if res.get("extra_numbers"):
+            m = res["extra_numbers"][0]
+            return (f"audio gate: {what} said the number {m['number']}, which the script does not{loc}: heard "
+                    f"{res['heard'][:100]!r} ({takes} take(s))")
         return (f"audio gate: {what} was heard as {res['heard'][:100]!r}{loc} (word error rate {res['wer']:.2f}, at "
                 f"most {self.cfg.gate_wer_max:.2f}; {takes} take(s))")
 
@@ -711,8 +722,8 @@ class AdPipeline:
             return self._retake(wd, rel, ad, bible, script, g)
         if g["mode"] == "full":
             take = g["units"]["full"]["attempts"][-1]
-            g["track"].update(status="passed", wer=take["wer"], lost=take["lost"], heard=take["heard"],
-                              transcript=take["transcript"], **{"from": [take["wav"]]})
+            g["track"].update(status="passed", wer=take["wer"], wer_inner=take.get("wer_inner"), lost=take["lost"],
+                              heard=take["heard"], transcript=take["transcript"], **{"from": [take["wav"]]})
         else:
             heard = self._heard(wd, track["transcript"])
             line_refs = [gate_tokens(ln["text"], lex) for ln in script["lines"]]
@@ -730,7 +741,7 @@ class AdPipeline:
                     u["attempts"][-1].update(ok=False, status="failed", in_track={
                         "heard": r["heard"], "wer": r["wer"],
                         "missing_terms": [{"term": m["term"], "heard_as": m["heard_as"]} for m in r["missing_terms"]],
-                        "missing_numbers": r["missing_numbers"]})
+                        "missing_numbers": r["missing_numbers"], "extra_numbers": r.get("extra_numbers") or []})
                     failed = self.plan_retake(wd, g, ad, key, u, r, "in the voice track")
                     if failed is None:
                         retakes.append(key)
@@ -743,19 +754,38 @@ class AdPipeline:
                     return self._retake(wd, rel, ad, bible, script, g)
                 return self.gate_failed(wd, g, f"audio gate: the voice track was heard as {res['heard'][:100]!r} "
                                                f"(word error rate {res['wer']:.2f}) though each line passed alone")
-            g["track"].update(status="passed", wer=res["wer"], lost=res["lost"], heard=heard,
-                              transcript=track["transcript"], **{"from": list(track["from"])})
+            g["track"].update(status="passed", wer=res["wer"], wer_inner=res["wer_inner"], lost=res["lost"],
+                              heard=heard, transcript=track["transcript"], **{"from": list(track["from"])})
         g["status"] = "voice_passed"
         g["voice_passed_wall"] = _now_wall()
         self.save_gate(wd, g)
         self.build_track(wd, ad, script, g["track"]["from"])
         return None
 
+    def max_rounds(self, g: dict) -> int:
+        """Retake rounds at most: each round says at least one line again and each line has at most
+        gate_attempts takes, so lines found failing one at a time (alone, then in the track) each
+        get all their takes. A safety net, never the limit a line meets first."""
+        return max(1, len(g.get("units") or {})) * max(0, self.cfg.gate_attempts - 1)
+
+    def depth_needed(self, ad: dict, shots: list, rounds: int) -> int:
+        """Continuation hops the whole ad needs (each job and the brain step after it), with the
+        hops kept free for infrastructure retries."""
+        return 2 * self.planned_jobs(ad, {"shots": shots}, rounds) + 2 + 2 * RETRY_HOPS
+
     def _retake(self, wd, rel, ad, bible, script, g):
         g["rounds"] = int(g.get("rounds") or 0) + 1
-        if g["rounds"] > self.cfg.gate_attempts:
+        if g["rounds"] > self.max_rounds(g):
             return self.gate_failed(wd, g, f"audio gate: the voice still fails after {g['rounds'] - 1} rounds of "
                                            f"retakes")
+        if self.depth_needed(ad, script.get("shots") or [], g["rounds"]) > self.max_depth:
+            pending = [k for k, u in g["units"].items() if u["status"] == "pending"]
+            last = g["units"][pending[0]]["attempts"][-2] if pending and len(g["units"][pending[0]]["attempts"]) > 1 \
+                else None
+            heard = f": heard {last.get('heard_norm', '')[:80]!r}" if last else ""
+            return self.gate_failed(wd, g, f"audio gate: {', '.join(pending) or 'a line'} still fails{heard}, and "
+                                           f"another retake round would take the ad past the continuation depth "
+                                           f"limit {self.max_depth} (after {g['rounds'] - 1} rounds)")
         self.save_gate(wd, g)
         res = self.step_voice(wd, rel, ad, bible, script)
         return res if res is not None else self.step_gate(wd, rel, ad, bible, script)
@@ -792,8 +822,13 @@ class AdPipeline:
         res = self._judge(g, ref, heard)
         self._record(rec, heard, res)
         stem_lost = float(number(g["track"].get("lost")) or 0.0)
-        rec.update(stem_wer=g["track"].get("wer"), stem_lost=stem_lost)
-        masked = res["lost"] - stem_lost > self.cfg.gate_mix_margin + 1e-9
+        stem_inner = number(g["track"].get("wer_inner"))
+        stem_inner = float(number(g["track"].get("wer")) or 0.0) if stem_inner is None else float(stem_inner)
+        rec.update(stem_wer=g["track"].get("wer"), stem_wer_inner=stem_inner, stem_lost=stem_lost)
+        # Music masking: the mix's word error rate against the stem's, counting what was lost and
+        # what the music was heard as between the words, not what an ASR writes over the music
+        # alone before the voice starts or after it ends (the end card).
+        masked = res["wer_inner"] - stem_inner > self.cfg.gate_mix_margin + 1e-9
         ok = not masked and not res["missing_terms"] and not res["missing_numbers"]
         rec.update(ok=ok, status="passed" if ok else "failed")
         if ok:
@@ -821,7 +856,8 @@ class AdPipeline:
             m = res["missing_numbers"][0]
             what = f"never says the number {m['number']} (heard {m['heard_as'][:60]!r})"
         else:
-            what = f"loses {res['lost']:.0%} of the words against {stem_lost:.0%} in the voice alone"
+            what = (f"is heard with a word error rate of {res['wer_inner']:.2f} inside the speech against "
+                    f"{stem_inner:.2f} for the voice alone (lost {res['lost']:.0%} of the words)")
         return self.gate_failed(wd, g, f"audio gate: the music masks the voice: the final mix {what}, even with the "
                                        f"music {self.cfg.gate_remix_db:g} dB lower ({rec['music_db']:g} dB)")
 
@@ -892,7 +928,7 @@ class AdPipeline:
         paths.atomic_json(os.path.join(wd, "timing.json"), timing)
         g = paths.read_json(self.gate_path(wd), {}) or {}
         n = self.planned_jobs(ad, timing, int(number(g.get("rounds")) or 0))
-        if 2 * n + 2 + 2 * RETRY_HOPS > self.max_depth:
+        if self.depth_needed(ad, timing["shots"], int(number(g.get("rounds")) or 0)) > self.max_depth:
             return ("fail", f"this ad would need {n} more jobs, past the continuation depth limit {self.max_depth}: "
                             f"lower talk_seeds or raise max_job_s")
         return None
@@ -902,8 +938,8 @@ class AdPipeline:
         finish, the voice's retake rounds so far (a voice job and a gate job each), one re-mix kept
         in reserve (assembly and the gate again), and the stills and takes."""
         seeds = int((ad.get("picks") or {}).get("talk_seeds") or self.cfg.talk_seeds)
-        talk = sum(1 for s in timing["shots"] if s["kind"] == "talk")
-        broll = sum(1 for s in timing["shots"] if s["kind"] == "broll")
+        talk = sum(1 for s in timing["shots"] if s.get("kind") == "talk")
+        broll = sum(1 for s in timing["shots"] if s.get("kind") == "broll")
         stills_s = (talk + broll * (2 if self.cfg.broll_last_frame else 1)) * self.cfg.exp("still")
         per_job = max(1, int(self.cfg.max_job_s // max(1.0, self.cfg.exp("talk"))))
         broll_jobs = math.ceil(broll * self.cfg.exp("broll") / self.cfg.max_job_s) if broll else 0
@@ -1218,8 +1254,11 @@ class AdPipeline:
         facts = paths.read_json(os.path.join(wd, "facts.json")) or {}
         card = ad.get("end_card") or {}
         gate = self.gate_summary(wd)
-        if gate["status"] == "failed":  # the owner never gets an ad the gate refused, whatever a brain says
-            decision = give_up(f"the audio gate failed: {gate.get('reason')}")
+        if gate["status"] != "passed":
+            # The owner never gets an ad the gate refused, nor one it did not hear to the end (no
+            # record, or the final mix never checked), whatever a brain says.
+            decision = give_up(f"the audio gate failed: {gate.get('reason')}" if gate["status"] == "failed" else
+                               f"{self.gate_note(gate)}: an ad nobody heard end to end never reaches the owner")
             self._review_manifest(wd, {"model": model, "vision": None, "images": 0, "reply": "",
                                        "decision": decision["verdict"], "note": decision["note"], "at_wall": _now_wall()})
             return decision

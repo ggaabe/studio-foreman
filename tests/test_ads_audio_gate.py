@@ -224,6 +224,13 @@ class G2Heard(unittest.TestCase):
         self.assertFalse(garbage["ok"])
         self.assertLessEqual(garbage["errors"]["ins"], 4 * 2 + 40, "an endless answer is cut, not aligned whole")
 
+    def test_words_heard_over_the_music_alone_are_outside_the_speech(self):
+        line = "We prepare it and file it for you. Get it done today."
+        around = judge(line, "music we prepare it and file it for you get it done today thank you for watching")
+        self.assertEqual((around["errors"]["ins"], around["wer_inner"]), (5, 0.0), "before and after the voice")
+        inside = judge(line, "we prepare it and file it for you la la la get it done today")
+        self.assertGreater(inside["wer_inner"], 0.2, "the music heard as words between the voice's")
+
 
 # ---------------------------------------------------------------- G3 the gate in a running ad
 
@@ -525,6 +532,51 @@ class G5Aligner(TmpCase):
         self.assertNotIn({"model": studio.ALIGNER}, self.fake.bodies("/v1/unload-model"))
 
 
+# ---------------------------------------------------------------- G5' an ASR outage is the environment's
+
+@needs_ffmpeg
+class G5AsrOutage(GateHarness):
+    """An ASR that is down, answers without text or hears nothing anywhere fails the ad as
+    infrastructure (engine_error, retried, never the template's content), and the gate never passes."""
+
+    def outage(self, handler_fn=None):
+        import fake_mlx_serve
+        from unittest import mock
+        if handler_fn is None:
+            res = self.start()
+            self.assertTrue(self.run_until(self.done(res["item"]), timeout=90), self.trail())
+        else:
+            with mock.patch.object(fake_mlx_serve._Handler, "_transcribe", handler_fn):
+                res = self.start()
+                self.assertTrue(self.run_until(self.done(res["item"]), timeout=90), self.trail())
+        it = self.item(res["item"])
+        self.assertEqual((it["state"], it["fail_class"]), ("failed", "infra"), (it, self.trail()))
+        self.assertIn("engine_error", it["fail_reason"])
+        self.assertNotIn((self.gate() or {}).get("status"), ("voice_passed", "passed"))
+        self.assertEqual(self.jobs("ad_timing"), [])
+        self.assertGreater(len(self.jobs("ad_gate")), 1, "an infrastructure failure is retried")
+        return it
+
+    def test_an_asr_answering_503_is_an_infrastructure_failure(self):
+        def down(handler):
+            n = int(handler.headers.get("Content-Length") or 0)
+            handler.rfile.read(n)
+            return handler._error(503, "the ASR is not available")
+        self.assertIn("HTTP 503", self.outage(down)["fail_reason"])
+
+    def test_an_answer_without_text_is_an_infrastructure_failure(self):
+        def no_text(handler):
+            n = int(handler.headers.get("Content-Length") or 0)
+            handler.rfile.read(n)
+            return handler._json(200, {"task": "transcribe", "language": "en", "segments": []})
+        self.assertIn("carried no text", self.outage(no_text)["fail_reason"])
+
+    def test_an_asr_that_hears_nothing_anywhere_is_an_infrastructure_failure(self):
+        self.fake.asr_text = ""
+        it = self.outage()
+        self.assertIn("audio gate: the ASR heard nothing", it["fail_reason"])
+
+
 # ---------------------------------------------------------------- G6 the review
 
 class G6Review(TmpCase):
@@ -573,11 +625,16 @@ class G6Review(TmpCase):
         self.assertEqual(self.asked, [])
         self.assertEqual(paths.read_json(os.path.join(self.wd, "manifest.json"))["review"]["decision"], "give_up")
 
-    def test_without_a_gate_record_the_brain_cannot_accept(self):
+    def test_without_a_gate_record_or_a_checked_mix_the_ad_never_reaches_the_owner(self):
+        # Changed after the red team: an ad nobody heard end to end used to go to human_review,
+        # which still put it in front of the owner. It is given up without asking the brain.
         d = self.review(None)
-        self.assertEqual(d["verdict"], "human_review")
-        self.assertIn("audio gate did not pass", d["note"])
-        self.assertTrue(self.asked)
+        self.assertEqual(d["verdict"], "give_up")
+        self.assertIn("audio gate: no record", d["note"])
+        d = self.review({"version": 1, "status": "voice_passed", "units": {}, "track": {"wer": 0.0}, "mix": {}})
+        self.assertEqual(d["verdict"], "give_up")
+        self.assertIn("final mix was not checked", d["note"])
+        self.assertEqual(self.asked, [])
 
     def test_a_passed_gate_reaches_the_brain_and_the_note(self):
         d = self.review({"version": 1, "status": "passed", "units": {}, "track": {"wer": 0.0, "heard": "hello there"},

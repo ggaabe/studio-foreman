@@ -22,7 +22,10 @@ Foreman's own bookkeeping and is never sent):
                                                               (response_format json: the text only);
                                                               release_companions: a companion model this
                                                               job's requests loaded (the forced aligner) is
-                                                              unloaded when the job ends
+                                                              unloaded when the job ends; speech: the input
+                                                              holds speech (an answer without text, or no
+                                                              word in any of a job's two or more recordings
+                                                              with sound, is the engine's failure)
     image       /v1/images/generations         image          prompt size seed steps mode strength ...,
                                                               image_path -> image, ref_image_paths -> ref_images
     video       /v1/video/generations          video          prompt width height num_frames seed steps pipeline
@@ -45,7 +48,8 @@ Raw frames are deleted once the MP4 is written (keep_raw_frames keeps them), and
 deletes the scratch directories no live run owns (a killed gpud's raw frames). A take must come
 back at the size and frame count asked for. A model without the capability its op needs, no
 ffmpeg or no free disk is the environment's failure (Poll.reason engine_unconfigured or
-engine_error), never the request's.
+engine_error), never the request's; so is an answer that says the server is busy or unavailable
+(HTTP 429, 502, 503) and a transcription answer without its text.
 """
 from __future__ import annotations
 
@@ -223,6 +227,7 @@ def run_ops(engine, run) -> dict:
     release = any(op.get("op") == "transcribe" and op.get("release_companions") for op in ops)
     try:
         results = _run_each(engine, run, ops, weights, total, wd)
+        _check_heard_anything(ops, results)
     finally:
         if release and getattr(engine, "companions", None):
             # The audio gate's transcriptions need no word times: a companion model (the forced
@@ -234,6 +239,32 @@ def run_ops(engine, run) -> dict:
                 with engine._lock:
                     run.note(f"could not unload the companions of {run.spec.model}: {type(e).__name__}: {e}")
     return _artifact(engine, run, wd, ops, results)
+
+
+def _check_heard_anything(ops: list, results: list) -> None:
+    """Two or more recordings that hold speech (op 'speech': the voice step checked they are not
+    silent), none of them silent here either, and the ASR heard no word in any: the ASR is not
+    working, which is the environment's failure, not every recording's. Their transcripts are
+    removed so a retry asks again."""
+    speech = [(op, r) for op, r in zip(ops, results) if op.get("op") == "transcribe" and op.get("speech")]
+    if len(speech) < 2 or any(int(number(r.get("text_chars")) or 0) > 0 for _op, r in speech):
+        return
+    for _op, r in speech:
+        try:
+            st = media.wav_stats(r["audio_path"]) if r.get("audio_path") else None
+        except media.MediaError:
+            st = None
+        if st is None or number(st.get("silence_ratio")) is None or st["silence_ratio"] > validators.MAX_SILENCE_RATIO:
+            return  # a recording that is silent (or unreadable) here: no proof the ASR is at fault
+    for _op, r in speech:
+        for x in (r["path"], _meta_path(r["path"])):
+            try:
+                os.remove(x)
+            except OSError:
+                pass
+    raise _ms.EnvironmentFailure(f"audio gate: the ASR heard nothing in any of the {len(speech)} recordings, none "
+                                 f"of them silent (every answer was empty: heard ''): the ASR is not working",
+                                 reason="engine_error")
 
 
 def _run_each(engine, run, ops: list, weights: list, total: float, wd: str) -> list:
@@ -316,10 +347,18 @@ def _open(engine, run) -> StreamConn:
     return conn
 
 
+# Answers that say the server cannot take any request now (busy, a proxy in front of it failing,
+# unavailable): the environment's failure however often it repeats, never the request's (a crash
+# that repeats is charged to the work).
+UNAVAILABLE = (429, 502, 503)
+
+
 def _refused(status: int, conn) -> Exception:
     message = error_message(conn.read_body(1 << 20))
     if _ms.rejected_status(status, message):
         return _ms.RequestRejected(f"HTTP {status}: {message}")
+    if status in UNAVAILABLE:
+        return _ms.EnvironmentFailure(f"HTTP {status}: {message}", reason="engine_error")
     return _ms.RunFailed(f"HTTP {status}: {message}")
 
 
@@ -580,12 +619,17 @@ def _op_transcribe(engine, run, op, out, wd, lo, hi, i) -> dict:
     finally:
         if getattr(engine, "companions", None):
             engine.note_companions(run.spec.model, before)
+    if not isinstance(obj.get("text"), str):
+        # A transcription answer without its text is malformed: the engine's failure, never the
+        # recording's (the audio gate would otherwise read it as 'heard nothing').
+        raise _ms.EnvironmentFailure(f"op {i}: the transcription answer carried no text: {str(obj)[:200]}",
+                                     reason="engine_error")
     words = obj.get("words") if isinstance(obj.get("words"), list) else []
     paths.atomic_json(out, obj)
-    ok = isinstance(obj.get("text"), str)
+    ok = True
     checks = [{"check": "transcript", "ok": ok, "detail": f"{len(words)} timed words"}]
-    return {"words": len(words), "text_chars": len(obj.get("text") or ""), "audio_s": round(seconds, 3),
-            "checks": checks, "ok": ok}
+    return {"words": len(words), "text_chars": len(obj.get("text").strip()), "audio_s": round(seconds, 3),
+            "audio_path": src, "checks": checks, "ok": ok}
 
 
 def _op_image(engine, run, op, out, wd, lo, hi, i) -> dict:

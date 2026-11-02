@@ -440,8 +440,9 @@ def parse_tags(value) -> list:
             bad.append(str(p)[:40])
         else:
             out.add(t)
-    if bad:
-        raise LedgerError(f"unknown reason tag(s) {bad}; known: {', '.join(t for t, _n in REASON_TAGS)}")
+    if bad:  # name a few of them, never all: the message must stay readable whatever was given
+        named = ", ".join(repr(b) for b in bad[:5]) + (f" and {len(bad) - 5} more" if len(bad) > 5 else "")
+        raise LedgerError(f"unknown reason tag(s) {named}; known: {', '.join(t for t, _n in REASON_TAGS)}")
     return sorted(out, key=_TAG_ORDER.get)
 
 
@@ -466,12 +467,17 @@ def reasons_text(tags) -> str:
 
 def _note_with_reasons(note, old_tags, tags) -> str | None:
     """The verdict note with its readable reasons replaced. A note is ' | '-joined parts (the
-    owner's notes, then the reasons): the part naming the old reasons is dropped and the new one
-    appended, kept whole within NOTE_MAX (the owner's text is shortened instead)."""
+    owner's notes and the reasons): the one part this function appended for the old reasons is
+    dropped (the last part with exactly that text: an owner's own note that reads the same is a
+    separate part and stays) and the new one appended, kept whole within NOTE_MAX (the owner's text
+    is shortened instead)."""
     parts = [p for p in (note or "").split(" | ") if p]
     if old_tags:
         old = reasons_text(old_tags)
-        parts = [p for p in parts if p != old]
+        for i in range(len(parts) - 1, -1, -1):
+            if parts[i] == old:
+                del parts[i]
+                break
     base = " | ".join(parts)
     if not tags:
         return base or None

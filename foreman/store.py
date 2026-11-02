@@ -256,6 +256,7 @@ CREATE TABLE IF NOT EXISTS phone_messages (
   note        TEXT,                              -- a reply that waits for the verdict
   note_ids    TEXT NOT NULL DEFAULT '[]',        -- the replies already in `note` (a redelivery adds nothing)
   tags        TEXT,                              -- reasons being picked after a Reject (JSON; NULL: not picking)
+  pick_of     INTEGER,                           -- events.id of the phone Reject the reasons were asked for
   attempts    INTEGER NOT NULL DEFAULT 0,
   next_try_at REAL,
   error       TEXT,
@@ -297,7 +298,7 @@ _MIGRATIONS = {
     "model_owners": [("server_id", "TEXT")],
     "plan_items": [("reserved_slot", "INTEGER NOT NULL DEFAULT 0"), ("fail_class", "TEXT"), ("counted", "INTEGER"),
                    ("count_note", "TEXT"), ("verdict_tags", "TEXT")],
-    "phone_messages": [("note_ids", "TEXT NOT NULL DEFAULT '[]'"), ("tags", "TEXT")],
+    "phone_messages": [("note_ids", "TEXT NOT NULL DEFAULT '[]'"), ("tags", "TEXT"), ("pick_of", "INTEGER")],
     "phone_state": [("pair_id", "TEXT"), ("bot_id", "INTEGER")],
 }
 
