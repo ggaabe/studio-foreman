@@ -1371,7 +1371,7 @@ and video prompts): no on-screen text or signs, no prices, no generated product 
 (only screen shots of real captures show the product), no other brand, no address. Checks read
 the text folded (NFKC, invisible characters removed, look-alike letters as Latin), and the lines
 are stored exactly as they were checked, so the voice and the captions say what passed. An invalid
-script gets one repair attempt with the problems listed; a second invalid one is a content failure.
+script gets one repair attempt with the problems listed (an h3 plan two); one still invalid after that is a content failure.
 The facts and every other quoted text reach the brain inside one `<untrusted>` block whose markers
 the text cannot close.
 
@@ -1734,6 +1734,15 @@ one; a string; null), `readings`, `caption` (`size`, `margin_v`, `margins`), `pu
 `examples/ads/templates/ads.example-h3.v1.json` (generic: ExampleCo, example.com, $9.50), its
 facts `examples/ads/assets/facts-h3.json` and presenter `examples/ads/characters/presenter-example/`.
 The character's voice names its reference recording (`voice.ref_wav`, allowed with any engine).
+
+**The plan.** The brain writes the beats (line, scene, action, cutaways on words of the line), with the
+template's `example` as a worked plan, and code checks them (`validate_h3_script`); an h3 plan gets two
+repairs with the problems listed before the ad fails as content. A screen or price card stays up for at
+least three words, the call to action goes on for at least two words after the web address (the end card
+cuts in on a word after it), and a tap, pulse or underline whose word the cutaway cannot draw (outside it,
+or on a card with nothing to press or underline) is left out and noted in `script.json` `dropped`, not a
+reason to throw the plan away. An action may say a phone's screen faces away from the camera: that is
+what the visual rule wants, not a product screen.
 
 **The media worker** (`foreman/h3/`: probe, edit, audio, captions, graphics) needs numpy and Pillow,
 which gpud's Python does not have, so the core never imports it: it runs

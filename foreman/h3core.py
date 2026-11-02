@@ -53,6 +53,7 @@ PUNCH_SCALE, HOLD_CTA_S, TAIL_HOOK_S, STILL_PUSH = 1.2, 1.0, 0.05, 0.06
 HIGHLIGHT, TEXT, MUTED = "#FFD700", "#FFFFFF", "#E5E7EB"
 MAX_BOX = 20000                   # px: a capture box coordinate at most
 MAX_CUTAWAYS = 2                  # per beat
+MIN_CARD_WORDS = 3                # a screen or price card stays up for at least this many words of the line
 SEED_MOD = 2147483647
 CAMERA = ("Static tripod shot: the camera does not move and the framing stays exactly the same from the first frame "
           "to the last.")
@@ -766,10 +767,15 @@ overlap. Every word you name is a word of that beat's own line, written as in th
 - screen: a real screen capture of the product ("capture": one of the capture ids), with an \
 optional "tap": the word on which its button is pressed (only captures that have a button).
 - still: a still picture ("still": one of the still ids).
-- price: the price card, only in the beat whose line states its price, at most once; optional \
-"pulse" and "underline": words on which it pulses and underlines.
-- endcard: the end card, exactly once, in the last beat: "at" is a word after the web address, with \
-at least one word after it; no "until"; optional "pulse"."""
+- price: the price card, only in the beat whose line states its price, at most once; "at" is the \
+price itself and the line goes on after it (such as "It costs $9.50, with everything included."), so \
+the card is up for at least three words; optional "pulse" and "underline": words on which it pulses and \
+underlines, between its "at" and its "until" (or the end of the line).
+- A screen cutaway too stays up for at least three words of the line, and its "tap" is a word between \
+its "at" and its "until".
+- endcard: the end card, exactly once, in the last beat. The last beat's line says the web address and \
+then goes on for at least two more words (such as "Go to example.com and get it done today."): "at" is \
+the first word after the web address; no "until"; optional "pulse": a word after "at"."""
 
 
 def h3_script_prompt(ad: dict, bible, facts: dict, cfg: ads.AdsConfig) -> list:
@@ -857,7 +863,7 @@ def validate_h3_script(obj, ad: dict, facts: dict, still_tags: list, cfg: ads.Ad
     if not isinstance(obj, dict):
         return None, ["the reply is not a JSON object"]
     h3 = ad.get("h3") or {}
-    errs = []
+    errs, dropped = [], []
     extra = sorted(set(obj) - set(PLAN_KEYS))
     if extra:
         errs.append(f"unknown fields {extra[:8]} (fields: {', '.join(PLAN_KEYS)})")
@@ -920,6 +926,10 @@ def validate_h3_script(obj, ad: dict, facts: dict, still_tags: list, cfg: ads.Ad
             addr_i = next((i for i, w in enumerate(words) if url and word_key(w) == url.lower()), None)
             if addr_i is None:
                 errs.append(f"{where}: the call to action must say the web address {url!r} as written")
+            elif addr_i > len(words) - 3:
+                errs.append(f"{where}: the call to action must go on for at least two words after the web address "
+                            f"(such as 'Go to {url} and get it done today.'): the end card cuts in on a word after "
+                            f"the address, and at least one word follows it")
         sid = b.get("scene")
         scene = scenes.get(sid) if isinstance(sid, str) else None
         if scene is None:
@@ -948,7 +958,7 @@ def validate_h3_script(obj, ad: dict, facts: dict, still_tags: list, cfg: ads.Ad
         seconds = beat_seconds(spoken)
         total += seconds
         cuts, problems = _cutaways(b.get("cutaways"), words, k, n, role, addr_i, scene or {}, h3, caps, stills,
-                                   pc_money, t)
+                                   pc_money, t, dropped)
         errs += [f"{where}: {p}" for p in problems]
         prices += sum(1 for c in cuts if c["kind"] == "price")
         endcards += sum(1 for c in cuts if c["kind"] == "endcard")
@@ -998,11 +1008,14 @@ def validate_h3_script(obj, ad: dict, facts: dict, still_tags: list, cfg: ads.Ad
         return None, errs
     if headline is not None and out_beats:
         out_beats[0]["headline"] = True
-    return {"lines": [{"i": k, "role": b["role"], "text": b["line"]} for k, b in enumerate(out_beats)],
-            "shots": [{"k": k, "kind": "talk", "lines": [k], "visual": b["direction"], "still": b["still"],
-                       "capture": None} for k, b in enumerate(out_beats)],
-            "beats": out_beats, "headline": headline, "disclosure": ad.get("disclosure"), "title": fold(title),
-            "backend": "h3"}, []
+    script = {"lines": [{"i": k, "role": b["role"], "text": b["line"]} for k, b in enumerate(out_beats)],
+              "shots": [{"k": k, "kind": "talk", "lines": [k], "visual": b["direction"], "still": b["still"],
+                         "capture": None} for k, b in enumerate(out_beats)],
+              "beats": out_beats, "headline": headline, "disclosure": ad.get("disclosure"), "title": fold(title),
+              "backend": "h3"}
+    if dropped:
+        script["dropped"] = dropped
+    return script, []
 
 
 def _says_address(text: str, url: str) -> bool:
@@ -1014,8 +1027,12 @@ def _says_address(text: str, url: str) -> bool:
 
 
 def _cutaways(raw, words: list, k: int, n: int, role: str, addr_i, scene: dict, h3: dict, caps: dict, stills: dict,
-              pc_money: set, line: str) -> tuple:
-    """(cutaways of one beat with word indexes and the edit's flags, problems)."""
+              pc_money: set, line: str, dropped: list | None = None) -> tuple:
+    """(cutaways of one beat with word indexes and the edit's flags, problems). A tap, pulse or underline the
+    cutaway cannot draw (its word is outside the cutaway, or the card has nothing to press or underline) is
+    an ornament: it is left out and noted in `dropped`, never a ripple at the wrong time (B9) and never a
+    reason to throw the whole plan away."""
+    dropped = [] if dropped is None else dropped
     if raw is None:
         raw = []
     if not isinstance(raw, list) or len(raw) > MAX_CUTAWAYS:
@@ -1048,19 +1065,22 @@ def _cutaways(raw, words: list, k: int, n: int, role: str, addr_i, scene: dict, 
                                 f"{c.get('at')!r}")
                 continue
         stop = until_i if until_i is not None else len(words)
+        if kind in ("screen", "price") and stop - at_i < MIN_CARD_WORDS:
+            problems.append(f"{at} ({kind}): the card would be up for only {stop - at_i} word(s) (from {c.get('at')!r} "
+                            f"to {'the end of the line' if until_i is None else repr(c.get('until'))}): start it "
+                            f"earlier or keep the line going after it, so it stays up for at least {MIN_CARD_WORDS} "
+                            f"words")
+            continue
         idx = {}
-        bad = False
         for ev in ("tap", "pulse", "underline"):
             if c.get(ev) is None:
                 idx[ev] = None
                 continue
             idx[ev] = find_word(words, c.get(ev), at_i, stop)
             if idx[ev] is None:
-                problems.append(f"{at} ({kind}): {ev} {c.get(ev)!r} is not a word of this line inside the cutaway "
-                                f"(from {c.get('at')!r}{' to ' + repr(c.get('until')) if until_i is not None else ''})")
-                bad = True
-        if bad:
-            continue
+                dropped.append(f"beat {k} {at} ({kind}): {ev} {c.get(ev)!r} left out: not a word of the line inside "
+                               f"the cutaway (from {c.get('at')!r}"
+                               f"{' to ' + repr(c.get('until')) if until_i is not None else ''})")
         e = {"kind": kind, "at_i": at_i, "until_i": until_i, "tap_i": idx["tap"], "pulse_i": idx["pulse"],
              "underline_i": idx["underline"], "capture": None, "still": None, "captions": True, "close_pauses": False,
              "close_gap": False, "check_anchor": False, "scale": None, "anchor_y": None, "push": None}
@@ -1073,8 +1093,8 @@ def _cutaways(raw, words: list, k: int, n: int, role: str, addr_i, scene: dict, 
                                 else f"{at} (screen): there are no screen captures for this ad")
                 continue
             if idx["tap"] is not None and not cap.get("tap"):
-                problems.append(f"{at} (screen): capture {cap['id']!r} has no button to tap")
-                continue
+                dropped.append(f"beat {k} {at} (screen): tap left out: capture {cap['id']!r} has no button to tap")
+                idx["tap"] = e["tap_i"] = None
             e.update(capture=cap["id"], close_pauses=True)
         elif kind == "still":
             if not isinstance(c.get("still"), str) or c["still"] not in stills:
@@ -1090,8 +1110,8 @@ def _cutaways(raw, words: list, k: int, n: int, role: str, addr_i, scene: dict, 
                 problems.append(f"{at} (price): only in the beat whose line states {h3['price_card']['big']}")
                 continue
             if idx["underline"] is not None and not h3["price_card"].get("underline"):
-                problems.append(f"{at} (price): the price card has nothing to underline")
-                continue
+                dropped.append(f"beat {k} {at} (price): underline left out: the price card has nothing to underline")
+                idx["underline"] = e["underline_i"] = None
             e.update(captions=False, close_pauses=True)
         elif kind == "endcard":
             if role != "cta":
@@ -1412,12 +1432,12 @@ def _inner_extra_numbers(ref: list, hyp: list, names: list) -> list:
 
 def _join_own_address(text: str, own: str) -> str:
     """The text as the checks read it, with the ad's own address written as the address however it was heard
-    ('Example Co dot com' for exampleco.com), so a spelled-out own address is not taken for another one."""
+    ('Example dot com' for example.com), so a spelled-out own address is not taken for another one."""
     seen = ads._seen(text)
     if not own:
         return seen
     labels = [r"[\s-]*".join(re.escape(ch) for ch in label.replace("-", "")) for label in own.lower().split(".")
-              if label.replace("-", "")]  # 'my-site.com' heard as 'my site dot com' or 'mysite.com' is still its own
+              if label.replace("-", "")]  # a hyphenated host heard without its hyphen is still its own
     pat = r"\s*(?:\.|\bdot\b)\s*".join(labels)
     return re.sub(r"(?<![a-z0-9])" + pat + r"(?![a-z0-9])", own.lower(), seen) if pat else seen
 

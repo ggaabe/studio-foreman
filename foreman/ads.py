@@ -147,6 +147,12 @@ GENERATED_UI = re.compile(
     r"|(upload|checkout|landing|home|pricing|order|payment|account) (page|screen|form|flow)"
     r"|(screens?|monitors?|displays?|laptops?|phones?|tablets?|computers?)\b[^.,;]{0,30}\b(showing|shows|displaying"
     r"|displays|with the|open (to|on)))\b")
+# A device whose screen the camera cannot see shows no product screen: what the visual rule wants said.
+SCREEN_AWAY = re.compile(
+    r"\b(with )?(the |its |her |his |their )?(screens?|displays?) (is |are )?(facing|turned|tilted|pointed|angled)"
+    r" away( from (the )?(camera|lens|viewer))?"
+    r"|\b(with )?(the )?backs? of (the |her |his |their )?(phones?|tablets?|laptops?|screens?|devices?)"
+    r" (is |are )?(facing |turned |pointed )?(toward|towards|to|at) (the )?(camera|lens|viewer)")
 PRICE_IN_PICTURE = re.compile(r"[$€£¥₹%]|\b(prices?|dollars?|cents|percent|discounts?|sale|coupons?"
                               r"|\d+ ?(off|free))\b")
 STAGE_DIRECTION = re.compile(r"[*\[\]{}()<>_#~`|\\^]")
@@ -845,7 +851,7 @@ def visual_problems(visual: str, ad: dict, where: str) -> list:
                    f"edit)")
     if PRICE_IN_PICTURE.search(seen):
         out.append(f"{where}: visual must not show prices, numbers or discounts (the end card states the price)")
-    if GENERATED_UI.search(seen):
+    if GENERATED_UI.search(SCREEN_AWAY.sub(" ", seen)):  # "the screen facing away from the camera" shows none
         out.append(f"{where}: visual must not show the product's screens or pages (only a screen shot of a real "
                    f"capture shows the product)")
     out += [f"{where}: {p}" for p in mark_problems(visual, ad.get("banned_marks"))]

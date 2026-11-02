@@ -415,12 +415,17 @@ class H2Plan(unittest.TestCase):
         self.assertIn("at 'folder' is not a word of this line", errors(bad))
         bad = beat_with(b1_cutaways=[{"kind": "screen", "capture": "upload", "at": "from", "until": "Upload"}])
         self.assertIn("until 'Upload' is not a word of this line after 'from'", errors(bad))
-        # B9: an event word outside its cutaway is an error, never a ripple at frame 0
+        # B9: an event word outside its cutaway is never a ripple at frame 0: the ornament is left out and noted
         bad = beat_with(b1_cutaways=[{"kind": "screen", "capture": "upload", "at": "from", "until": "ExampleCo",
                                       "tap": "prepares"}])
-        self.assertIn("tap 'prepares' is not a word of this line inside the cutaway", errors(bad))
+        script, errs = validate(bad)
+        self.assertEqual((errs, script["beats"][1]["cutaways"][0]["tap_i"]), ([], None))
+        self.assertIn("tap 'prepares' left out: not a word of the line inside the cutaway", script["dropped"][0])
         bad = beat_with(b2_cutaways=[{"kind": "price", "at": "$9.50", "until": "checking", "pulse": "included"}])
-        self.assertIn("pulse 'included'", errors(bad))
+        script, errs = validate(bad)
+        self.assertEqual((errs, script["beats"][2]["cutaways"][0]["pulse_i"]), ([], None))
+        self.assertIn("pulse 'included' left out", script["dropped"][0])
+        self.assertNotIn("dropped", validate(plan())[0], "nothing left out: no note")
         ok = beat_with(b2_cutaways=[{"kind": "price", "at": "$9.50.", "until": "CHECKING", "pulse": "one"}])
         self.assertEqual(errors(ok), "", "case and punctuation are ignored")
         phrase = beat_with(b1_cutaways=[{"kind": "screen", "capture": "upload", "at": "from your phone",
@@ -443,7 +448,9 @@ class H2Plan(unittest.TestCase):
         self.assertIn("at most 2", errors(beat_with(b0_cutaways=[{"kind": "punch", "at": "but"}] * 3)))
         no_tap = h3_block()
         del no_tap["captures"]["captures/upload.png"]["tap"], no_tap["captures"]["captures/upload.png"]["tap_color"]
-        self.assertIn("has no button to tap", errors(plan(), ad=h3_ad(no_tap)))
+        script, errs = validate(plan(), ad=h3_ad(no_tap))
+        self.assertEqual((errs, script["beats"][1]["cutaways"][0]["tap_i"]), ([], None))
+        self.assertIn("has no button to tap", script["dropped"][0])
 
     def test_cutaways_in_order_without_overlap(self):
         self.assertIn("runs to the end of the beat: nothing may follow it", errors(beat_with(b1_cutaways=[
@@ -460,13 +467,19 @@ class H2Plan(unittest.TestCase):
         self.assertIn("only in the beat whose line states $9.50", errors(beat_with(b1_cutaways=[
             {"kind": "price", "at": "from"}])))
         self.assertIn("this ad has no price card", errors(plan(), ad=h3_ad(h3_block(price_card=None))))
-        two = beat_with(b2_line="Forms start at $9.50, yes $9.50. One form, filing and checking included.",
-                        b2_cutaways=[{"kind": "price", "at": "$9.50", "until": "yes"},
-                                     {"kind": "price", "at": "yes", "until": "checking"}])
+        two = beat_with(b2_line="Forms start at $9.50, and that is it, yes, $9.50. One form, filing and checking included.",
+                        b2_cutaways=[{"kind": "price", "at": "$9.50", "until": "yes,"},
+                                     {"kind": "price", "at": "yes,", "until": "checking"}])
         self.assertIn("at most one price cutaway", errors(two))
         card = h3_block()
         card["price_card"] = {"big": "$9.50", "lines": ["One form"]}
-        self.assertIn("nothing to underline", errors(plan(), ad=h3_ad(card)))
+        script, errs = validate(plan(), ad=h3_ad(card))
+        self.assertEqual((errs, script["beats"][2]["cutaways"][0]["underline_i"]), ([], None))
+        self.assertIn("nothing to underline", script["dropped"][0])
+        short = beat_with(b2_line="It is simple, and forms start at $9.50.", b2_cutaways=[{"kind": "price", "at": "$9.50"}])
+        self.assertIn("the card would be up for only 1 word(s) (from '$9.50' to the end of the line)", errors(short))
+        short = beat_with(b1_cutaways=[{"kind": "screen", "capture": "upload", "at": "from", "until": "phone,"}])
+        self.assertIn("(screen): the card would be up for only 2 word(s)", errors(short))
 
     def test_the_end_card(self):
         self.assertIn("exactly one endcard", errors(beat_with(b3_cutaways=[])))
@@ -477,6 +490,10 @@ class H2Plan(unittest.TestCase):
                       errors(beat_with(b3_cutaways=[{"kind": "endcard", "at": "form"}])))
         self.assertIn("not a word of this line after the web address",
                       errors(beat_with(b3_cutaways=[{"kind": "endcard", "at": "to"}])))
+        self.assertIn("must go on for at least two words after the web address",
+                      errors(beat_with(b3_line="Mail your form at example.com.", b3_cutaways=[])))
+        self.assertIn("must go on for at least two words after the web address",
+                      errors(beat_with(b3_line="Mail your form at example.com today.", b3_cutaways=[])))
         script, errs = validate(beat_with(b3_line="Go online and type example.com and send your form.",
                                           b3_cutaways=[{"kind": "endcard", "at": "and"}]))
         self.assertEqual(script["beats"][3]["cutaways"][0]["at_i"], 5, "the first 'and' after the address")

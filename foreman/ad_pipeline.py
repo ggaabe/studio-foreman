@@ -47,6 +47,7 @@ H3_FONTS = {"black": "/System/Library/Fonts/Supplemental/Arial Black.ttf",
             "logo": "/System/Library/Fonts/Avenir Next.ttc"}
 # Placeholders an h3 graph must carry: without one, Foreman's value would be dropped without a word
 # (a take in another voice, or of another scene).
+H3_SCRIPT_TRIES = 3   # the brain's h3 plan: a first answer and two repairs
 H3_PLACEHOLDERS = ("prompt", "image_1", "image_2", "image_3", "audio_1", "seed", "seconds", "width", "height")
 H3_PUBLISH_NOTE = "Before posting: set each platform's AI-content disclosure (final/publish.json)."
 # The frame the h3 edit draws its cards, headline and captions on (foreman/h3/graphics.py).
@@ -540,7 +541,9 @@ class AdPipeline:
         if not isinstance(script, dict):
             script, why = self.write_script(wd, ad, bible, facts, model, ctx, client)
             if script is None:
-                return give_up(f"the brain's script failed validation after one repair: {why}")
+                n = (H3_SCRIPT_TRIES if self.is_h3(ad) else 2) - 1
+                return give_up(f"the brain's script failed validation after {'one repair' if n == 1 else f'{n} repairs'}: "
+                               f"{why}")
         if self.is_h3(ad):
             if not os.path.isfile(self.gate_path(wd)):
                 n = len(script.get("beats") or [])
@@ -570,7 +573,7 @@ class AdPipeline:
         messages = (h3core.h3_script_prompt if h3 else script_prompt)(ad, bible, facts, self.cfg)
         validate = h3core.validate_h3_script if h3 else validate_script
         raws, why = [], ""
-        for attempt in range(2):
+        for attempt in range(H3_SCRIPT_TRIES if h3 else 2):  # an h3 plan has more rules: one more repair
             raw = client.chat(model, messages, ctx, max_tokens=self.cfg.script_max_tokens)
             raws.append(raw)
             script, errors = validate(parse_reply(raw), ad, facts, bible.approved_tags(), self.cfg)
