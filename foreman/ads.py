@@ -827,8 +827,8 @@ def validate_script(obj, ad: dict, facts: dict, still_tags: list, cfg: AdsConfig
             errs.append(f"{where}: a talk shot lip-syncs exactly one line")
         covered += ln
         visual = s.get("visual")
-        if kind == "screen" and visual in (None, ""):
-            visual = ""  # a real capture: nothing to describe
+        if kind == "screen":
+            visual = ""  # a real capture: its description is never a prompt, so it may name the product's pages
         elif not isinstance(visual, str) or not visual.strip() or len(visual) > 400:
             errs.append(f"{where}: visual must describe the scene, motion and camera (at most 400 characters)")
             visual = ""

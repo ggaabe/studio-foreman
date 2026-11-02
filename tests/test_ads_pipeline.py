@@ -198,6 +198,18 @@ class P2Script(unittest.TestCase):
             self.assertIsNone(script, obj)
             self.assertIn(needle, " | ".join(errs), (needle, errs))
 
+    def test_a_screen_shot_may_describe_the_real_page_it_shows(self):
+        # Seen live: the brain described a real capture as "the product's pricing page on a mobile device
+        # screen" and the generated-UI rule refused it. A capture's description is never a prompt.
+        described = dict(SCRIPT, shots=[dict(s, visual="Static view of the product's pricing page on a phone screen.")
+                                         if s["kind"] == "screen" else s for s in SCRIPT["shots"]])
+        script, errs = self.check(described)
+        self.assertEqual(errs, [])
+        self.assertEqual([s["visual"] for s in script["shots"] if s["kind"] == "screen"], [""])
+        generated = dict(SCRIPT, shots=[dict(s, visual="Her phone showing the upload page.") if s["kind"] == "broll" else s
+                                        for s in SCRIPT["shots"]])
+        self.assertIn("product's screens", " | ".join(self.check(generated)[1]))
+
     def test_length_follows_the_template(self):
         short = dict(SCRIPT, hook="Hi.", body=["Upload it."], cta="Do it at example.com.",
                      shots=[{"kind": "talk", "lines": [0], "visual": "office"}, {"kind": "broll", "lines": [1], "visual": "desk"},
