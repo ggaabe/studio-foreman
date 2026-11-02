@@ -1057,6 +1057,26 @@ class H12ReviewFixes(unittest.TestCase):
         bad = beat_with(b1_cutaways=[{"kind": "still", "still": "payoff", "at": "files"}])
         self.assertIn("(still): the picture would be up for only 2 word(s)", errors(bad))
 
+    def test_a_price_said_without_a_currency_word_is_heard_as_the_price(self):
+        """The voice is told the reading ("nine fifty"); an ASR may write what it heard as "9.50"."""
+        ad = h3_ad()
+        line = "Forms start at $9.50. One form, filing and checking included."
+        for heard, ok in (("Forms start at 9.50. One form, filing and checking included.", True),
+                          ("Forms start at 9.5, one form, filing and checking included.", True),
+                          ("Forms start at nine fifty. One form, filing and checking included.", True),
+                          ("Forms start at 8.50. One form, filing and checking included.", False),
+                          ("Forms start at 19.50. One form, filing and checking included.", False)):
+            self.assertEqual(h3core.judge_line(line, heard, lexicon(), AdsConfig(), ad)["ok"], ok, heard)
+        self.assertFalse(h3core.judge_line(line, "Forms start at 9.50. One form, filing and checking included.",
+                                           lexicon(), AdsConfig())["ok"], "without the ad's readings it is a number")
+        self.assertEqual(h3core.heard_as_read("at 9.50, then 9.505 and 29.50", ad), "at $9.50, then 9.505 and 29.50")
+        beat = {"k": 2, "role": "body", "line": line, "words": ads._words(line), "seconds": 6.0, "cutaways": []}
+        said = line.replace("$9.50", "9.50").split()
+        words = [(w, 0.3 * i + 0.3, 0.3 * i + 0.55) for i, w in enumerate(said)]
+        v = h3core.judge_take(beat, None, lexicon(), asr(*words), {"text": " ".join(said)}, probe(duration=6.0),
+                              AdsConfig(), ad)
+        self.assertTrue(v["ok"], v["why"])
+
     def test_only_an_ai_label_is_refused_not_a_mention_of_ai(self):
         for text in ("AI-generated: file it from home", "Made with AI", "made by an AI", "Synthetic presenter",
                      "this AI presenter", "an AI voice", "computer-generated", "not a real person"):

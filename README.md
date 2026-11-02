@@ -1692,7 +1692,10 @@ naming the beat and what was heard. The dispatcher refuses an ad whose worst cas
 `h3_attempts` times) would not fit the continuation depth. A take's voice is told the line with the
 lexicon's spellings (the ad's address spelled out first: "example dot com") and the template's
 `readings` ("nine fifty" for $9.50); the speech gate must take what the voice is told for the line
-word for word, or the ad fails before any render. Nothing else in the prompt may speak for it: the
+word for word, or the ad fails before any render. An ASR may write a price said without a currency word
+as a bare number ("9.50"): every judge (the take's, each finished voice's and the mix's) reads a bare
+number equal to a reading's price as that price, and any other number as it was heard. Nothing else in
+the prompt may speak for it: the
 brain's action is held to the visual rules plus no claim, banned word, markup or quoted speech, the
 template's presenter, framing and setting likewise, and every field is stripped of the prompt's own
 markup (`<`, `>`, `[`, `]`, `{`, `}`), so the line is the prompt's one `<d>` dialogue tag.

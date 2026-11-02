@@ -1459,6 +1459,26 @@ def heard_problems(line: str, text: str, ad: dict) -> list:
     return sorted(found(text) - found(line))
 
 
+CURRENCY_WORD = re.compile(r"\b(dollars?|bucks|cents?|euros?|pounds?|pence|yen|rupees?)\b", re.I)
+
+
+def heard_as_read(text: str, ad: dict | None) -> str:
+    """A price the voice was told without a currency word (the template's reading "nine fifty" for
+    $9.50) is written by an ASR as a bare number ("9.50"): as the line writes it, that is the price.
+    Each bare number equal to a reading's price with cents is written as the price; any other number
+    stays as heard, so "8.50" is still the wrong price."""
+    out = str(text or "")
+    for display, said in (((ad or {}).get("h3") or {}).get("readings") or {}).items():
+        money = ads.typed_numbers(str(display))["money"]
+        if len(money) != 1 or "." not in money[0] or CURRENCY_WORD.search(str(said)):
+            continue
+        whole, frac = money[0].split(".", 1)
+        pat = r"(?<![\w$€£¥.,])" + re.escape(whole) + r"\." + re.escape(frac.rstrip("0") or "0") + r"0*(?![\w]|[.,]\d)"
+        price = "$" + whole + "." + (frac + "00")[:2] if str(display).lstrip().startswith("$") else str(display)
+        out = re.sub(pat, lambda m: price, out)
+    return out
+
+
 def judge_line(line: str, text: str, lex: list, cfg: ads.AdsConfig, ad: dict | None = None) -> dict:
     """A free-running transcript `text` against its line (judge_take's check 2, and the final gate's
     on each beat's finished voice): every term and number of the line heard, no other number inside
@@ -1466,7 +1486,7 @@ def judge_line(line: str, text: str, lex: list, cfg: ads.AdsConfig, ad: dict | N
     ad), wer_inner at most gate_wer_max. {ok, why, heard, wer, wer_inner, lost, missing_terms,
     missing_numbers, extra_numbers (inside the line), said (what heard_problems found)}."""
     names = [e["display"] for e in lex]
-    text = str(text or "")
+    text = heard_as_read(str(text or ""), ad)
     ref, hyp = ads.gate_tokens(line, lex), ads.gate_tokens(text[:4000], lex)
     res = ads.judge_heard(ref, hyp, cfg.gate_wer_max, names)
     extra = _inner_extra_numbers(ref, hyp, names)
@@ -1528,6 +1548,10 @@ def judge_take(beat: dict, words, lex: list, hinted, unhinted, probe, cfg: ads.A
     if not heard_line["ok"]:
         fails.append(heard_line["why"])
     v["heard_hinted"] = str((hinted or {}).get("text") or "")[:1500] if isinstance(hinted, dict) else ""
+    if isinstance(hinted, dict) and isinstance(hinted.get("words"), list):  # "9.50" heard for $9.50 (heard_as_read)
+        hinted = dict(hinted, words=[dict(w, **{k: heard_as_read(w[k], ad) for k in ("word", "text")
+                                                if isinstance(w.get(k), str)}) if isinstance(w, dict) else w
+                                     for w in hinted["words"]])
     al = align_words(words, hinted, lex, duration)
     v["words"] = [{"text": w["text"], "start": w["start"], "end": w["end"]} for w in al["words"]]
     heard = al["asr"]

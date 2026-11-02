@@ -1736,7 +1736,7 @@ class AdPipeline:
                                            f"(heard {v['heard'][:100]!r}), even edited with no pause removed")
         heard = self._heard(wd, rec["transcript"])
         ref = [t for ln in script["lines"] for t in gate_tokens(ln["text"], lex)]
-        res = self._judge(g, ref, heard)
+        res = self._judge(g, ref, h3core.heard_as_read(heard, ad))  # "9.50" for a price said "nine fifty"
         self._record(rec, heard, res)
         stem_inner = number(g["track"].get("wer_inner"))
         stem_inner = float(number(g["track"].get("wer")) or 0.0) if stem_inner is None else float(stem_inner)
