@@ -1047,6 +1047,16 @@ class H12ReviewFixes(unittest.TestCase):
         self.assertEqual(h3core.shown_hands(hits, dict(beat, tail=None), words, [0.4, 1.5, None], 4.0), hits,
                          "an untailed beat shows its take to the end")
 
+    def test_saying_the_price_is_a_direction_not_a_price_in_the_picture(self):
+        ok = beat_with(b2_action="leaning forward with a confident smile, she states the price clearly to the camera")
+        self.assertEqual(errors(ok), "")
+        bad = beat_with(b2_action="she holds up a price tag and smiles")
+        self.assertIn("leave the price and its numbers to the line", errors(bad))
+
+    def test_a_still_is_up_for_three_words(self):
+        bad = beat_with(b1_cutaways=[{"kind": "still", "still": "payoff", "at": "files"}])
+        self.assertIn("(still): the picture would be up for only 2 word(s)", errors(bad))
+
     def test_only_an_ai_label_is_refused_not_a_mention_of_ai(self):
         for text in ("AI-generated: file it from home", "Made with AI", "made by an AI", "Synthetic presenter",
                      "this AI presenter", "an AI voice", "computer-generated", "not a real person"):

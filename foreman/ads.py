@@ -153,6 +153,10 @@ SCREEN_AWAY = re.compile(
     r" away( from (the )?(camera|lens|viewer))?"
     r"|\b(with )?(the )?backs? of (the |her |his |their )?(phones?|tablets?|laptops?|screens?|devices?)"
     r" (is |are )?(facing |turned |pointed )?(toward|towards|to|at) (the )?(camera|lens|viewer)")
+# The presenter speaking about the price is a direction for the voice, not a price in the picture.
+SAYS_PRICE = re.compile(r"\b(states?|stating|says?|saying|mentions?|mentioning|explains?|explaining|announces?"
+                        r"|announcing|reads? out|tells?|telling|names?|naming|gives?|giving|quotes?|quoting)"
+                        r" (out )?(the |its |her |his |their )?(price|cost)s?\b")
 PRICE_IN_PICTURE = re.compile(r"[$€£¥₹%]|\b(prices?|dollars?|cents|percent|discounts?|sale|coupons?"
                               r"|\d+ ?(off|free))\b")
 STAGE_DIRECTION = re.compile(r"[*\[\]{}()<>_#~`|\\^]")
@@ -849,7 +853,7 @@ def visual_problems(visual: str, ad: dict, where: str) -> list:
     if ON_SCREEN_TEXT.search(seen):
         out.append(f"{where}: visual must not ask for on-screen text, signs, captions or logos (they are added in the "
                    f"edit)")
-    if PRICE_IN_PICTURE.search(seen):
+    if PRICE_IN_PICTURE.search(SAYS_PRICE.sub(" ", seen)):  # "she states the price" is how a line is said
         out.append(f"{where}: visual must not show prices, numbers or discounts (the end card states the price)")
     if GENERATED_UI.search(SCREEN_AWAY.sub(" ", seen)):  # "the screen facing away from the camera" shows none
         out.append(f"{where}: visual must not show the product's screens or pages (only a screen shot of a real "

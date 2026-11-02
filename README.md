@@ -1737,12 +1737,13 @@ The character's voice names its reference recording (`voice.ref_wav`, allowed wi
 
 **The plan.** The brain writes the beats (line, scene, action, cutaways on words of the line), with the
 template's `example` as a worked plan, and code checks them (`validate_h3_script`); an h3 plan gets two
-repairs with the problems listed before the ad fails as content. A screen or price card stays up for at
-least three words, the call to action goes on for at least two words after the web address (the end card
+repairs with the problems listed before the ad fails as content. A screen or price card or a still stays up
+for at least three words, the call to action goes on for at least two words after the web address (the end card
 cuts in on a word after it), and a tap, pulse or underline whose word the cutaway cannot draw (outside it,
 or on a card with nothing to press or underline) is left out and noted in `script.json` `dropped`, not a
 reason to throw the plan away. An action may say a phone's screen faces away from the camera: that is
-what the visual rule wants, not a product screen.
+what the visual rule wants, not a product screen; and she may state the price: that is how the line is said,
+not a price in the picture.
 
 **The media worker** (`foreman/h3/`: probe, edit, audio, captions, graphics) needs numpy and Pillow,
 which gpud's Python does not have, so the core never imports it: it runs

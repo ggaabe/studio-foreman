@@ -53,7 +53,7 @@ PUNCH_SCALE, HOLD_CTA_S, TAIL_HOOK_S, STILL_PUSH = 1.2, 1.0, 0.05, 0.06
 HIGHLIGHT, TEXT, MUTED = "#FFD700", "#FFFFFF", "#E5E7EB"
 MAX_BOX = 20000                   # px: a capture box coordinate at most
 MAX_CUTAWAYS = 2                  # per beat
-MIN_CARD_WORDS = 3                # a screen or price card stays up for at least this many words of the line
+MIN_CARD_WORDS = 3                # a screen, price or still cutaway stays up for at least this many words
 SEED_MOD = 2147483647
 CAMERA = ("Static tripod shot: the camera does not move and the framing stays exactly the same from the first frame "
           "to the last.")
@@ -766,7 +766,7 @@ overlap. Every word you name is a word of that beat's own line, written as in th
 - punch: a closer framing of the same shot, for emphasis. No other fields; at most one per beat.
 - screen: a real screen capture of the product ("capture": one of the capture ids), with an \
 optional "tap": the word on which its button is pressed (only captures that have a button).
-- still: a still picture ("still": one of the still ids).
+- still: a still picture ("still": one of the still ids), up for at least three words of the line.
 - price: the price card, only in the beat whose line states its price, at most once; "at" is the \
 price itself and the line goes on after it (such as "It costs $9.50, with everything included."), so \
 the card is up for at least three words; optional "pulse" and "underline": words on which it pulses and \
@@ -946,7 +946,10 @@ def validate_h3_script(obj, ad: dict, facts: dict, still_tags: list, cfg: ads.Ad
             action = re.sub(r"\s+", " ", CONTROL_RE.sub(" ", fold(action))).strip()
             # it goes into the H3 prompt just before the line's <d> tag, and H3 makes the voice: no markup (a
             # dialogue tag of its own), no quoted speech, no claim or banned word
-            errs += ads.visual_problems(action, ad, f"{where} action")
+            errs += [p + (" (the action is the picture and how the line is said: leave the price and its numbers to "
+                          "the line, and write how she says it, such as 'explains it with a confident smile')"
+                          if "must not show prices" in p else "")
+                     for p in ads.visual_problems(action, ad, f"{where} action")]
             errs += [p for p in prompt_problems(action, _view(ad), f"{where} action") if "prompt markup" not in p]
             m = ads.STAGE_DIRECTION.search(action)
             if m:
@@ -1065,8 +1068,9 @@ def _cutaways(raw, words: list, k: int, n: int, role: str, addr_i, scene: dict, 
                                 f"{c.get('at')!r}")
                 continue
         stop = until_i if until_i is not None else len(words)
-        if kind in ("screen", "price") and stop - at_i < MIN_CARD_WORDS:
-            problems.append(f"{at} ({kind}): the card would be up for only {stop - at_i} word(s) (from {c.get('at')!r} "
+        if kind in ("screen", "price", "still") and stop - at_i < MIN_CARD_WORDS:
+            problems.append(f"{at} ({kind}): the {'picture' if kind == 'still' else 'card'} would be up for only "
+                            f"{stop - at_i} word(s) (from {c.get('at')!r} "
                             f"to {'the end of the line' if until_i is None else repr(c.get('until'))}): start it "
                             f"earlier or keep the line going after it, so it stays up for at least {MIN_CARD_WORDS} "
                             f"words")
