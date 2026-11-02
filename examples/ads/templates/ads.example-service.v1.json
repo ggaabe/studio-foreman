@@ -30,6 +30,11 @@
     "music": {"prompt": "warm, upbeat acoustic guitar and light percussion", "bpm": 100},
     "style": "bright natural light, friendly, uncluttered",
     "language": "English",
-    "spellings": ["example.com"]
+    "spellings": ["example.com"],
+    "lexicon": [
+      {"display": "ExampleCo", "spoken": "Example Co", "respellings": ["Eggs Ample Co"],
+       "ipa": "ɪɡˈzæmpəl koʊ", "arpabet": "IH0 G Z AE1 M P AH0 L K OW1"},
+      {"display": "example.com", "spoken": "example.com", "respellings": ["example dot com"]}
+    ]
   }
 }

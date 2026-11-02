@@ -1307,12 +1307,14 @@ outputs exist is skipped, so a crash, a retry or a gpud restart resumes from the
 |---|---|---|---|
 | facts | `ad_facts` | local CPU engine | `facts.json` (the facts URL fetched, or the facts file read), `ad.json`, `character.json` |
 | script | inside `ad_next` | the resident brain | `script.json`: hook, body, call to action and 4-6 shots, validated by code |
-| voice | `ad_voice` | Kokoro, or Qwen3-TTS cloning the bible's reference WAV | `voice/line-<i>.wav`, `voice/full.wav`, `voice/track.wav` |
+| voice | `ad_voice` | Kokoro, or Qwen3-TTS cloning the bible's reference WAV | `voice/line-<i>.wav`, `voice/full.wav` (and `-a<n>.wav`, the audio gate's retakes) |
+| gate | `ad_gate` | Qwen3-ASR, free-running (no prompt) | `gate/line-<i>-a<n>.json`, `gate/track-r<n>.json`, `gate.json`, `voice/track.wav` |
 | timing | `ad_timing` | Qwen3-ASR (word times from the forced aligner) | `timing.json`: the script's words with times, cuts, 8k+1 frame counts, `voice/talk-<k>.wav` |
 | stills | `ad_stills` | image edit on mlx-serve, a ComfyUI graph, or the approved still itself | `stills/shot-<k>-a.png` (and `-b.png`, B-roll's last frame) |
 | shots | `ad_shots` | LTX: talking shots two-stage audio-to-video, N seeds each; B-roll one-stage first/last frame | `shots/shot-<k>-s<seed>.mp4` (+ sidecars with stats) |
 | music | `ad_music` | ACE-Step, instrumental, the ad's length | `music/bed.wav` |
 | assemble | `ad_assemble` | local CPU engine, ffmpeg | `final/ad.mp4`, `captions.ass`, `assembly.json`, `pick.json` |
+| mix gate | `ad_gate` | Qwen3-ASR, free-running | `gate/mix-r<n>.json` (and once more after a re-mix with the music lower) |
 | finish | `ad_finish` | local CPU engine | `final/qa.json`, `final/video.json`, `manifest.json` |
 | review | `ad_review` | the vision brain | its verdict; the item goes to review (accept or human_review) or fails (give_up) |
 
@@ -1343,8 +1345,58 @@ script gets one repair attempt with the problems listed; a second invalid one is
 The facts and every other quoted text reach the brain inside one `<untrusted>` block whose markers
 the text cannot close.
 
-**Timing.** The voice track is the line WAVs joined with short pauses (`voice_track: "lines"`, the
-default; `"full"` uses the full read instead). Qwen3-ASR transcribes it with word times, and the
+**The pronunciation lexicon.** A voice reads a brand written as one word the way it reads any
+unknown word, and a brain that reviews the finished ad cannot hear it: a brand was read as two other
+words in live ads, while the same voice and ASR got it right every time once it was respelled as two
+words. The template's `lexicon` lists such terms, `[{"display": "ExampleCo", "spoken": "Example Co",
+"respellings": ["Eggs Ample Co"], "ipa": "...", "arpabet": "..."}]`, and the owner's
+`$FOREMAN_HOME/lexicon.json` (a list of entries, or `{"entries": [...]}`) is merged under it (the
+template's entry for a term wins). The script, the captions, the end card and every check keep the
+display text; only what the voice is given changes: each term, found as a whole word in any case,
+with or without spaces or hyphens inside and with look-alike letters read as Latin, becomes its
+`spoken` spelling (default: the display), and the `respellings` (best first) are what the audio
+gate tries next. The ad's own address is a term too (said as written, then spelled out, "example
+dot com"), and a brand written inside the address is said with its own spoken spelling there too
+(and its respellings are tried once the address's own run out). Every spelling is
+checked like a spoken line when the template loads (no markup, symbols or look-alike letters, no
+claim, other brand or other address; at most 40 entries of at most 6 respellings); the owner's file
+is checked when an ad's facts step reads it, and one that does not hold stops the ad there, before
+any GPU work, as the machine's configuration (`engine_unconfigured`), not as content. `ipa` and
+`arpabet` are kept for reference and the manifest: no MLX-Serve voice is known to read them.
+
+**The audio gate** (code, on the ASR model: `ad_gate`). Every voice line, then the voice track,
+then the final mix, is transcribed free-running by Qwen3-ASR (`/v1/audio/transcriptions`,
+`response_format` json, the ad's language, no prompt and no spelling hints, no word times) and
+compared with the script. Both are normalized the same way: case, punctuation and contractions;
+a number in words or in digits is one number with its unit ("nine dollars and fifty cents" is
+"$9.50", "twenty percent" is "20%", "2 million" is "2,000,000"); "dot com" is ".com"; and a lexicon
+term heard as any of its spellings is the term. A take passes when every lexicon term and every
+number of its line was heard (as often as the line says it) and its word error rate is at most
+`gate_wer_max` (0.08). The forced aligner's word times are never a check: they assume the script.
+A take that fails is said again: with a new seed when the voice varies by seed (Qwen3-TTS;
+`gate_rerolls` per spelling), then with the next respelling of each term it did not hear, up to
+`gate_attempts` (4)
+takes of a line; Kokoro reads the same words the same way, so a line it misreads with no spelling
+left (a wrong number, say) fails at once. When every line passes alone, the track made of the
+passing takes is checked too, and a line it loses is said again the same way. A line that still
+fails fails the ad as content, before anything renders, with a reason that names the term and what
+was heard ("audio gate: line 0 never said 'ExampleCo': heard 'example cove' (2 take(s), said as
+'Example Co', 'Eggs Ample Co')"): the owner never gets that ad. After the cut, the final mix is
+transcribed the same way: it must still say every term and number and may not lose more than
+`gate_mix_margin` (0.05) of the script's words beyond what the voice track alone lost (music
+masking the voice; extra words heard in the music do not count). If it does, the ad is mixed once
+more with the music `gate_remix_db` (8 dB) lower and checked again; a second loss is a content
+failure. Every take (what the voice was given, its seed, why it was taken, what was heard, the word
+error rate, the terms and numbers it missed), every track and mix check, and the verdicts are kept
+in `gate.json` and the gate's files in `gate/`, and go into the manifest. The transcriptions need no
+word times, so a companion model their requests loaded (the forced aligner) is unloaded as soon as
+the gate's job ends, through the adapter's companion record (one that was resident before is never
+touched).
+
+**Timing.** The voice track is the line takes the audio gate passed, joined with short pauses
+(`voice_track: "lines"`, the default; `"full"` uses the full read instead, and the gate then judges
+and retakes the full read). Qwen3-ASR transcribes it with word times (here, and only here, the
+template's `spellings` and the lexicon's display terms are given as spelling hints), and the
 times are mapped onto the script's own words by an edit-distance alignment, so captions show the
 script ("example.com", "$9.50") and never the ASR's spelling; a word the ASR dropped is
 interpolated. The ASR answer is untrusted: one with more words than the track could hold is
@@ -1386,14 +1438,19 @@ peak (ebur128), black intervals (blackdetect) before the end card, frozen interv
 inside generated shots, flat frames (a NaN-poisoned render decodes to a flat picture), finite
 measurements, and the captions and the label measured as drawn (the frame comparison above, not a
 flag). Then `ad_review` runs on the vision brain: it reads
-the facts, the spoken words, the end card and the QA, and compares sampled frames with the
-bible's hero still. It can accept only when the facts and the character both check out and it saw
-the images; otherwise the ad goes to the owner flagged (`human_review`) or fails (`give_up`).
+the facts, the spoken words, what the audio gate heard in the final mix, the gate's verdict, the end
+card and the QA, and compares sampled frames with the bible's hero still. It can accept only when
+the facts and the character both check out, it saw the images and the audio gate passed; an ad whose
+gate failed is given up without asking it, and one with no gate record cannot be accepted.
+Otherwise the ad goes to the owner flagged (`human_review`) or fails (`give_up`). The item's note
+(and so the phone's caption) starts with the gate's result ("audio gate passed (voice WER 0.00, mix
+WER 0.02, 1 retake(s))").
 
 **The manifest** (`manifest.json`): models per role and their licenses, versions (mlx-serve,
 ComfyUI, ffmpeg), the backends and graphs, every seed (stills, takes with their scores and which
 one was picked, music), the disclosure flags, a snapshot of the facts with their hash, the
-script, the shots, the QA, every step's job and duration, and the review.
+script, the shots, the QA, the audio gate (the lexicon used and every take, track and mix check),
+every step's job and duration, and the review.
 
 **Failures.** An infrastructure failure of a step (a crash, a timeout, an engine lost, a load that
 never fit, a restart) is retried by `ad_recover` with the same request; its finished outputs are
@@ -1475,7 +1532,8 @@ block: `concept`, `character`, `facts` (`{"url": ...}` or `{"file": "assets/fact
 under `$FOREMAN_HOME/assets`, never a secret or the configuration), `cta`, `end_card` (`price`,
 `url`, `cta`, `still`, `background`), `disclosure` (it must say the ad is AI-generated),
 `ai_label`, `captures` (files under `$FOREMAN_HOME/assets`), `banned_marks`, `music`, `style`,
-`language`, `spellings` (terms the ASR should spell your way), `talk_seeds`. Its `params` are
+`language`, `spellings` (terms the timing ASR should spell your way), `lexicon` (see "The
+pronunciation lexicon"), `talk_seeds`. Its `params` are
 `seconds` (15 up to what the shots allow), `shots` (4 to 6) and `seed`. Every shot but the end card
 lasts at most `max_shot_s` (8 s) and the end card 3 s, so six shots run about 46 s at most: a
 template whose `seconds.max` is longer than its `shots.max` can run is refused when it loads. The
@@ -1509,9 +1567,14 @@ python3 -m foreman.cli ads models [--rescan]     # the configured model per role
 - `voice_track`, `line_gap_s`, `endcard_s`, `words_per_s`, `min_shot_s`, `max_shot_s`,
   `music_db`, `duck_threshold`, `duck_ratio`, `loudness_lufs`, `true_peak_db`, `max_mb`, `fonts`,
   `endcard_color`, `push_in`.
-- `expected`: seconds per unit (`still`, `talk`, `broll`, `line`, `full`, `asr`, `music`,
-  `assemble`, `finish`, `script`, `review`, `dispatch`), and `max_job_s` (600): a step's units are
-  packed into jobs up to that expected time, so every lease stays inside gpud's brainless budget.
+- `expected`: seconds per unit (`still`, `talk`, `broll`, `line`, `full`, `asr`, `gate` (one
+  gate transcription), `music`, `assemble`, `finish`, `script`, `review`, `dispatch`), and
+  `max_job_s` (600): a step's units are packed into jobs up to that expected time, so every lease
+  stays inside gpud's brainless budget.
+- The audio gate: `gate_wer_max` (0.08), `gate_attempts` (4 takes of a line at most),
+  `gate_rerolls` (1 new seed per spelling, for a voice that varies by seed), `gate_mix_margin`
+  (0.05), `gate_remix_db` (8); `lexicon_file` (default `$FOREMAN_HOME/lexicon.json`; see
+  `examples/ads/lexicon.json`).
 - `characters_dir`, `assets_dir`, `commercial_models`, `max_jobs`, `keep_segments`.
 - `comfyui_options`: `dir`, `python`, `port`, `graphs_dir`, `plan_gb` (the footprint gpud plans
   ComfyUI with, 60 by default: it fits beside the brain and the owner's default model in gpud's
@@ -1519,7 +1582,8 @@ python3 -m foreman.cli ads models [--rescan]     # the configured model per role
   `extra_args`.
 
 The deployment policy allows 64 continuation hops per lineage (an ad is up to about twenty steps,
-two hops each, plus retries); the dispatcher refuses an ad whose planned jobs would not fit.
+two hops each, plus retries, the audio gate's retake rounds and one re-mix); the dispatcher refuses
+an ad whose planned jobs would not fit.
 
 ### Known gaps of the ad pipeline
 
@@ -1554,6 +1618,17 @@ two hops each, plus retries); the dispatcher refuses an ad whose planned jobs wo
   raises `ads_options.max_shot_s` is not seen when templates load.
 - The disk guard counts an ad's whole estimate while it runs, without subtracting what it has
   already written (conservative).
+- The audio gate hears with the same ASR that gives the word times, so a word that ASR always
+  mishears looks like a voice error: such a line fails the ad (raise `gate_wer_max`, or add the
+  word to the lexicon with a spelling both get right). Its normalization covers the usual forms
+  (numbers in words or digits with their unit, ".com", contractions, compounds such as "e-mail"),
+  not every one ("nine fifty" for $9.50 is two numbers), and a lexicon term that is also a common
+  phrase counts wherever the phrase is said. The music-masking check compares the ASR's view of the
+  mix with its view of the voice track; it does not measure the loudness of the voice against the
+  music. Whether MLX-Serve's Qwen3-ASR loads the forced aligner for a plain JSON transcription is
+  not verified (the gate unloads it either way), and whether its Kokoro reads `ipa` or `arpabet`
+  is not known (they are not sent). The tests use the fake MLX-Serve, whose voice says what a test
+  tells it and whose ASR hears what each WAV holds; the gate has not run against the Studio yet.
 
 ## Known gaps
 

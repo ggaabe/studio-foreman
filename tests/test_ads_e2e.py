@@ -122,7 +122,6 @@ class E1HappyPath(AdHarness):
 
     def test_one_ad_from_enqueue_to_the_review_queue(self):
         self.fake.chat_replies.extend([json.dumps(SCRIPT), REVIEW_OK])
-        self.fake.asr_text = " ".join([SCRIPT["hook"]] + SCRIPT["body"] + [SCRIPT["cta"]])
         res = self.enqueue()
         self.assertTrue(self.run_until(self.done(res["item"])), self.trail())
         it = self.item(res["item"])
@@ -134,7 +133,8 @@ class E1HappyPath(AdHarness):
         self.assertNotIn(".mp4", "".join(os.path.basename(a) for a in it["artifacts"][1:]))
         # every step ran as a gpud job, in order, one GPU stack at a time
         kinds = [j.kind for j in self.jobs() if j.kind.startswith("ad_") and j.requires != "brain"]
-        order = ["ad_facts", "ad_voice", "ad_timing", "ad_stills", "ad_shots", "ad_music", "ad_assemble", "ad_finish"]
+        order = ["ad_facts", "ad_voice", "ad_gate", "ad_timing", "ad_stills", "ad_shots", "ad_music", "ad_assemble",
+                 "ad_finish"]
         self.assertEqual([k for k in dict.fromkeys(kinds)], order, kinds)
         self.assertEqual(len(self.fake.video_requests), 2 * 2 + 2, "two talking shots x two seeds, two B-roll takes")
         self.assertEqual(kinds.count("ad_shots"), 2, "takes packed into jobs of at most max_job_s, one kind per job")

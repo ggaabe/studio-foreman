@@ -11,6 +11,7 @@ they exist), and a crash anywhere resumes from the files.
       ad.json  character.json  facts.json        the spec, the bible snapshot, the facts (step a)
       script.json  script.raw.txt                the brain's lines and shot list, validated (b)
       voice/line-<i>.wav  voice/full.wav  voice/track.wav  voice/talk-<k>.wav            (c)
+      voice/line-<i>-a<n>.wav  gate/*.json  gate.json   the audio gate's retakes and what it heard (c')
       timing/track.json  timing.json             ASR word times mapped onto the script (d)
       stills/shot-<k>-a.png [-b.png]             keyframes from the bible's approved stills (e)
       shots/shot-<k>-s<seed>.mp4 (+ .meta.json)  talking takes (N seeds), B-roll (f)
@@ -24,13 +25,20 @@ The steps, their job kinds and where they run:
     a facts     ad_facts     local CPU engine     fetch the facts URL or read the facts file
     b script    (ad_next)    the resident brain   lines + 4-6 shots as JSON, validated by code;
                                                   one repair attempt, then a content failure
-    c voice     ad_voice     TTS model            each line, and the full read
+    c voice     ad_voice     TTS model            each line, and the full read, lexicon terms in their
+                                                  spoken spelling
+    c' gate     ad_gate      ASR model            free-running transcriptions of every line and the
+                                                  track: every term and number heard, a low word
+                                                  error rate; else a retake (seed, respelling), then
+                                                  a content failure
     d timing    ad_timing    ASR model            word times -> per-shot cuts and 8k+1 frames
     e stills    ad_stills    image model | ComfyUI | the approved still itself ("direct")
     f shots     ad_shots     LTX (or a ComfyUI graph): talking shots two-stage audio-to-video,
                                                   N seeds each; B-roll one-stage first/last frame
     g music     ad_music     ACE-Step instrumental of the ad's length
     h assemble  ad_assemble  local CPU engine     ffmpeg (foreman/assembly.py)
+    h' mix gate ad_gate      ASR model            the final mix may not lose words against the voice
+                                                  (music masking): one re-mix lower, then content
     i finish    ad_finish    local CPU engine     QA, manifest; then ad_review on the vision brain
                                                   checks the transcript, end card and character
 
@@ -54,6 +62,7 @@ import os
 import re
 import secrets
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field
 
 from . import characters
@@ -63,11 +72,12 @@ from .text import CONTROL_RE, fold, has_bidi, mixed_script_words, skeleton
 log = logging.getLogger("foreman.ads")
 
 FPS = 24
-JOB_KINDS = ("ad_facts", "ad_voice", "ad_timing", "ad_stills", "ad_shots", "ad_music", "ad_assemble", "ad_finish")
+JOB_KINDS = ("ad_facts", "ad_voice", "ad_gate", "ad_timing", "ad_stills", "ad_shots", "ad_music", "ad_assemble",
+             "ad_finish")
 BRAIN_KINDS = ("ad_next", "ad_recover", "ad_review")
 KIND_FAMILIES = {"ad_facts": ("cpu",), "ad_assemble": ("cpu",), "ad_finish": ("cpu",), "ad_voice": ("tts",),
-                 "ad_timing": ("asr",), "ad_stills": ("image", "comfy"), "ad_shots": ("video", "comfy"),
-                 "ad_music": ("music",)}
+                 "ad_gate": ("asr",), "ad_timing": ("asr",), "ad_stills": ("image", "comfy"),
+                 "ad_shots": ("video", "comfy"), "ad_music": ("music",)}
 SHOT_KINDS = ("talk", "broll", "screen", "endcard")
 ROLES = ("tts", "tts_clone", "asr", "image", "video", "music", "cpu", "comfy")
 BACKENDS = ("mlx", "comfyui")
@@ -216,6 +226,14 @@ class AdsConfig:
     assets_dir: str = ""               # default: $FOREMAN_HOME/assets
     commercial_models: list = field(default_factory=list)  # more models cleared for commercial use
     keep_segments: bool = False
+    # The audio gate: every voice line, the voice track and the final mix are transcribed free-running
+    # (no prompt) and compared with the script; see ads.judge_heard and AdPipeline.step_gate.
+    gate_wer_max: float = 0.08         # a line's (and the track's) word error rate at most this
+    gate_attempts: int = 4             # takes of one line at most (re-rolls and respellings included)
+    gate_rerolls: int = 1              # new seeds per spelling, for a voice whose take changes with the seed
+    gate_mix_margin: float = 0.05      # the mix may lose at most this share of words more than the voice stem
+    gate_remix_db: float = 8.0         # the one re-mix lowers the music bed by this much
+    lexicon_file: str = ""             # the owner's pronunciation lexicon (default: $FOREMAN_HOME/lexicon.json)
 
     @classmethod
     def from_dict(cls, data, **base) -> "AdsConfig":
@@ -258,6 +276,16 @@ class AdsConfig:
                             "video_max_mb (45 by default), a bigger one only as a frame")
         if len(self.lora_paths or []) != len(self.lora_scales or []) or len(self.lora_paths or []) > 8:
             problems.append("lora_paths and lora_scales must be parallel lists of at most 8")
+        for k, lo, hi in (("gate_wer_max", 0.0, 0.5), ("gate_mix_margin", 0.0, 0.5), ("gate_remix_db", 1.0, 30.0)):
+            v = number(getattr(self, k))
+            if v is None or not lo <= v <= hi:
+                problems.append(f"{k} must be a number in [{lo:g}, {hi:g}]")
+        for k, lo, hi in (("gate_attempts", 1, 8), ("gate_rerolls", 0, 4)):
+            v = getattr(self, k)
+            if not isinstance(v, int) or isinstance(v, bool) or not lo <= v <= hi:
+                problems.append(f"{k} must be an integer in {lo}..{hi}")
+        if not isinstance(self.lexicon_file, str):
+            problems.append("lexicon_file must be a path")
         if problems:
             raise ValueError("ads options: " + "; ".join(problems))
 
@@ -265,14 +293,15 @@ class AdsConfig:
         return float((self.expected or {}).get(unit) or EXPECTED[unit])
 
 
-EXPECTED = {"facts": 30.0, "script": 300.0, "line": 6.0, "full": 20.0, "asr": 40.0, "still": 60.0, "talk": 420.0,
-            "broll": 150.0, "music": 120.0, "assemble": 300.0, "finish": 120.0, "review": 240.0, "dispatch": 90.0}
+EXPECTED = {"facts": 30.0, "script": 300.0, "line": 6.0, "full": 20.0, "asr": 40.0, "gate": 15.0, "still": 60.0,
+            "talk": 420.0, "broll": 150.0, "music": 120.0, "assemble": 300.0, "finish": 120.0, "review": 240.0,
+            "dispatch": 90.0}
 
 
 # ---------------------------------------------------------------- the template's "ad" block
 
 AD_KEYS = ("concept", "character", "facts", "cta", "end_card", "disclosure", "ai_label", "captures", "banned_marks",
-           "banned_words", "music", "style", "language", "spellings", "talk_seeds")
+           "banned_words", "music", "style", "language", "spellings", "talk_seeds", "lexicon")
 END_CARD_KEYS = ("price", "url", "cta", "still", "background")
 
 
@@ -358,6 +387,9 @@ def parse_ad_block(block, problems: list) -> dict | None:
     if seeds is not None and (not isinstance(seeds, int) or isinstance(seeds, bool) or not 1 <= seeds <= 8):
         problems.append("ad.talk_seeds must be 1..8")
     out["talk_seeds"] = seeds
+    out["lexicon"] = parse_lexicon(block.get("lexicon"), "ad.lexicon", problems,
+                                   {"banned_marks": out["banned_marks"], "banned_words": out["banned_words"],
+                                    "end_card": out["end_card"]})
     if out["cta"] and out["end_card"]:
         ad_view = {"banned_marks": out["banned_marks"], "banned_words": out["banned_words"], "end_card": out["end_card"]}
         for where, txt in (("ad.cta", out["cta"]), ("ad.end_card.cta", out["end_card"].get("cta")),
@@ -390,7 +422,8 @@ def estimate(spec: dict, cfg: AdsConfig | None = None) -> tuple:
     shots = int(spec.get("shots") or 5)
     talk, other = 2, max(0, shots - 3)
     seeds = int(spec.get("talk_seeds") or cfg.talk_seeds)
-    gpu = (cfg.exp("script") + 6 * cfg.exp("line") + cfg.exp("full") + cfg.exp("asr") + (talk + 2 * other) * cfg.exp("still")
+    gpu = (cfg.exp("script") + 6 * cfg.exp("line") + cfg.exp("full") + cfg.exp("asr") + 8 * cfg.exp("gate")
+           + (talk + 2 * other) * cfg.exp("still")
            + talk * seeds * cfg.exp("talk") + other * cfg.exp("broll") + cfg.exp("music") + cfg.exp("assemble")
            + cfg.exp("finish") + cfg.exp("review"))
     take = cfg.video_width * cfg.video_height * 3 * 297 * 0.05  # a muxed take is a few % of its raw frames
@@ -501,13 +534,13 @@ def _scan_numbers(text) -> list:
             kind = "money"
         found.append((_norm_num(val), kind))
     words = re.findall(r"[a-z]+", re.sub(r"(\d)", " ", t).replace("-", " "))
-    for val, kind in _word_numbers(words):
+    for val, kind, _a, _b in _word_numbers(words):
         found.append((_norm_num(val), kind))
     return found
 
 
 def _word_numbers(words: list) -> list:
-    """Spelled-out numbers [(value, kind)] with money and percent context: 'nine dollars and fifty
+    """Spelled-out numbers [(value, kind, first word, end word)] with money and percent context: 'nine dollars and fifty
     cents' -> 9.5 money, 'forty two' -> 42, 'ten percent' -> 10 percent, 'a hundred dollars' -> 100
     money, 'two million' -> 2000000. A bare 'one' (a pronoun as often as a number) counts only
     before a unit or a scale ('one dollar', 'one hundred'), 'a' only before a scale."""
@@ -553,37 +586,39 @@ def _word_numbers(words: list) -> list:
         if val is None:
             i += 1
             continue
+        i0 = i
         j = i + used
         if j < n and words[j] in MONEY_AFTER:
             j += 1
             k = j + (1 if j < n and words[j] == "and" else 0)
             cents, cu = read(k) if k < n else (None, 0)
             if cents is not None and k + cu < n and words[k + cu] in ("cent", "cents"):
-                out.append((val + cents / 100.0, "money"))
+                out.append((val + cents / 100.0, "money", i0, k + cu + 1))
                 i = k + cu + 1
                 continue
             if cents is not None and cu and k == j and cents < 100:  # "three dollars forty"
-                out.append((val + cents / 100.0, "money"))
+                out.append((val + cents / 100.0, "money", i0, k + cu))
                 i = k + cu
                 continue
-            out.append((float(val), "money"))
+            out.append((float(val), "money", i0, j))
             i = j
             continue
         if j < n and words[j] in ("cent", "cents"):
-            out.append((val / 100.0, "money"))
+            out.append((val / 100.0, "money", i0, j + 1))
             i = j + 1
             continue
         if j < n and words[j] == "percent" or (j + 1 < n and words[j] == "per" and words[j + 1] == "cent"):
-            out.append((float(val), "percent"))
-            i = j + 1
+            end = j + (2 if words[j] == "per" else 1)
+            out.append((float(val), "percent", i0, end))
+            i = end
             continue
         if j < n and words[j] == "point":
             dec, du = basic(j + 1)
             if dec is not None:
-                out.append((float(f"{val}.{dec}"), "count"))
+                out.append((float(f"{val}.{dec}"), "count", i0, j + 1 + du))
                 i = j + 1 + du
                 continue
-        out.append((float(val), "count"))
+        out.append((float(val), "count", i0, j))
         i = j
     return out
 
@@ -959,6 +994,512 @@ def neutralize(text) -> str:
 
 def untrusted_block(label: str, text, limit: int) -> str:
     return f"<untrusted>\n{label}:\n{neutralize(str(text or '')[:limit])}\n</untrusted>"
+
+
+# ---------------------------------------------------------------- the pronunciation lexicon
+
+LEXICON_KEYS = ("display", "spoken", "respellings", "ipa", "arpabet")
+MAX_LEXICON = 40
+MAX_RESPELLINGS = 6
+LEXICON_FILE_MAX_BYTES = 256 * 1024
+# Voice engines whose take changes with the seed (Qwen3-TTS samples): a take the audio gate refuses
+# is re-rolled with a new seed before a respelling is tried. Kokoro reads deterministically, so a
+# new seed would only repeat the same take.
+SEEDED_VOICES = ("qwen3_clone",)
+_ARPABET = re.compile(r"^[A-Z]{1,2}[012]?(?: [A-Z]{1,2}[012]?)*$")
+
+
+def _plain_text(text) -> bool:
+    return isinstance(text, str) and bool(text.strip()) and not CONTROL_RE.search(text) and not has_bidi(text)
+
+
+def _clean(text: str) -> str:
+    return re.sub(r"\s+", " ", fold(text)).strip()
+
+
+def _speakable(form: str, where: str, ad_view) -> list:
+    """Why a lexicon spelling cannot go to the voice: markup, symbols, no letters, look-alike letters
+    of another script, and (with the ad's rules) a banned claim, another brand or another address."""
+    out = text_problems(form, where)
+    m = STAGE_DIRECTION.search(form)
+    if m:
+        out.append(f"{where} has markup ({m.group(0)!r}): write it the way it is said")
+    if any(unicodedata.category(ch) in ("So", "Sk", "Co") for ch in form):
+        out.append(f"{where} has symbols or emoji: write only words")
+    if not re.search(r"[^\W_]", form):
+        out.append(f"{where} has no letters")
+    if ad_view is not None:
+        own = _host((ad_view.get("end_card") or {}).get("url") or "")
+        out += [f"{where}: {p}" for p in claim_problems(form) + mark_problems(form, ad_view.get("banned_marks"))
+                + url_problems(form, own) + banned_word_problems(form, ad_view.get("banned_words"))]
+    return out
+
+
+def parse_lexicon(value, where: str, problems: list, ad_view: dict | None = None) -> list:
+    """A pronunciation lexicon: [{display, spoken, respellings, ipa, arpabet}]. `display` is the term
+    as the script, the captions, the end card and the checks write it; `spoken` is what the voice is
+    given instead (default: the display); `respellings` are more spellings for the voice, best first,
+    tried when the audio gate does not hear the term. `ipa` and `arpabet` are kept for reference and
+    the manifest (no MLX-Serve voice is known to read them). Appends to `problems`; returns the
+    cleaned entries."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > MAX_LEXICON:
+        problems.append(f"{where} must be a list of at most {MAX_LEXICON} entries {{display, spoken, respellings, "
+                        f"ipa, arpabet}}")
+        return []
+    out, seen = [], set()
+    for k, e in enumerate(value):
+        at = f"{where}[{k}]"
+        if not isinstance(e, dict) or set(e) - set(LEXICON_KEYS) or "display" not in e:
+            problems.append(f"{at} must be an object with a display (fields: {', '.join(LEXICON_KEYS)})")
+            continue
+        bad = []
+        display = e.get("display")
+        if not _plain_text(display) or len(display) > 60 or not re.search(r"[^\W_]", display):
+            bad.append(f"{at}.display must be the term as written, at most 60 characters")
+        spoken = e.get("spoken", display)
+        if not _plain_text(spoken) or len(spoken) > 120:
+            bad.append(f"{at}.spoken must be text of at most 120 characters: the way the voice should say it")
+        resp = e.get("respellings", [])
+        if not isinstance(resp, list) or len(resp) > MAX_RESPELLINGS or \
+                not all(_plain_text(r) and len(r) <= 120 for r in resp):
+            bad.append(f"{at}.respellings must be a list of at most {MAX_RESPELLINGS} spellings, best first")
+            resp = []
+        ipa, arpa = e.get("ipa"), e.get("arpabet")
+        if ipa is not None and (not _plain_text(ipa) or len(ipa) > 80):
+            bad.append(f"{at}.ipa must be text of at most 80 characters")
+        if arpa is not None and (not isinstance(arpa, str) or len(arpa) > 160 or not _ARPABET.match(arpa.strip())):
+            bad.append(f"{at}.arpabet must be ARPAbet phonemes separated by spaces (such as 'IH0 G Z AE1 M P AH0 L')")
+        if bad:
+            problems.extend(bad)
+            continue
+        display = _clean(display)
+        forms_ = list(dict.fromkeys([_clean(spoken)] + [_clean(r) for r in resp]))
+        for j, f in enumerate(forms_):
+            bad += _speakable(f, f"{at}.{'spoken' if j == 0 else 'respellings'} {f!r}", ad_view)
+        key = gate_key(display)
+        if not key:
+            bad.append(f"{at}.display {display!r} has no word to listen for")
+        elif key in seen:
+            bad.append(f"{at}: {display!r} is listed twice")
+        if bad:
+            problems.extend(bad)
+            continue
+        seen.add(key)
+        entry = {"display": display, "spoken": forms_[0], "respellings": forms_[1:]}
+        if ipa is not None:
+            entry["ipa"] = _clean(ipa)
+        if arpa is not None:
+            entry["arpabet"] = " ".join(arpa.split())
+        out.append(entry)
+    return out
+
+
+def read_lexicon_file(path: str, ad_view: dict | None = None) -> tuple:
+    """(entries, problems) of the owner's lexicon file: a JSON list of entries, or {"entries": [...]}.
+    A missing file is an empty lexicon."""
+    import json
+    if not path or not os.path.exists(path):
+        return [], []
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(LEXICON_FILE_MAX_BYTES + 1)
+        if len(raw) > LEXICON_FILE_MAX_BYTES:
+            return [], [f"{path} is larger than {LEXICON_FILE_MAX_BYTES // 1024} KB"]
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError) as e:
+        return [], [f"{path} is not readable JSON ({type(e).__name__}: {str(e)[:120]})"]
+    if isinstance(data, dict) and set(data) == {"entries"}:
+        data = data["entries"]
+    problems = []
+    entries = parse_lexicon(data, "lexicon.json", problems, ad_view)
+    return entries, problems
+
+
+def merge_lexicon(template: list, owner: list) -> list:
+    """The template's entries, then the owner file's for terms the template does not list (the
+    template's spelling of a term wins)."""
+    out = [dict(e, source="template") for e in template or []]
+    keys = {gate_key(e["display"]) for e in out}
+    for e in owner or []:
+        if gate_key(e["display"]) not in keys:
+            out.append(dict(e, source="owner"))
+            keys.add(gate_key(e["display"]))
+    return out
+
+
+def lex_forms(entry: dict) -> list:
+    """The spellings the voice may be given for a term, in the order they are tried."""
+    return list(dict.fromkeys([entry.get("spoken") or entry["display"]] + list(entry.get("respellings") or [])))
+
+
+def match_forms(entry: dict) -> list:
+    """Every way a term may be written or heard: its display, its spellings, and for a web address
+    the same with www. in front."""
+    forms_ = [entry["display"]] + lex_forms(entry)
+    if re.fullmatch(r"[^\s/]+\.[a-z]{2,}(/\S*)?", entry["display"].lower()):
+        forms_.append("www." + entry["display"])
+    return list(dict.fromkeys(forms_))
+
+
+def address_entry(url: str) -> dict:
+    """The ad's own address as a lexicon term: said as written first, then spelled out ('example dot
+    com')."""
+    url = str(url).strip()
+    spelled = re.sub(r"\s+", " ", url.replace(".", " dot ").replace("/", " slash ")).strip()
+    return {"display": url, "spoken": url, "respellings": [spelled] if spelled != url else [], "source": "address"}
+
+
+def gate_lexicon(ad: dict) -> list:
+    """The terms the audio gate listens for: the ad's lexicon (the template's merged over the owner
+    file's, as its facts step recorded it) and the ad's own web address, unless an entry covers it."""
+    lex = [dict(e) for e in ad.get("lexicon") or [] if isinstance(e, dict) and isinstance(e.get("display"), str)]
+    url = str((ad.get("end_card") or {}).get("url") or "").strip()
+    if url:
+        key = gate_key(url)
+        if not any(gate_key(f) == key for e in lex for f in match_forms(e)):
+            lex.append(address_entry(url))
+    return lex
+
+
+def _form_rx(form: str) -> str:
+    parts = [re.escape(p) for p in re.split(r"[\s\-]+", skeleton(form).strip()) if p]
+    return r"[\s\-]+".join(parts)
+
+
+def _substitute(text: str, lexicon: list, choice: dict, exclude=None, depth: int = 0) -> tuple:
+    pats = []
+    for idx, e in enumerate(lexicon):
+        if idx == exclude:
+            continue
+        for f in match_forms(e):
+            for g in dict.fromkeys((f, re.sub(r"[\s\-]+", "", f))):
+                rx = _form_rx(g)
+                if rx:
+                    pats.append((len(g), rx, idx))
+    if not pats:
+        return text, {}
+    pats.sort(key=lambda x: -x[0])
+    big = re.compile(r"(?<![^\W_])(?:" + "|".join(p for _, p, _ in pats) + r")(?![^\W_])", re.IGNORECASE)
+    compiled = [(re.compile(p, re.IGNORECASE), idx) for _, p, idx in pats]
+    seen = skeleton(text)
+    if len(seen) != len(text):  # positions would not map back (the text is not folded): match as is
+        seen = text
+    out, pos, used = [], 0, {}
+    for m in big.finditer(seen):
+        idx = next((i for c, i in compiled if c.fullmatch(m.group(0))), None)
+        if idx is None:
+            continue
+        ladder = lex_forms(lexicon[idx])
+        try:
+            pick = int(choice.get(str(idx), 0))
+        except (TypeError, ValueError):
+            pick = 0
+        form = ladder[min(max(0, pick), len(ladder) - 1)]
+        if depth == 0:  # a term inside the chosen spelling (a brand inside its address) gets its own
+            form, inner = _substitute(form, lexicon, choice, exclude=idx, depth=1)
+            used.update(inner)
+        out.append(text[pos:m.start()])
+        out.append(form)
+        pos = m.end()
+        used[lexicon[idx]["display"]] = form
+    out.append(text[pos:])
+    return "".join(out), used
+
+
+def spoken_text(text: str, lexicon: list, choice: dict | None = None) -> tuple:
+    """(what the voice is given, {display: the spelling used}). Every lexicon term in `text`, written
+    any of its ways (whole words, any case, look-alike letters read as Latin, spaces or hyphens
+    inside it or not), becomes the spelling `choice` picks for it ({entry index: index into
+    [spoken] + respellings}, 0 by default). The script itself keeps the display text."""
+    return _substitute(fold(str(text or "")), list(lexicon or []), dict(choice or {}))
+
+
+def inner_terms(lexicon: list, idx: int) -> list:
+    """Indexes of the other terms written inside entry `idx` (a brand inside its address)."""
+    keys = [gate_key(f) for f in match_forms(lexicon[idx])]
+    out = []
+    for j, e in enumerate(lexicon):
+        if j != idx and any(gate_key(e["display"]) and gate_key(e["display"]) in k for k in keys):
+            out.append(j)
+    return out
+
+
+def advance_spelling(lexicon: list, choice: dict, failing: list) -> dict | None:
+    """The spellings to try after the audio gate did not hear the terms `failing` (entry indexes):
+    each one's next respelling or, for a term with none left, the next respelling of a term written
+    inside it. None when no failing term has a spelling left."""
+    new, moved = dict(choice or {}), False
+    for idx in failing:
+        cur = int(new.get(str(idx), 0))
+        if cur + 1 < len(lex_forms(lexicon[idx])):
+            new[str(idx)] = cur + 1
+            moved = True
+            continue
+        for j in inner_terms(lexicon, idx):
+            c = int(new.get(str(j), 0))
+            if c + 1 < len(lex_forms(lexicon[j])):
+                new[str(j)] = c + 1
+                moved = True
+                break
+    return new if moved else None
+
+
+# ---------------------------------------------------------------- the audio gate: what was heard
+
+# A free-running transcription (no prompt, no spelling hints) is compared with the script after
+# both are normalized the same way: case, punctuation and contractions; numbers in words or digits
+# as one token with their unit ('$9.50' = 'nine dollars and fifty cents'); 'dot com' = '.com'; and
+# every lexicon term, however it is written or heard as one of its spellings, as one token.
+_GATE_TOKEN = re.compile(r"[$€£¥₹%]|\d+(?:,\d{3})+(?:\.\d+)?(?![\d,])|\d+(?:\.\d+)?|\.\d+|[^\W\d_]+")
+_CONTRACTIONS = tuple((re.compile(a), b) for a, b in (
+    (r"\bcan't\b", "can not"), (r"\bcannot\b", "can not"), (r"\bwon't\b", "will not"), (r"\bshan't\b", "shall not"),
+    (r"n't\b", " not"), (r"'re\b", " are"), (r"'ll\b", " will"), (r"'ve\b", " have"), (r"\bi'm\b", "i am"),
+    (r"\blet's\b", "let us"), (r"\b(it|that|there|what|here|he|she|who|where|how)'s\b", r"\1 is")))
+_SAME_WORD = {"okay": "ok", "alright": "allright"}
+_CURRENCY_TOKENS = frozenset(CURRENCY)
+_CURRENCY_CODES = ("usd", "eur", "gbp", "cad", "aud")
+
+
+def _gate_raw(text) -> list:
+    t = _seen(text)
+    t = re.sub("[‘’ʼ`´]", "'", t)
+    for rx, rep in _CONTRACTIONS:
+        t = rx.sub(rep, t)
+    t = t.replace("'", "")
+    t = re.sub(r"(?<=[^\W_])\.(?=[^\W\d_])", " dot ", t)  # example.com -> example dot com (not 9.50)
+    t = t.replace("&", " and ")
+    return [(m.group(0), m.start(), m.end()) for m in _GATE_TOKEN.finditer(t)]
+
+
+def gate_key(text) -> str:
+    """A term's words run together as the gate compares them: 'Example Co', 'ExampleCo' and
+    'example-co' are 'exampleco'; 'example.com' and 'example dot com' are 'exampledotcom'."""
+    return "".join(tok for tok, _, _ in _gate_raw(text) if tok[0].isalnum())
+
+
+def _mark_terms(toks: list, lexicon: list) -> list:
+    keys = {}
+    for idx, e in enumerate(lexicon):
+        for f in match_forms(e):
+            k = gate_key(f)
+            if k and k not in keys:
+                keys[k] = idx
+    if not keys:
+        return toks
+    longest = max(len(k) for k in keys)
+    out, i, n = [], 0, len(toks)
+    while i < n:
+        hit, joined = None, ""
+        for j in range(i, min(n, i + 16)):
+            t = toks[j][0]
+            if not t[0].isalnum():
+                break
+            joined += t
+            if len(joined) > longest + 1:
+                break
+            k = keys.get(joined)
+            if k is None and joined.endswith("s"):
+                k = keys.get(joined[:-1])  # a plural or possessive: ExampleCo's
+            if k is not None:
+                hit = (j, k)  # keep going: the longest match wins
+        if hit:
+            out.append((f"§{hit[1]}", toks[i][1], toks[hit[0]][2]))
+            i = hit[0] + 1
+        else:
+            out.append(toks[i])
+            i += 1
+    return out
+
+
+def _num_token(val: float, kind: str) -> str:
+    return "#" + _norm_num(val) + {"money": "$", "percent": "%"}.get(kind, "")
+
+
+def _mark_numbers(toks: list) -> list:
+    out, i, n = [], 0, len(toks)
+    while i < n:
+        tok, s, e = toks[i]
+        if tok[0].isdigit() or (tok[0] == "." and len(tok) > 1):
+            try:
+                val = float("0" + tok if tok[0] == "." else tok.replace(",", ""))
+            except ValueError:
+                out.append(toks[i])
+                i += 1
+                continue
+            kind, j = "count", i + 1
+            if out and (out[-1][0] in _CURRENCY_TOKENS or out[-1][0] in _CURRENCY_CODES):
+                out.pop()
+                kind = "money"
+            if j < n and toks[j][1] == e and toks[j][0] in SUFFIX_SCALES:
+                val *= SUFFIX_SCALES[toks[j][0]]
+                j += 1
+            elif j < n and toks[j][0] in SCALES:
+                val *= SCALES[toks[j][0]]
+                j += 1
+            if j < n and toks[j][0] in ("%", "percent"):
+                kind, j = "percent", j + 1
+            elif j + 1 < n and toks[j][0] == "per" and toks[j + 1][0] == "cent":
+                kind, j = "percent", j + 2
+            elif j < n and toks[j][0] in ("cent", "cents"):
+                val, kind, j = val / 100.0, "money", j + 1
+            elif j < n and toks[j][0] in MONEY_AFTER:
+                kind, j = "money", j + 1
+            out.append((_num_token(val, kind), s, toks[j - 1][2]))
+            i = j
+            continue
+        if tok.isalpha():
+            k = i
+            while k < n and toks[k][0].isalpha():
+                k += 1
+            pos = 0
+            for val, kind, a, b in _word_numbers([t for t, _, _ in toks[i:k]]):
+                out.extend(toks[i + pos:i + a])
+                out.append((_num_token(val, kind), toks[i + a][1], toks[i + b - 1][2]))
+                pos = b
+            out.extend(toks[i + pos:k])
+            i = k
+            continue
+        out.append(toks[i])
+        i += 1
+    return out
+
+
+def gate_tokens(text, lexicon=()) -> list:
+    """`text` as the audio gate compares it: lower-case words without punctuation, every number one
+    token ('#9.5$'), every lexicon term one token ('§<entry index>')."""
+    toks = _mark_numbers(_mark_terms(_gate_raw(text), list(lexicon or [])))
+    return [_SAME_WORD.get(t, t) for t, _, _ in toks if t[0] in "§#" or t[0].isalnum()]
+
+
+def _edit_ops(ref: list, hyp: list) -> list:
+    """A minimal edit script from ref to hyp: [(op, ref index, hyp index)], op eq|sub|del|ins."""
+    n, m = len(ref), len(hyp)
+    rows = [list(range(m + 1))]
+    for i in range(1, n + 1):
+        prev, cur, a = rows[-1], [i] + [0] * m, ref[i - 1]
+        for j in range(1, m + 1):
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a != hyp[j - 1]))
+        rows.append(cur)
+    ops, i, j = [], n, m
+    while i > 0 or j > 0:
+        if i > 0 and j > 0 and rows[i][j] == rows[i - 1][j - 1] + (ref[i - 1] != hyp[j - 1]):
+            ops.append(("eq" if ref[i - 1] == hyp[j - 1] else "sub", i - 1, j - 1))
+            i, j = i - 1, j - 1
+        elif i > 0 and rows[i][j] == rows[i - 1][j] + 1:
+            ops.append(("del", i - 1, None))
+            i -= 1
+        else:
+            ops.append(("ins", None, j - 1))
+            j -= 1
+    return ops[::-1]
+
+
+def _merge_compounds(a: list, b: list) -> list:
+    """Adjacent words of `a` that `b` writes as one ('e mail' / 'email', 'check out' / 'checkout')."""
+    vocab, out, i = set(b), [], 0
+    while i < len(a):
+        if i + 1 < len(a) and a[i].isalpha() and a[i + 1].isalpha() and a[i] + a[i + 1] in vocab \
+                and not (a[i] in vocab and a[i + 1] in vocab):
+            out.append(a[i] + a[i + 1])
+            i += 2
+        else:
+            out.append(a[i])
+            i += 1
+    return out
+
+
+def show_token(tok: str, names: list) -> str:
+    if tok.startswith("§"):
+        try:
+            return names[int(tok[1:])]
+        except (ValueError, IndexError):
+            return tok
+    if tok.startswith("#"):
+        v = tok[1:]
+        if v.endswith("$"):
+            v = v[:-1]
+            return "$" + (f"{float(v):.2f}" if "." in v else v)
+        return v
+    return tok
+
+
+def _cap_heard(ref: list, hyp: list) -> list:
+    return hyp[: 4 * len(ref) + 40]  # an answer far longer than the script is garbage: the rest adds nothing
+
+
+def judge_heard(ref: list, hyp: list, wer_max: float, names: list) -> dict:
+    """The audio gate's verdict on one transcription. `ref`: the script's tokens, `hyp`: the heard
+    tokens (both gate_tokens). Every lexicon term and every number of the script must be heard, as
+    often as the script says it, and the word error rate must be at most wer_max. `lost` counts
+    only the script's words that were not heard (substituted or dropped), not extra words."""
+    hyp = _cap_heard(ref, hyp)
+    ref2 = _merge_compounds(ref, hyp)
+    hyp2 = _merge_compounds(hyp, ref2)
+    ops = _edit_ops(ref2, hyp2)
+    count = {"sub": 0, "del": 0, "ins": 0}
+    for op, _, _ in ops:
+        if op != "eq":
+            count[op] += 1
+    total = max(1, len(ref2))
+    runs, run = {}, []  # each script position that was not heard -> what was heard around it
+
+    def close(run):
+        heard = [hyp2[j] for _, _, j in run if j is not None]
+        for _, i, _ in run:
+            if i is not None:
+                runs[i] = heard
+    for o in ops:
+        if o[0] == "eq":
+            close(run)
+            run = []
+        else:
+            run.append(o)
+    close(run)
+
+    def heard_at(token):
+        for i, t in enumerate(ref2):
+            if t == token and i in runs:
+                return " ".join(show_token(x, names) for x in runs[i]) or "(nothing)"
+        return "(not heard as often as written)"
+    missing_terms, missing_numbers = [], []
+    need = Counter(t for t in ref2 if t.startswith("§"))
+    got = Counter(t for t in hyp2 if t.startswith("§"))
+    for t, c in need.items():
+        if got[t] < c:
+            missing_terms.append({"idx": int(t[1:]), "term": show_token(t, names), "heard_as": heard_at(t)})
+    nval = Counter(t[1:].rstrip("$%") for t in ref2 if t.startswith("#"))
+    gval = Counter(t[1:].rstrip("$%") for t in hyp2 if t.startswith("#"))
+    for v, c in nval.items():
+        if gval[v] < c:
+            tok = next(t for t in ref2 if t.startswith("#") and t[1:].rstrip("$%") == v)
+            missing_numbers.append({"number": show_token(tok, names), "heard_as": heard_at(tok)})
+    wer = (count["sub"] + count["del"] + count["ins"]) / float(total)
+    lost = (count["sub"] + count["del"]) / float(total)
+    return {"ok": not missing_terms and not missing_numbers and wer <= wer_max + 1e-9,
+            "wer": round(wer, 4), "lost": round(lost, 4), "words": len(ref2), "errors": count,
+            "missing_terms": missing_terms, "missing_numbers": missing_numbers,
+            "expected": " ".join(show_token(t, names) for t in ref2)[:1200],
+            "heard": " ".join(show_token(t, names) for t in hyp2)[:1200]}
+
+
+def split_heard(line_refs: list, hyp: list) -> list:
+    """Each line's share of what was heard in the whole track: `hyp` aligned against the lines'
+    tokens joined, each heard token given to the line of the script token it stands for (an extra
+    word to the line before it)."""
+    ref, owner = [], []
+    for k, toks in enumerate(line_refs):
+        ref += toks
+        owner += [k] * len(toks)
+    hyp = _cap_heard(ref, hyp)
+    per, last = [[] for _ in line_refs], 0
+    for op, i, j in _edit_ops(ref, hyp):
+        if i is not None:
+            last = owner[i]
+        if j is not None and per:
+            per[last].append(hyp[j])
+    return per
 
 
 # ---------------------------------------------------------------- timing

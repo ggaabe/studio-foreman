@@ -19,6 +19,10 @@ Foreman's own bookkeeping and is never sent):
     music       /v1/audio/music-generations    music          prompt lyrics instrumental bpm seed duration_seconds ...
     transcribe  /v1/audio/transcriptions       transcription  multipart: file_path, language, prompt; verbose_json
                                                               with word timestamps unless words is false
+                                                              (response_format json: the text only);
+                                                              release_companions: a companion model this
+                                                              job's requests loaded (the forced aligner) is
+                                                              unloaded when the job ends
     image       /v1/images/generations         image          prompt size seed steps mode strength ...,
                                                               image_path -> image, ref_image_paths -> ref_images
     video       /v1/video/generations          video          prompt width height num_frames seed steps pipeline
@@ -216,6 +220,23 @@ def run_ops(engine, run) -> dict:
                 f"/v1/models (it lists {sorted(have)}): check the configured model for this role (ads_options.models)")
     weights = [max(1.0, number(op.get("expected_s")) or OPS[op["op"]]["expected_s"]) for op in ops]
     total = sum(weights)
+    release = any(op.get("op") == "transcribe" and op.get("release_companions") for op in ops)
+    try:
+        results = _run_each(engine, run, ops, weights, total, wd)
+    finally:
+        if release and getattr(engine, "companions", None):
+            # The audio gate's transcriptions need no word times: a companion model (the forced
+            # aligner) their requests loaded goes now, through the engine's companion record, not
+            # when gpud later unloads the ASR model. One that was resident before is never touched.
+            try:
+                engine._unload_companions(run.spec.model)
+            except Exception as e:  # never fail a finished job over the cleanup
+                with engine._lock:
+                    run.note(f"could not unload the companions of {run.spec.model}: {type(e).__name__}: {e}")
+    return _artifact(engine, run, wd, ops, results)
+
+
+def _run_each(engine, run, ops: list, weights: list, total: float, wd: str) -> list:
     results, done = [], 0.0
     for i, (op, w) in enumerate(zip(ops, weights)):
         if run.cancel.is_set():
@@ -247,7 +268,7 @@ def run_ops(engine, run) -> dict:
         with engine._lock:
             engine._bump(run, hi)
             run.timings[f"op{i}"] = round(run.elapsed(), 1)
-    return _artifact(engine, run, wd, ops, results)
+    return results
 
 
 def _artifact(engine, run, wd: str, ops: list, results: list) -> dict:

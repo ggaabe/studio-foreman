@@ -17,6 +17,16 @@ multipart /v1/audio/transcriptions answering verbose_json with word times spread
 non-streaming /v1/images/generations (edit mode, at most 4 ref_images), and the full video request
 checked the way the server checks it (8k+1 frames, a 64 px grid for two-stage and 32 px for one
 stage, audio-to-video only two-stage, at most 768 MiB of raw RGB, decodable keyframes and audio).
+
+What the voice says and what the ASR hears are controllable, for the audio gate's tests. Each speech
+request is an utterance with a tone of its own (so every take's samples differ), and the fake
+remembers what it "said" in it: by default the input, or `say(input, body)`, or the input with the
+words in `mispronounce` ({written: said}, whole words, any case) replaced. A transcription hears
+the utterances whose samples it finds in the WAV, in order (a line, or the voice track made of
+lines); audio it cannot place (the final mix, which ffmpeg re-made) is heard as the longest audio it
+did place, passed through the next callable or text queued in `asr_unknown`; `asr_rewrite`
+(a callable, or [(regex, replacement)]) then writes the text the way an ASR would (digits for
+numbers, '.com'). `asr_text`, when set, is heard for every transcription (the older tests).
 """
 from __future__ import annotations
 
@@ -26,6 +36,7 @@ import io
 import json
 import math
 import os
+import re
 import select
 import socket
 import struct
@@ -128,6 +139,13 @@ class FakeMlxServe:
         self.asr_lower = True                   # ASR writes words lower-cased (a URL comes back lower-case)
         self.asr_loads = ()                     # server ids a transcription loads beside the ASR (its aligner)
         self.last_speech = ""
+        self.say = None                         # callable(input, body) -> what the voice says (default: the input)
+        self.mispronounce = {}                  # {written word or phrase: what the voice says instead}
+        self.utterances = []                    # [{"said", "input", "seed", "pcm", "format", "seconds"}]
+        self.asr_unknown = collections.deque()  # per transcription of audio it cannot place: callable(text) or text
+        self.asr_rewrite = None                 # callable(text) or [(regex, replacement)]: how the ASR writes
+        self.heard = []                         # [(fields, text)] of every transcription
+        self._placed = []                       # [(seconds, text)] of the audio a transcription placed
         self.image_size_cap = 256
         self.image_delay = 0.0
         self.video_requests = []                # summaries of the video requests (fields, decoded sizes)
@@ -187,6 +205,72 @@ class FakeMlxServe:
 
     def bodies(self, path: str) -> list:
         return [b for (m, p, b) in self.requests if p == path]
+
+    def transcriptions(self) -> list:
+        return [b for (m, p, b) in self.requests if p == "/v1/audio/transcriptions"]
+
+    # ---- what the voice says, what the ASR hears
+    def said(self, text: str, body: dict) -> str:
+        if self.say is not None:
+            return str(self.say(text, body))
+        out = text
+        for written, spoken in sorted(self.mispronounce.items(), key=lambda kv: -len(kv[0])):
+            out = re.sub(r"(?i)(?<![\w])" + re.escape(written) + r"(?![\w])", lambda _m, w=spoken: w, out)
+        return out
+
+    def speak(self, text: str, body: dict, seconds: float, silent: bool) -> bytes:
+        with self.lock:
+            k = len(self.utterances)
+        wav = tone_wav(seconds, freq=180.0 + 11.0 * (k % 900), silent_tail=seconds if silent else 0.0)
+        with wave.open(io.BytesIO(wav), "rb") as w:
+            fmt, pcm = (w.getnchannels(), w.getsampwidth(), w.getframerate()), w.readframes(w.getnframes())
+        with self.lock:
+            self.utterances.append({"said": self.said(text, body), "input": text, "seed": body.get("seed"),
+                                    "pcm": pcm, "format": fmt, "seconds": seconds})
+        return wav
+
+    def hear(self, audio: bytes, fields: dict) -> str:
+        if self.asr_text is not None:
+            return self.asr_text
+        try:
+            with wave.open(io.BytesIO(audio or b""), "rb") as w:
+                fmt, pcm = (w.getnchannels(), w.getsampwidth(), w.getframerate()), w.readframes(w.getnframes())
+                seconds = w.getnframes() / float(w.getframerate())
+        except Exception:
+            fmt, pcm, seconds = None, b"", 0.0
+        with self.lock:
+            known = [u for u in self.utterances if u["format"] == fmt and u["pcm"]]
+        hits = []
+        for u in known:
+            block = u["format"][0] * u["format"][1]
+            pos = pcm.find(u["pcm"])
+            while pos >= 0 and pos % block:
+                pos = pcm.find(u["pcm"], pos + 1)
+            if pos >= 0:
+                hits.append((pos, u["said"]))
+        if hits:
+            text = " ".join(said for _, said in sorted(hits))
+            with self.lock:
+                self._placed.append((seconds, text))
+        else:
+            with self.lock:
+                placed = sorted(self._placed, key=lambda x: x[0])
+            text = placed[-1][1] if placed else (self.last_speech or "hello world")
+            with self.lock:
+                hook = self.asr_unknown.popleft() if self.asr_unknown else None
+            if callable(hook):
+                text = hook(text)
+            elif isinstance(hook, str):
+                text = hook
+        rw = self.asr_rewrite
+        if callable(rw):
+            text = rw(text)
+        elif rw:
+            for rx, repl in rw:
+                text = re.sub(rx, repl, text)
+        with self.lock:
+            self.heard.append((dict(fields), text))
+        return text
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -394,7 +478,7 @@ class _Handler(BaseHTTPRequestHandler):
                 seconds = w.getnframes() / float(w.getframerate())
         except Exception:
             return self._error(400, "file must be a WAV")
-        text = s.asr_text if s.asr_text is not None else s.last_speech or "hello world"
+        text = s.hear(audio, fields)
         words = [w for w in text.split() if w]
         if s.asr_lower:
             words = [w.lower() for w in words]
@@ -549,9 +633,10 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path.endswith("speech"):
             seconds = min(s.speech_cap, max(1.0, s.speech_rate * len(body.get("input", "x"))))
+            wav = s.speak(str(body.get("input") or ""), body, seconds, behaviour == "silent")
         else:
             seconds = min(s.music_cap, float(body.get("duration_seconds") or max(1.0, 0.06 * len(body.get("input", "x")))))
-        wav = tone_wav(seconds, silent_tail=seconds if behaviour == "silent" else 0.0)
+            wav = tone_wav(seconds, silent_tail=seconds if behaviour == "silent" else 0.0)
         self._send({"type": "complete", "format": "wav", "data": base64.b64encode(wav).decode()})
 
     def _chat(self, body):

@@ -801,7 +801,8 @@ class R4Restarts(AdHarness):
         it = self.item(res["item"])
         self.assertEqual(it["state"], "review", (it, restarts, self.trail()))
         self.assertGreaterEqual(len(restarts), 15, ("gpud was killed between the steps", restarts))
-        self.assertEqual(self.media_counts(), {"video": 6, "image": 6, "speech": 6, "asr": 1, "music": 1},
+        # asr: the audio gate's five lines, the voice track and the final mix, and the timing
+        self.assertEqual(self.media_counts(), {"video": 6, "image": 6, "speech": 6, "asr": 8, "music": 1},
                          "every request was made exactly once across the restarts")
         reviews = [j for j in self.jobs("ad_review")]
         self.assertEqual(len(reviews), 1)
