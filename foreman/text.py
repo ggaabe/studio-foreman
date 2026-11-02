@@ -59,6 +59,62 @@ def variants(text: str) -> tuple:
     return tuple(dict.fromkeys((a, b, c)))
 
 
+# Letters of other scripts that render like a Latin letter (Cyrillic, Greek and a few IPA forms):
+# 'guarantееd' with two Cyrillic 'е' reads as 'guaranteed' on screen and in the voice. `skeleton`
+# maps them to the Latin letter so a filter compares what a viewer sees.
+_CONFUSABLES = {
+    "а": "a", "в": "b", "е": "e", "ё": "e", "к": "k", "м": "m", "н": "h", "о": "o", "р": "p", "с": "c", "т": "t",
+    "у": "y", "х": "x", "ѕ": "s", "і": "i", "ї": "i", "ј": "j", "ԁ": "d", "һ": "h", "ӏ": "l", "ԛ": "q", "ԝ": "w",
+    "ɡ": "g", "ɩ": "i", "ʏ": "y", "ᴀ": "a", "ο": "o", "α": "a", "ν": "v", "ρ": "p", "ι": "i", "κ": "k", "τ": "t",
+    "υ": "u", "χ": "x", "ε": "e", "ϲ": "c", "А": "A", "В": "B", "Е": "E", "Ё": "E", "К": "K", "М": "M", "Н": "H",
+    "О": "O", "Р": "P", "С": "C", "Т": "T", "У": "Y", "Х": "X", "Ѕ": "S", "І": "I", "Ј": "J", "Ԛ": "Q", "Ԝ": "W",
+    "Α": "A", "Β": "B", "Ε": "E", "Ζ": "Z", "Η": "H", "Ι": "I", "Κ": "K", "Μ": "M", "Ν": "N", "Ο": "O", "Ρ": "P",
+    "Τ": "T", "Υ": "Y", "Χ": "X", "Ϲ": "C",
+}
+_CONFUSABLE_TABLE = str.maketrans(_CONFUSABLES)
+
+
+def skeleton(text: str) -> str:
+    """`fold(text)` with look-alike letters of other scripts read as the Latin letter they show."""
+    t = fold(text)
+    return t if t.isascii() else t.translate(_CONFUSABLE_TABLE)
+
+
+def _script(ch: str) -> str | None:
+    if not ch.isalpha():
+        return None
+    if ch.isascii():
+        return "latin"
+    try:
+        name = unicodedata.name(ch)
+    except ValueError:
+        return "other"
+    for s in ("LATIN", "CYRILLIC", "GREEK"):
+        if name.startswith(s):
+            return s.lower()
+    return "other"
+
+
+def mixed_script_words(text: str) -> list:
+    """Words that mix Latin letters with Cyrillic or Greek ones (a homoglyph spelling such as
+    'ОtherCo' with a Cyrillic 'О'): no real word of any language does that."""
+    out = []
+    for word in re.findall(r"[^\W\d_]+", fold(text)):
+        scripts = {_script(ch) for ch in word} - {None}
+        if "latin" in scripts and scripts & {"cyrillic", "greek"}:
+            out.append(word)
+    return out
+
+
+BIDI_CONTROLS = frozenset("؜‎‏‪‫‬‭‮⁦⁧⁨⁩")
+
+
+def has_bidi(text: str) -> bool:
+    """Characters that reorder how a line is displayed (what a viewer reads is not the order a
+    filter reads it in)."""
+    return any(ch in BIDI_CONTROLS for ch in str(text))
+
+
 def has_control(text: str) -> bool:
     """A C0 or C1 control character other than tab and newline."""
     return bool(CONTROL_RE.search(text))

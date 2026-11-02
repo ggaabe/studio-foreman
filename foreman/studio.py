@@ -330,6 +330,7 @@ class ComfyConfig:
 def build_engine(cfg: Config, brain=None, **kw):
     from .adapters.mlx_serve import MlxServeEngine
     kw.setdefault("ffmpeg", find_ffmpeg(cfg.ffmpeg, cfg.home))
+    kw.setdefault("companions", {QWEN3_ASR: (ALIGNER,)})  # the aligner the ASR loads for word times
     return MlxServeEngine(cfg.base_url, cfg.catalog(), name=ENGINE, model_dir=cfg.model_dir,
                           artifacts_dir=cfg.artifacts_dir, brain=brain, min_headroom_gb=cfg.min_headroom_gb,
                           max_resident_models=cfg.max_resident_models or None, stall_after=cfg.stall_after,

@@ -12,7 +12,8 @@ behaviours (hang, error, drop, http500, http400, black or frozen video) are scri
 
 For the ad pipeline (MLX-Serve 26.11.1 shapes): capabilities per model in /v1/models (audio,
 music, video, image, transcription, alignment), speech with a Qwen3-TTS `ref_audio` clone,
-multipart /v1/audio/transcriptions answering verbose_json with word times spread over the WAV,
+multipart /v1/audio/transcriptions answering verbose_json with word times spread over the WAV
+(asr_loads: ids it loads beside the ASR model, as mlx-serve may load the forced aligner),
 non-streaming /v1/images/generations (edit mode, at most 4 ref_images), and the full video request
 checked the way the server checks it (8k+1 frames, a 64 px grid for two-stage and 32 px for one
 stage, audio-to-video only two-stage, at most 768 MiB of raw RGB, decodable keyframes and audio).
@@ -125,6 +126,7 @@ class FakeMlxServe:
         self.music_cap = 3.0
         self.asr_text = None                    # what the fake "hears" (default: the input it last spoke)
         self.asr_lower = True                   # ASR writes words lower-cased (a URL comes back lower-case)
+        self.asr_loads = ()                     # server ids a transcription loads beside the ASR (its aligner)
         self.last_speech = ""
         self.image_size_cap = 256
         self.image_delay = 0.0
@@ -383,6 +385,9 @@ class _Handler(BaseHTTPRequestHandler):
             s.requests.append(("POST", self.path, dict(fields, file_bytes=len(files.get("file", b"")))))
         if not self._resident_or_fallback({"model": fields.get("model")}):
             return
+        with s.lock:
+            for mid in s.asr_loads:  # mlx-serve loading the forced aligner for word times
+                s.ready.setdefault(mid, int(1e9))
         audio = files.get("file")
         try:
             with wave.open(io.BytesIO(audio or b""), "rb") as w:

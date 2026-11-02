@@ -4,16 +4,20 @@ ComfyUI is not a service that is always there: gpud starts it when a job needs i
 when the job is done, so it never shares the GPU with an mlx-serve media model.
 
   * Its one catalog model (family "comfy", ModelSpec.solo_media) is "resident" while the server
-    process Foreman started answers GET /system_stats. load() starts it:
+    process Foreman started is alive (answering HTTP or not: it holds its memory). load() starts it:
         <python> main.py --listen 127.0.0.1 --port <port> --use-pytorch-cross-attention --disable-auto-launch
     from the configured ComfyUI directory (its own venv), logging to <home>/logs/comfyui.log, and
-    the load is ready once /system_stats answers. Its pid is kept in <home>/run/comfyui.json so a
-    restarted gpud can still stop the server it started.
+    the load is ready once /system_stats answers. Its pid (and port) is kept in
+    <home>/run/comfyui.json so a restarted gpud adopts and can still stop the server it started:
+    only a process that is alive, leads its own session, runs main.py and started when the file
+    says is adopted, and only its process group is ever signalled. An adopted server's leftover
+    prompts are interrupted and removed before the next job.
   * The memory rule: gpud unloads its own mlx-serve media models before the load (solo_media),
     and the load is deferred (gpud retries, and the job fails as an infrastructure failure after
     Policy.load_defer_max_s) while `media_probe()` reports any media model resident in mlx-serve
     (someone else's too: the adapter asks the server itself) or free memory minus the planned
-    footprint would fall below `min_headroom_gb`.
+    footprint would fall below `min_headroom_gb`. A server that is already up checks the same
+    media rule again before every job and every graph.
   * A job is a list of graph ops: {"op": "graph", "graph": "<name>", "params": {...},
     "images": {"image_1": "<path>"}, "out": "<file in the work directory>"}. The graph is a
     template file <graphs_dir>/<name>.json in ComfyUI's API format with placeholders such as
@@ -22,14 +26,16 @@ when the job is done, so it never shares the GPU with an mlx-serve media model.
         {"graph": {...}, "outputs": ["9"], "defaults": {"steps": 8}, "license": "...", "commercial_ok": true}
     Images are uploaded first (POST /upload/image), the graph is queued (POST /prompt), its
     progress is followed by polling /queue and /history/<id> (a bounded heartbeat while it runs),
-    and the first file of the output nodes is downloaded (GET /view) to `out`, with a sidecar
-    `<out>.meta.json` that makes the op skip on a retry.
+    and the first file of the output nodes is downloaded (GET /view) to `out`, streamed to a temp
+    file and checked (a cut connection, an error page, a truncated image is never kept), with a
+    sidecar `<out>.meta.json` that makes the op skip on a retry.
   * After the job: POST /free {"unload_models": true, "free_memory": true}, and (exit_after_job,
     the default) the process is stopped before the job reports done: SIGTERM to its process
     group, a wait, then SIGKILL. Only a ComfyUI Foreman started is ever signalled; a server on
     the port that Foreman did not start makes the load fail (it is someone else's), and
     mlx-serve is never signalled at all.
-  * cancel(): POST /interrupt and remove the prompt from the queue.
+  * cancel(): POST /interrupt and remove the prompt from the queue. close() (gpud shutting down)
+    stops the server too.
 """
 from __future__ import annotations
 
@@ -55,6 +61,7 @@ from ..policy import number
 log = logging.getLogger("foreman.comfyui")
 
 EVENT_CAP = 0.95
+MAX_OUTPUT_BYTES = 2 << 30   # one downloaded output at most (a 2 GiB take is far past anything an ad uses)
 PLACEHOLDER = re.compile(r"\{\{\s*([a-z][a-z0-9_]{0,40})\s*\}\}")
 META = ".meta.json"
 
@@ -71,6 +78,12 @@ class StopPending(RuntimeError):
 
 class RunRefused(Exception):
     """The server refused the graph itself (a content failure: Poll.reason 'rejected')."""
+
+
+class EngineTrouble(Exception):
+    """The host or the server failed, not the graph: an mlx-serve media model resident beside a
+    running ComfyUI, an answer that is not the file it should be, a stale prompt that will not
+    leave the queue. Poll.reason 'engine_error': infrastructure, never charged to the work."""
 
 
 class Cancelled(Exception):
@@ -104,6 +117,48 @@ def load_graph(graphs_dir: str, name) -> dict:
     return {"graph": graph, "outputs": [str(o) for o in outputs] if outputs else None, "defaults": defaults,
             "license": data.get("license") if wrapped else None,
             "commercial_ok": data.get("commercial_ok") is True if wrapped else False, "path": path}
+
+
+def output_problem(path: str, ctype: str, name: str) -> str | None:
+    """Why a downloaded output is not the file it should be (None when it is): an error page served
+    with 200, a truncated image, a video or audio file without its container's signature."""
+    ctype = (ctype or "").split(";")[0].strip().lower()
+    if ctype.startswith("text/") or ctype in ("application/json", "application/xhtml+xml"):
+        return f"the answer is {ctype}, not a media file"
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            head = f.read(64)
+            f.seek(max(0, size - 16))
+            tail = f.read(16)
+    except OSError as e:
+        return f"unreadable: {e}"
+    if size <= 0:
+        return "empty"
+    ext = os.path.splitext(name or path)[1].lower() or os.path.splitext(path)[1].lower()
+    if ext == ".png" or head[:8] == b"\x89PNG\r\n\x1a\n":
+        if head[:8] != b"\x89PNG\r\n\x1a\n":
+            return "not a PNG"
+        if b"IEND" not in tail:
+            return "a truncated PNG (no IEND chunk)"
+        return None if media.image_size(path) else "a PNG without a readable header"
+    if ext in (".jpg", ".jpeg"):
+        if head[:2] != b"\xff\xd8" or b"\xff\xd9" not in tail:
+            return "not a complete JPEG"
+        return None
+    if ext in (".mp4", ".mov", ".m4v"):
+        return None if head[4:8] == b"ftyp" else "not an MP4/MOV (no ftyp box)"
+    if ext == ".webm":
+        return None if head[:4] == b"\x1a\x45\xdf\xa3" else "not a WebM file"
+    if ext == ".gif":
+        return None if head[:4] == b"GIF8" else "not a GIF"
+    if ext == ".wav":
+        return None if head[:4] == b"RIFF" and head[8:12] == b"WAVE" else "not a WAV file"
+    if ext in (".webp",):
+        return None if head[:4] == b"RIFF" and head[8:12] == b"WEBP" else "not a WebP image"
+    if head.lstrip()[:1] in (b"<", b"{"):
+        return "the answer looks like a page or JSON, not a media file"
+    return None
 
 
 def placeholders(obj) -> set:
@@ -171,7 +226,7 @@ class ComfyUIEngine:
         self.comfy_dir = os.path.expanduser(comfy_dir)
         self.python = os.path.expanduser(python) if python else self._default_python()
         self.host, self.port = host, int(port)
-        self.base_url = f"http://{host}:{self.port}"
+        self._live_port = None         # the port of the server Foreman runs (an adopted one keeps its own)
         self.graphs_dir = os.path.expanduser(graphs_dir)
         self.artifacts_dir = os.path.expanduser(artifacts_dir)
         self.home = os.path.expanduser(home)
@@ -194,8 +249,13 @@ class ComfyUIEngine:
         self._by_run: dict = {}
         self._stopping = None          # thread stopping the server
         self._version = None
+        self._stale_queue = False      # an adopted server may still run what the dead gpud queued
         self._pidfile = os.path.join(self.home, "run", "comfyui.json")
         self._adopt()
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self._live_port or self.port}"
 
     def _default_python(self) -> str:
         for rel in ("venv/bin/python", ".venv/bin/python", "venv/bin/python3", ".venv/bin/python3"):
@@ -227,16 +287,49 @@ class ComfyUIEngine:
         return True
 
     def _adopt(self) -> None:
-        """A ComfyUI an earlier gpud started (pid file) is still Foreman's to stop."""
+        """A ComfyUI an earlier gpud started (pid file) is still Foreman's to stop, on whatever port
+        it was started (a changed comfyui_options.port never orphans it): it is adopted when the pid
+        is alive, leads its own session (Foreman starts ComfyUI with start_new_session), runs main.py
+        and started when the pid file says. Anything else is not Foreman's: the pid file is dropped
+        and that process is never signalled."""
         info = paths.read_json(self._pidfile)
         if not isinstance(info, dict):
             return
-        pid = info.get("pid")
-        if isinstance(pid, int) and info.get("port") == self.port and self._alive(pid) and self._is_comfy(pid):
-            self._pid, self._started_wall = pid, info.get("started_wall")
-            log.info("adopted the ComfyUI server Foreman started earlier (pid %d)", pid)
+        pid, port = info.get("pid"), info.get("port")
+        if isinstance(pid, int) and isinstance(port, int) and self._alive(pid) and self._ours(pid, info.get("started_wall")):
+            self._pid, self._started_wall, self._live_port = pid, info.get("started_wall"), port
+            self._stale_queue = True
+            log.info("adopted the ComfyUI server Foreman started earlier (pid %d, port %d)", pid, port)
         else:
             self._clear_pidfile()
+
+    @classmethod
+    def _ours(cls, pid: int, started_wall) -> bool:
+        """`pid` is the ComfyUI Foreman started at `started_wall`, not a reused pid or another app's."""
+        try:
+            if os.getsid(pid) != pid:  # Foreman's ComfyUI leads its own session; a reused pid rarely does
+                return False
+        except OSError:
+            return False
+        if not cls._is_comfy(pid):
+            return False
+        age = cls._age_s(pid)
+        start = number(started_wall)
+        return age is not None and start is not None and abs((time.time() - age) - start) <= 120.0
+
+    @staticmethod
+    def _age_s(pid: int) -> float | None:
+        """Seconds since the process started (ps etime: [[dd-]hh:]mm:ss), or None."""
+        try:
+            out = subprocess.run(["/bin/ps", "-o", "etime=", "-p", str(pid)], capture_output=True, text=True,
+                                 timeout=3, check=False).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return None
+        m = re.match(r"^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$", out)
+        if not m:
+            return None
+        d, h, mi, sec = (int(x) if x else 0 for x in m.groups())
+        return float(((d * 24 + h) * 60 + mi) * 60 + sec)
 
     @staticmethod
     def _is_comfy(pid: int) -> bool:
@@ -249,8 +342,8 @@ class ComfyUIEngine:
 
     def _write_pidfile(self) -> None:
         os.makedirs(os.path.dirname(self._pidfile), exist_ok=True)
-        paths.atomic_json(self._pidfile, {"pid": self._pid, "port": self.port, "started_wall": self._started_wall,
-                                          "comfy_dir": self.comfy_dir})
+        paths.atomic_json(self._pidfile, {"pid": self._pid, "port": self._live_port or self.port,
+                                          "started_wall": self._started_wall, "comfy_dir": self.comfy_dir})
 
     def _clear_pidfile(self) -> None:
         try:
@@ -284,19 +377,28 @@ class ComfyUIEngine:
             out.close()
         with self._lock:
             self._proc, self._pid, self._started_wall = proc, proc.pid, time.time()
+            self._live_port, self._stale_queue = self.port, False
         self._write_pidfile()
 
     def _signal(self, sig) -> None:
+        """Signal the server's process group: ComfyUI and its children only. Foreman's ComfyUI leads
+        its own session, so when killpg fails the process is gone or is not Foreman's: nothing else
+        is ever signalled (no fallback to the bare pid)."""
         pid = self._pid
         if not pid:
             return
-        try:
-            os.killpg(pid, sig)  # its own session (start_new_session): ComfyUI and its children only
-        except (OSError, ProcessLookupError):
+        proc = self._proc
+        if proc is None or proc.pid != pid:  # adopted: make sure the pid still is the server Foreman started
             try:
-                os.kill(pid, sig)
+                if os.getsid(pid) != pid:
+                    log.warning("pid %d no longer leads its own session: not Foreman's ComfyUI, not signalled", pid)
+                    return
             except OSError:
-                pass
+                return
+        try:
+            os.killpg(pid, sig)
+        except OSError as e:
+            log.debug("killpg(%d) failed: %s", pid, e)
 
     def _stop_process(self) -> bool:
         """SIGTERM, wait stop_wait_s, then SIGKILL: only ever the server Foreman started."""
@@ -326,6 +428,7 @@ class ComfyUIEngine:
         with self._lock:
             proc = self._proc
             self._proc, self._pid, self._started_wall = None, None, None
+            self._live_port, self._stale_queue = None, False
         if proc is not None:
             try:
                 proc.wait(timeout=0.1)
@@ -340,13 +443,15 @@ class ComfyUIEngine:
 
     # ---- Engine interface: residency
     def resident_models(self) -> set:
+        """The server is resident while the process Foreman started is alive, whether or not it
+        answers HTTP right now (busy, swapping, wedged): it holds its memory either way, and a
+        health blip must never make gpud drop it and load an mlx-serve media model beside it (fail
+        closed). Only while Foreman is still starting it is it not resident yet."""
         if not self._ours_running():
             return set()
         with self._lock:
             loading = any(op.state == "loading" for op in self._loads.values())
-        if loading:
-            return set()
-        return set(self._mine) if self._healthy() is not None else set()
+        return set() if loading else set(self._mine)
 
     def instance_id(self):
         with self._lock:
@@ -517,10 +622,16 @@ class ComfyUIEngine:
             log.debug("ComfyUI interrupt failed: %s", e)
 
     def close(self) -> None:
+        """gpud is shutting down: stop the runs, then the server Foreman started (POST /free,
+        SIGTERM, SIGKILL), so no ComfyUI of Foreman's holds memory while no gpud enforces the
+        memory rule. Runs synchronously on the caller's thread."""
         with self._lock:
             live = [r for r in self._runs.values() if r.status == "running"]
         for r in live:
             self._close(r, "gpud shutting down")
+        if self._ours_running():
+            self._free()
+            self._stop_process()
 
     def live_runs(self) -> list:
         with self._lock:
@@ -553,6 +664,13 @@ class ComfyUIEngine:
         except (RunRefused, GraphError, paths.PathRefused) as e:
             self._after_job(run)
             self._finish(run, "failed", error=str(e)[:1000], reason="rejected")
+        except EngineTrouble as e:
+            self._after_job(run)
+            if run.cancel.is_set():
+                self._finish(run, "cancelled", error="cancelled")
+            else:
+                log.warning("ComfyUI run %s failed: %s", run.spec.run_id, e)
+                self._finish(run, "failed", error=str(e)[:1000], reason="engine_error")
         except Exception as e:  # noqa: BLE001
             self._after_job(run)
             if run.cancel.is_set():
@@ -582,6 +700,8 @@ class ComfyUIEngine:
             wd = paths.workdir(self.artifacts_dir, re.sub(r"[^A-Za-z0-9._-]+", "_", run.spec.run_id) + "-comfy")
         if self._healthy() is None:
             raise ConnectionError("ComfyUI is not answering")
+        self._media_check()
+        self._clear_stale(run)
         weights = [max(1.0, number(op.get("expected_s")) or 60.0) if isinstance(op, dict) else 1.0 for op in ops]
         total, done = sum(weights), 0.0
         results = []
@@ -590,6 +710,8 @@ class ComfyUIEngine:
                 raise Cancelled("cancelled")
             if not isinstance(op, dict) or op.get("op") != "graph":
                 raise RunRefused(f"op {i} must be a graph op")
+            if i:
+                self._media_check()
             lo, hi = EVENT_CAP * done / total, EVENT_CAP * (done + w) / total
             out = paths.out_path(wd, op.get("out"))
             meta = paths.read_json(out + META)
@@ -635,6 +757,70 @@ class ComfyUIEngine:
             if prim.get(k):
                 art[k] = prim[k]
         return art
+
+    def _media_check(self) -> None:
+        """The memory rule on a server that is already up (exit_after_job off, or adopted after a
+        restart): no graph runs while mlx-serve holds a media model, anyone's."""
+        if self.media_probe is None:
+            return
+        try:
+            busy = sorted(self.media_probe() or ())
+        except Exception as e:
+            raise EngineTrouble(f"cannot tell whether mlx-serve holds media models ({type(e).__name__}: {e}): no "
+                                f"graph runs until it can be checked") from None
+        if busy:
+            raise EngineTrouble(f"mlx-serve holds media model(s) {busy}: no ComfyUI graph runs beside an mlx-serve "
+                                f"media model")
+
+    def _queue_ids(self) -> tuple:
+        _, q = json_call(self.base_url, "GET", "/queue", timeout=self.call_timeout_s)
+        q = q if isinstance(q, dict) else {}
+
+        def ids(key):
+            return [str(it[1]) for it in q.get(key) or [] if isinstance(it, list) and len(it) > 1]
+        return ids("queue_running"), ids("queue_pending")
+
+    def _clear_stale(self, run: _Run, wait_s: float = 60.0) -> None:
+        """Before a job: nothing else may be queued or running on Foreman's server (one job at a time).
+        A prompt left by a gpud that died (this server was adopted) or by a run that was abandoned is
+        interrupted and removed first, so a retried step never renders beside its first attempt."""
+        with self._lock:
+            mine = {r.prompt_id for r in self._runs.values() if r is not run and r.status == "running" and r.prompt_id}
+        try:
+            running, pending = self._queue_ids()
+        except Exception as e:
+            raise EngineTrouble(f"cannot read ComfyUI's queue: {e}") from None
+        stale = [p for p in running + pending if p not in mine]
+        if not stale:
+            with self._lock:
+                self._stale_queue = False
+            return
+        self._note(run, f"removing {len(stale)} stale prompt(s) from ComfyUI's queue first: {stale[:4]}")
+        for pid in running:
+            if pid in stale:
+                try:
+                    json_call(self.base_url, "POST", "/interrupt", {"prompt_id": pid}, timeout=self.call_timeout_s)
+                except Exception as e:
+                    log.debug("ComfyUI interrupt failed: %s", e)
+        end = time.monotonic() + wait_s
+        while True:
+            try:
+                running, pending = self._queue_ids()
+                left = [p for p in pending if p in stale]
+                if left:
+                    json_call(self.base_url, "POST", "/queue", {"delete": left}, timeout=self.call_timeout_s)
+            except Exception as e:
+                log.debug("ComfyUI queue cleanup: %s", e)
+                running, pending = stale, []
+            if not [p for p in running + pending if p in stale]:
+                break
+            if run.cancel.is_set():
+                raise Cancelled("cancelled")
+            if time.monotonic() > end:
+                raise EngineTrouble(f"stale prompts {stale[:4]} did not leave ComfyUI's queue within {wait_s:.0f}s")
+            time.sleep(min(0.2, self.poll_s))
+        with self._lock:
+            self._stale_queue = False
 
     def _upload(self, run: _Run, name: str, src: str) -> str:
         ext = os.path.splitext(src)[1].lower() or ".png"
@@ -711,19 +897,30 @@ class ComfyUIEngine:
         conn = StreamConn(self.base_url, self.call_timeout_s, poll_s=self.poll_s)
         try:
             status_code = conn.request("GET", f"/view?{q}", None, {}, header_timeout=60.0)
-            data = conn.read_body(2 << 30, silence_s=60.0)
+            if status_code != 200:
+                raise RuntimeError(f"/view answered HTTP {status_code} for {f0.get('filename')}")
+            ctype = conn.headers.get("content-type", "")
+            # streamed to a temp file beside `out` (renamed when complete): a cut connection, or an
+            # answer over the cap, leaves nothing behind that a retry would take for a finished output
+            nbytes = conn.save_body(out, MAX_OUTPUT_BYTES, silence_s=60.0)
+        except ValueError as e:
+            raise EngineTrouble(f"/view for {f0.get('filename')}: {e}") from None
         finally:
             conn.close()
-        if status_code != 200:
-            raise RuntimeError(f"/view answered HTTP {status_code} for {f0.get('filename')}")
-        paths.atomic_write(out, data)
-        meta = {"prompt_id": prompt_id, "file": f0.get("filename"), "bytes": len(data), "license": tpl["license"],
-                "commercial_ok": tpl["commercial_ok"]}
+        problem = output_problem(out, ctype, f0.get("filename") or "")
+        if problem:
+            try:
+                os.remove(out)
+            except OSError:
+                pass
+            raise EngineTrouble(f"/view for {f0.get('filename')} did not return the output file: {problem}")
+        meta = {"prompt_id": prompt_id, "file": f0.get("filename"), "bytes": nbytes, "license": tpl["license"],
+                "commercial_ok": tpl["commercial_ok"], "content_type": ctype}
         size = media.image_size(out)
         if size:
             meta.update(width=size[0], height=size[1])
-        meta["checks"] = [{"check": "output", "ok": len(data) > 0, "detail": f"{len(data)} bytes"}]
-        meta["ok"] = len(data) > 0
+        meta["checks"] = [{"check": "output", "ok": nbytes > 0, "detail": f"{nbytes} bytes, {ctype or 'no type'}"}]
+        meta["ok"] = nbytes > 0
         return meta
 
     @staticmethod

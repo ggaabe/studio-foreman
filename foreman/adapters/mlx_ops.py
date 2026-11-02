@@ -37,7 +37,11 @@ Outputs: `out` is relative to the work directory (inside the artifacts root; pat
 writes its file and then a sidecar `<out>.meta.json` (stats, seed, checks, how long it took):
 the sidecar is the completion marker, so a retried job skips the ops that already finished
 (resumable). Inputs (`*_path`) must lie under the artifacts root or the owner's Foreman home.
-Raw frames are deleted once the MP4 is written (keep_raw_frames keeps them).
+Raw frames are deleted once the MP4 is written (keep_raw_frames keeps them), and a job first
+deletes the scratch directories no live run owns (a killed gpud's raw frames). A take must come
+back at the size and frame count asked for. A model without the capability its op needs, no
+ffmpeg or no free disk is the environment's failure (Poll.reason engine_unconfigured or
+engine_error), never the request's.
 """
 from __future__ import annotations
 
@@ -201,13 +205,15 @@ def run_ops(engine, run) -> dict:
     except paths.PathRefused as e:
         raise _err(str(e), True) from None
     run.dir = wd
+    clean_scratch(engine, wd)
     caps = engine.capabilities()
     have = caps.get(run.server_model)
     for op in ops:
         need = OPS[op["op"]]["cap"]
         if have is not None and need not in have:
-            raise _err(f"{run.spec.model} (server id {run.server_model!r}) does not list the {need!r} capability "
-                       f"in /v1/models (it lists {sorted(have)}): check the configured model for this role")
+            raise _ms.EnvironmentFailure(
+                f"{run.spec.model} (server id {run.server_model!r}) does not list the {need!r} capability in "
+                f"/v1/models (it lists {sorted(have)}): check the configured model for this role (ads_options.models)")
     weights = [max(1.0, number(op.get("expected_s")) or OPS[op["op"]]["expected_s"]) for op in ops]
     total = sum(weights)
     results, done = [], 0.0
@@ -391,10 +397,14 @@ def _request_stream(engine, run, path: str, body: dict, scratch: str, lo: float,
                 if state["terminal"] is not None:
                     break
         except Silence as e:
+            reader.abort()
             raise _ms.RunFailed(f"mlx-serve sent nothing for {engine.max_silence_s:.0f}s ({e})") from None
         except SseError as e:
             reader.abort()
             raise _ms.RunFailed(f"unparseable SSE stream: {e}") from None
+        except BaseException:
+            reader.abort()  # a cancel or a dropped connection: close the half-written frame file
+            raise
     finally:
         with engine._lock:
             run.beat = None
@@ -416,6 +426,30 @@ def _request_stream(engine, run, path: str, body: dict, scratch: str, lo: float,
             f.write(binascii.a2b_base64(fields[key]))
         files[key] = target
     return fields, files
+
+
+def clean_scratch(engine, wd: str) -> int:
+    """Delete the scratch directories (raw frames, padded audio) that no live run of this engine
+    owns: what a gpud killed mid-decode left behind, hundreds of MB per take. Returns bytes freed."""
+    root = os.path.join(wd, ".scratch")
+    if not os.path.isdir(root) or os.path.islink(root):
+        return 0
+    with engine._lock:
+        live = [re.sub(r"[^A-Za-z0-9._-]+", "_", r.spec.run_id) + "-" for r in engine._runs.values()
+                if getattr(r, "status", None) == "running"]
+    freed = 0
+    for name in os.listdir(root):
+        path = os.path.join(root, name)
+        if any(name.startswith(prefix) for prefix in live) or os.path.islink(path) or not paths.inside(path, wd):
+            continue
+        for dirpath, _, files in os.walk(path):
+            for f in files:
+                try:
+                    freed += os.path.getsize(os.path.join(dirpath, f))
+                except OSError:
+                    pass
+        shutil.rmtree(path, ignore_errors=True)
+    return freed
 
 
 def _scratch(wd: str, run, i: int) -> str:
@@ -519,7 +553,12 @@ def _op_transcribe(engine, run, op, out, wd, lo, hi, i) -> dict:
     except media.MediaError:
         seconds = 30.0
     grace = max(30.0, 3.0 * (number(op.get("expected_s")) or OPS["transcribe"]["expected_s"]), 2.0 * seconds)
-    obj = _request_json(engine, run, OPS["transcribe"]["path"], body, ctype, lo, hi, grace)
+    before = engine._companions_resident(run.spec.model) if getattr(engine, "companions", None) else set()
+    try:
+        obj = _request_json(engine, run, OPS["transcribe"]["path"], body, ctype, lo, hi, grace)
+    finally:
+        if getattr(engine, "companions", None):
+            engine.note_companions(run.spec.model, before)
     words = obj.get("words") if isinstance(obj.get("words"), list) else []
     paths.atomic_json(out, obj)
     ok = isinstance(obj.get("text"), str)
@@ -560,15 +599,15 @@ def _op_image(engine, run, op, out, wd, lo, hi, i) -> dict:
 
 def _op_video(engine, run, op, out, wd, lo, hi, i) -> dict:
     if not engine.ffmpeg:
-        raise _ms.RunFailed("video ops write MP4s and need ffmpeg (FOREMAN_FFMPEG / ffmpeg in config)")
+        raise _ms.EnvironmentFailure("video ops write MP4s and need ffmpeg (FOREMAN_FFMPEG / ffmpeg in config)")
     if not isinstance(op.get("prompt"), str) or not op["prompt"].strip():
         raise _err(f"op {i}: video needs a 'prompt'", True)
     w, h, n = int(op["width"]), int(op["height"]), int(op["num_frames"])
     need = n * w * h * 3 * 1.3 + 1e9
     free = shutil.disk_usage(wd).free
     if free < need:
-        raise _ms.RunFailed(f"not enough free disk for {n} frames at {w}x{h}: {free / 1e9:.1f} GB free, "
-                            f"{need / 1e9:.1f} GB needed")
+        raise _ms.EnvironmentFailure(f"not enough free disk for {n} frames at {w}x{h}: {free / 1e9:.1f} GB free, "
+                                     f"{need / 1e9:.1f} GB needed", reason="engine_error")
     body = _body(op, "video", run.server_model)
     body.update(width=w, height=h, num_frames=n, pipeline=op.get("pipeline") or "one_stage")
     scratch = _scratch(wd, run, i)
@@ -642,6 +681,7 @@ def _op_video(engine, run, op, out, wd, lo, hi, i) -> dict:
         {"check": "frozen_frames", "ok": frozen is not None and frozen <= validators.MAX_FROZEN_FRAME_RATIO,
          "detail": f"frozen_frame_ratio={meta.get('frozen_frame_ratio')!r}"},
         {"check": "frames", "ok": fn == n, "detail": f"got {fn} frames, asked for {n}"},
+        {"check": "size", "ok": (fw, fh) == (w, h), "detail": f"got {fw}x{fh}, asked for {w}x{h}"},
     ]
     meta.update(checks=checks, ok=all(c["ok"] for c in checks))
     return meta

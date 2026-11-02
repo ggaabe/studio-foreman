@@ -17,6 +17,7 @@ out object"), which is why the streaming side talks to the socket directly.
 from __future__ import annotations
 
 import json
+import os
 import socket
 import threading
 import urllib.error
@@ -217,16 +218,20 @@ class StreamConn:
             return
         remaining = int(length) if length is not None and length.isdigit() else None
         buf, self._buf = self._buf, b""
+        got = 0
         while True:
             if buf:
                 if remaining is not None:
                     buf = buf[:remaining]
                     remaining -= len(buf)
+                got += len(buf)
                 yield buf
             if remaining is not None and remaining <= 0:
                 return
             buf = self._recv(silence_s)
             if not buf:
+                if remaining is not None and remaining > 0:  # the connection dropped inside the body
+                    raise ConnectionError(f"connection closed after {got} of {got + remaining} body bytes")
                 return
 
     def _chunked(self, silence_s):
@@ -264,10 +269,35 @@ class StreamConn:
                 yield piece
             need(2)
 
-    def read_body(self, limit: int = 1 << 20, silence_s: float | None = 30.0) -> bytes:
+    def read_body(self, limit: int = 1 << 20, silence_s: float | None = 30.0, strict: bool = False) -> bytes:
+        """The body, at most `limit` bytes (a longer one is cut there, or with strict raises
+        ValueError: a caller that stores the body as a file must never keep a cut one)."""
         out = bytearray()
         for chunk in self.body_chunks(silence_s):
             out += chunk
-            if len(out) >= limit:
+            if len(out) > limit:
+                if strict:
+                    raise ValueError(f"the answer is larger than {limit} bytes")
                 break
         return bytes(out[:limit])
+
+    def save_body(self, path: str, limit: int, silence_s: float | None = 30.0) -> int:
+        """Stream the body into `path` (a temp file beside it, renamed when complete): returns the
+        byte count. Raises (and leaves nothing) when the body is cut short or exceeds `limit`."""
+        tmp = f"{path}.part-{os.getpid()}"
+        n = 0
+        try:
+            with open(tmp, "wb") as f:
+                for chunk in self.body_chunks(silence_s):
+                    n += len(chunk)
+                    if n > limit:
+                        raise ValueError(f"the answer is larger than {limit} bytes")
+                    f.write(chunk)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
+        return n

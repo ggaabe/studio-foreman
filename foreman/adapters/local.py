@@ -5,9 +5,11 @@ the moment gpud asks for it. Each job kind maps to a handler `fn(spec, ctx) -> a
 a worker thread. The context gives the handler what a render has: `ctx.progress(fraction)`
 (only an increase renews the lease), `ctx.log(line)` for the log tail, `ctx.cancelled`, and
 `ctx.run(cmd)` for subprocesses (ffmpeg), which a cancel stops (SIGTERM, then SIGKILL: these are
-Foreman's own children). A handler raises ContentFailure when the work itself cannot be done (gpud
-records Poll.reason "rejected", a content failure); any other exception is a crash, an
-infrastructure failure the ad retries. Runs live only as long as this process: after a gpud
+Foreman's own children, kept in gpud's process group so they die with it). A handler raises
+ContentFailure when the work itself cannot be done (gpud records Poll.reason "rejected", a content
+failure), InfraFailure when the host or the network is at fault (Poll.reason engine_error or
+engine_unconfigured: infrastructure, never charged to the template); any other exception is a
+crash, an infrastructure failure the ad retries. Runs live only as long as this process: after a gpud
 restart find() knows nothing and the job is recorded as interrupted.
 """
 from __future__ import annotations
@@ -31,6 +33,17 @@ EVENT_CAP = 0.95
 
 class ContentFailure(Exception):
     """The job's input or output is wrong (not the machine): reported as a rejected request."""
+
+
+class InfraFailure(RuntimeError):
+    """The machine, its configuration or the network failed, not the work: a font or ffmpeg missing
+    on the host, a site that answers 429. Reported as Poll.reason `reason` (engine_error or
+    engine_unconfigured), an infrastructure failure however often it repeats: it never uses the
+    template's weekly cap or the review budget."""
+
+    def __init__(self, message: str, reason: str = "engine_error"):
+        super().__init__(message)
+        self.reason = reason if reason in ("engine_error", "engine_unconfigured") else "engine_error"
 
 
 class Cancelled(Exception):
@@ -66,8 +79,9 @@ class LocalContext:
         progress creeps toward the next tenth (bounded), so a long ffmpeg pass is not mistaken for a
         stall but one that never ends still is."""
         self.check()
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd,
-                                start_new_session=True)
+        # In gpud's own process group (no new session): when launchd stops or kills gpud's group,
+        # its ffmpeg goes with it instead of racing the retried step on the same files.
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd, stdin=subprocess.DEVNULL)
         with self._engine._lock:
             self._run.procs.append(proc)
         t0 = time.monotonic()
@@ -100,17 +114,15 @@ class LocalContext:
 
 
 def _stop(proc, wait_s: float = 5.0) -> None:
-    """SIGTERM a child of ours (its own session: the whole group), then SIGKILL if it lingers."""
+    """SIGTERM a child of ours, then SIGKILL if it lingers (only that process: it shares gpud's
+    process group, so the group is never signalled)."""
     for sig in (signal.SIGTERM, signal.SIGKILL):
         if proc.poll() is not None:
             return
         try:
-            os.killpg(proc.pid, sig)
-        except (OSError, ProcessLookupError):
-            try:
-                proc.send_signal(sig)
-            except OSError:
-                pass
+            proc.send_signal(sig)
+        except OSError:
+            pass
         try:
             proc.wait(timeout=wait_s)
             return
@@ -269,6 +281,11 @@ class LocalEngine:
             self._finish(run, "cancelled", error="cancelled")
         except ContentFailure as e:
             self._finish(run, "failed", error=str(e)[:1000], reason="rejected")
+        except InfraFailure as e:
+            if run.cancel.is_set():
+                self._finish(run, "cancelled", error="cancelled")
+            else:
+                self._finish(run, "failed", error=str(e)[:1000], reason=e.reason)
         except Exception as e:  # noqa: BLE001 - a crash is an outcome gpud records, never a dead thread
             if run.cancel.is_set():
                 self._finish(run, "cancelled", error="cancelled")

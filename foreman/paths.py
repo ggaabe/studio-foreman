@@ -74,10 +74,19 @@ def input_path(path, roots, wd: str | None = None) -> str:
 
 
 def atomic_write(path: str, data: bytes) -> None:
+    """Write `data` to `path` all at once: the old file stays until the new one is complete, and a
+    write that fails (a full disk, a kill) leaves no partial temp file behind."""
     tmp = f"{path}.tmp-{os.getpid()}"
-    with open(tmp, "wb") as f:
-        f.write(data)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def atomic_json(path: str, obj) -> None:

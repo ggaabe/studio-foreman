@@ -386,13 +386,20 @@ def _pcm_wav(path: str):
 
 
 def _write_pcm(path: str, params, data: bytes) -> None:
-    tmp = path + ".tmp"
-    with wave.open(tmp, "wb") as w:
-        w.setnchannels(params.nchannels)
-        w.setsampwidth(params.sampwidth)
-        w.setframerate(params.framerate)
-        w.writeframes(data)
-    os.replace(tmp, path)
+    tmp = f"{path}.tmp-{os.getpid()}"
+    try:
+        with wave.open(tmp, "wb") as w:
+            w.setnchannels(params.nchannels)
+            w.setsampwidth(params.sampwidth)
+            w.setframerate(params.framerate)
+            w.writeframes(data)
+        os.replace(tmp, path)
+    except BaseException:  # a failed write (a full disk) leaves no partial file behind
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def wav_duration(path: str) -> float:

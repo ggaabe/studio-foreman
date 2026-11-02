@@ -992,11 +992,14 @@ class Planner:
 
     @staticmethod
     def pending_gb(store) -> float:
-        """What the media jobs of items still queued or running may yet write (retention.estimate_bytes)."""
+        """What the media jobs of items still queued or running may yet write (retention.estimate_bytes).
+        An item counts while any job of its lineage is live, not only its root: an ad's root (its
+        facts) ends in seconds and its takes are written for hours after."""
         total = 0.0
+        live = "('queued', 'starting', 'running', 'cancelling')"
         for row in store.conn.execute(
                 "SELECT j.id FROM plan_items i JOIN jobs j ON j.id = i.job_id WHERE i.state = 'queued' "
-                "AND j.state IN ('queued', 'starting', 'running')"):
+                f"AND (j.state IN {live} OR EXISTS (SELECT 1 FROM jobs c WHERE c.root_id = j.id AND c.state IN {live}))"):
             job = store.job(row["id"])
             if job is not None:
                 total += retention.estimate_bytes({"kind": job.kind, "payload": job.payload})

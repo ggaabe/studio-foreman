@@ -301,8 +301,13 @@ def import_folder(home: str, src: str, cid: str, name: str | None = None, kind: 
     elif voice:
         data["voice"] = {"engine": "kokoro", "voice": voice, "speed": float(speed or 1.0)}
     elif isinstance(base.get("voice"), dict) and base["voice"].get("engine") == "qwen3_clone":
-        ref = os.path.join(src, base["voice"].get("ref_wav") or "")
-        if os.path.isfile(ref):
+        rel = base["voice"].get("ref_wav")
+        bad = []
+        _rel_file(src, rel, "the folder's bible.json voice.ref_wav", bad)  # never a file outside the folder
+        if bad:
+            raise BibleError("; ".join(bad))
+        ref = os.path.join(src, rel)
+        if os.path.isfile(ref) and not os.path.islink(ref):
             os.makedirs(os.path.join(root, "voice"), exist_ok=True)
             shutil.copyfile(ref, os.path.join(root, "voice", "reference.wav"))
             data["voice"] = dict(base["voice"], ref_wav="voice/reference.wav")

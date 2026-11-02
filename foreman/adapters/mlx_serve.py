@@ -49,6 +49,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -92,6 +93,17 @@ class RequestRejected(RunFailed):
     adapter cannot even build): a content failure, reported to gpud as Poll.reason 'rejected'."""
 
 
+class EnvironmentFailure(RunFailed):
+    """The host or its configuration cannot run the request (no ffmpeg, no free disk, a model that
+    does not list the capability its role needs in /v1/models): an infrastructure failure,
+    reported as Poll.reason `reason` (engine_unconfigured or engine_error), never charged to the
+    work however often it repeats."""
+
+    def __init__(self, message: str, reason: str = "engine_unconfigured"):
+        super().__init__(message)
+        self.reason = reason
+
+
 # 4xx answers that say "not now", "not this server state" or "not this caller" rather than "not
 # these parameters": the caller was refused (401 Unauthorized, 403 Forbidden, 407 Proxy
 # Authentication Required: an auth proxy or an API key in front of the server), the endpoint does
@@ -104,6 +116,36 @@ MAX_PLAUSIBLE_GB = 1024.0
 # id) while gpud's own copy has another id: reported as "<id> (another copy)", a model outside the
 # catalog (never unloaded, counted in memory and slots).
 OTHER_COPY = "(another copy)"
+
+
+def _run_cancellable(cmd: list, cancel, timeout: float) -> tuple:
+    """(returncode, stderr) of a subprocess that a cancel (threading.Event) or the timeout stops
+    (SIGTERM, then SIGKILL): a muxing ffmpeg never outlives the run it belongs to."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
+    end = time.monotonic() + timeout
+    err = b""
+    try:
+        while True:
+            try:
+                _, e = proc.communicate(timeout=0.5)
+                return proc.returncode, err + (e or b"")
+            except subprocess.TimeoutExpired:
+                if (cancel is not None and cancel.is_set()) or time.monotonic() > end:
+                    break
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            if proc.poll() is not None:
+                break
+            proc.send_signal(sig)
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                continue
+        _, e = proc.communicate()
+        return (proc.returncode if proc.returncode is not None else -9), err + (e or b"")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
 
 
 def rejected_status(status: int, message: str) -> bool:
@@ -279,7 +321,8 @@ class MlxServeEngine:
                  max_silence_s: float = 1800.0, decode_s_per_mpf: float = 0.6, min_decode_grace_s: float = 60.0,
                  sample_frames: int = 4, sample_max_side: int = 512, stall_after: int | None = None,
                  stall_kinds=None, forbidden=FORBIDDEN_PATTERNS, ffmpeg: str | None = "auto",
-                 preserve_default: bool = True, keep_raw_frames: bool = False, input_roots=None):
+                 preserve_default: bool = True, keep_raw_frames: bool = False, input_roots=None,
+                 companions=None):
         split_url(base_url)  # validate early
         self.name = name
         self.base_url = base_url.rstrip("/")
@@ -310,6 +353,12 @@ class MlxServeEngine:
         home = os.path.expanduser(os.environ.get("FOREMAN_HOME", "~/.foreman"))
         self.input_roots = [self.artifacts_dir] + [os.path.expanduser(r) for r in (input_roots or [home])]
         self._mine ={m for m, s in self.catalog.items() if s.engine == name}
+        # Server ids a catalog model's requests may load beside it (the ASR's forced aligner, used for
+        # word times): one that was not resident before a request of Foreman's and is after was
+        # loaded by Foreman, and goes when gpud unloads the model it came with. One already resident
+        # (anyone's) is never touched.
+        self.companions = {m: tuple(v) for m, v in (companions or {}).items()}
+        self._companion_loaded: dict = {}         # catalog model -> {server ids its requests loaded}
         self._boot = secrets.token_hex(4)
         self._seq = itertools.count(1)
         self._lock = threading.RLock()
@@ -833,7 +882,40 @@ class MlxServeEngine:
             raise ConnectionError(job.error or "mlx-serve unreachable")
         if not job.ok:
             log.error("mlx-serve refused to unload %s: %s", model, job.error)
+        elif self._companion_loaded.get(model):
+            self._unload_companions(model)
         return bool(job.ok)
+
+    def _companions_resident(self, model: str) -> set:
+        want = self.companions.get(model) or ()
+        if not want:
+            return set()
+        try:
+            ps = self._ps()
+        except Exception:
+            return set()
+        return {sid for sid in want if sid in ps}
+
+    def note_companions(self, model: str, before: set) -> None:
+        """After a request of `model`: companions resident now that were not before were loaded by it."""
+        new = self._companions_resident(model) - set(before)
+        if new:
+            with self._lock:
+                self._companion_loaded.setdefault(model, set()).update(new)
+            log.info("%s loaded %s for Foreman's request: it is unloaded with %s", model, sorted(new), model)
+
+    def _unload_companions(self, model: str) -> None:
+        with self._lock:
+            sids = sorted(self._companion_loaded.pop(model, set()))
+        for sid in sids:
+            try:
+                json_call(self.base_url, "POST", "/v1/unload-model", {"model": sid}, timeout=self.unload_timeout_s)
+                log.info("unloaded %s (loaded by Foreman's %s request)", sid, model)
+            except HttpError as e:
+                if e.status != 404:
+                    log.warning("could not unload %s (loaded with %s): %s", sid, model, e)
+            except Exception as e:
+                log.warning("could not unload %s (loaded with %s): %s", sid, model, e)
 
     def _unload_main(self, job: _Unload) -> None:
         try:
@@ -982,7 +1064,8 @@ class MlxServeEngine:
         except Cancelled:
             self._finish(run, "cancelled", error="cancelled (HTTP connection closed)")
         except RunFailed as e:
-            self._finish(run, "failed", error=str(e), reason="rejected" if isinstance(e, RequestRejected) else None)
+            reason = "rejected" if isinstance(e, RequestRejected) else getattr(e, "reason", None)
+            self._finish(run, "failed", error=str(e), reason=reason)
         except Exception as e:
             if run.cancel.is_set():
                 self._finish(run, "cancelled", error="cancelled (HTTP connection closed)")
@@ -1267,12 +1350,14 @@ class MlxServeEngine:
         tail = ["-pix_fmt", "yuv420p", "-movflags", "+faststart", out]
         for enc in encoders:
             try:
-                res = subprocess.run(head + enc + tail, capture_output=True, timeout=600, check=False)
+                code, err = _run_cancellable(head + enc + tail, getattr(run, "cancel", None), timeout=600.0)
             except (OSError, subprocess.SubprocessError) as e:
                 run.note(f"ffmpeg mux failed: {e}")
                 return None
-            if res.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
+            if getattr(run, "cancel", None) is not None and run.cancel.is_set():
+                raise Cancelled("cancelled while muxing")
+            if code == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
                 run.note(f"muxed {os.path.basename(out)} with {enc[1]}")
                 return out
-            run.note(f"ffmpeg {enc[1]} failed: {res.stderr[-300:].decode('utf-8', 'replace')}")
+            run.note(f"ffmpeg {enc[1]} failed: {err[-300:].decode('utf-8', 'replace')}")
         return None

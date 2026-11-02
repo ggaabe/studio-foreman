@@ -444,8 +444,15 @@ def parse_template(data, source: str = "<template>") -> Template:
         notes = ""
     ad_block = None
     if kind == "ad":
-        from .ads import parse_ad_block
+        from .ads import longest_ad_s, parse_ad_block
         ad_block = parse_ad_block(data.get("ad"), problems)
+        secs, shots = (params or {}).get("seconds") or {}, (params or {}).get("shots") or {}
+        if number(secs.get("max")) is not None and number(shots.get("max")) is not None:
+            longest = longest_ad_s(int(shots["max"]))
+            if float(secs["max"]) > longest:
+                problems.append(f"params.seconds: max {secs['max']:g} s is longer than {int(shots['max'])} shots can run "
+                                f"(at most {longest:.0f} s: every shot but the end card lasts at most 8 s); lower "
+                                f"seconds.max or allow more shots")
     elif "ad" in data:
         problems.append("ad is only for templates of kind ad")
     concept = (ad_block or {}).get("concept") or ""

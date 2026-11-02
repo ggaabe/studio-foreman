@@ -13,7 +13,14 @@ from that directory with relative paths, so no filter argument needs escaping):
   4. the final encode burns in the word-highlight ASS captions (libass with an explicit fontsdir:
      the Studio's ffmpeg has no fontconfig) and the small always-visible "AI-generated" label
      (drawtext with an explicit fontfile), H.264 (VideoToolbox, libx264 as the fallback) + AAC,
-     +faststart, at a bitrate that keeps the file under max_mb (re-encoded smaller if not).
+     +faststart, at a bitrate that keeps the file under max_mb (re-encoded smaller if not; an
+     MP4 still over the cap is deleted, never left as if finished).
+
+Drawn text (the end card, the label) is drawn verbatim (drawtext expansion=none: '20%' is text)
+and measured with the font's own advance widths first: a line too wide for the frame is shrunk,
+or broken in two. A caption phrase whose word cannot wrap (a long web address) is drawn smaller.
+Shot boundaries are cut on the plan's absolute frame numbers (round(t * 24)), so rounding never
+adds up across shots against the voice track and the captions.
 
 Captions stay inside the central safe zone: never over the top 12% or the bottom 20% of the
 frame (bottom-centre alignment with a 24% bottom margin and at most two lines).
@@ -47,6 +54,8 @@ FONT_GLOBS = ("/Library/Fonts/*.ttf", "/System/Library/Fonts/Supplemental/*.ttf"
 SAFE_TOP, SAFE_BOTTOM = 0.12, 0.20   # caption-free bands, as fractions of the height
 CAPTION_MARGIN_V = 0.24               # bottom margin of the caption block (above the bottom band)
 CAPTION_SIZE = 0.036                  # caption font size, fraction of the height (69 px at 1920)
+LABEL_SIZE, LABEL_MIN_SIZE = 0.022, 0.018  # the AI label's font size (shrunk to fit, never below the minimum)
+LABEL_Y = 0.13                        # its top, just below the top band
 HIGHLIGHT = "&H0000D7FF&"             # ASS colours are &HAABBGGRR: gold
 WHITE = "&H00FFFFFF&"
 
@@ -160,14 +169,179 @@ def font_names(path: str) -> tuple:
         return stem, ""
 
 
+def _same_file(a: str, b: str) -> bool:
+    """`b` exists and holds the same bytes as `a`."""
+    try:
+        if os.path.getsize(a) != os.path.getsize(b):
+            return False
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            while True:
+                x, y = fa.read(1 << 20), fb.read(1 << 20)
+                if x != y:
+                    return False
+                if not x:
+                    return True
+    except OSError:
+        return False
+
+
+# ---------------------------------------------------------------- text widths (fitting drawn text)
+
+class FontMetrics:
+    """Advance widths from a TrueType/OpenType font (the first face of a collection): cmap formats
+    4 and 12 and hmtx, read with the standard library. Text drawn with drawtext or libass is
+    measured with the font it is drawn with, so a line that would run off the frame is shrunk (or
+    wrapped) before it is drawn."""
+
+    def __init__(self, path: str):
+        with open(path, "rb") as f:
+            data = f.read(64 << 20)
+        base = struct.unpack(">I", data[12:16])[0] if data[:4] == b"ttcf" else 0
+        num = struct.unpack(">H", data[base + 4: base + 6])[0]
+        tables = {}
+        for i in range(num):
+            rec = data[base + 12 + 16 * i: base + 28 + 16 * i]
+            tables[rec[:4]] = struct.unpack(">I", rec[8:12])[0]
+        head, hhea, hmtx, cmap = (tables.get(t) for t in (b"head", b"hhea", b"hmtx", b"cmap"))
+        if None in (head, hhea, hmtx, cmap):
+            raise ValueError("not a TrueType/OpenType font with head, hhea, hmtx and cmap")
+        self.upem = struct.unpack(">H", data[head + 18: head + 20])[0] or 1000
+        self.n_metrics = struct.unpack(">H", data[hhea + 34: hhea + 36])[0]
+        self.data, self.hmtx = data, hmtx
+        self.sub = None
+        n_sub = struct.unpack(">H", data[cmap + 2: cmap + 4])[0]
+        best = None
+        for i in range(n_sub):
+            pid, eid, off = struct.unpack(">HHI", data[cmap + 4 + 8 * i: cmap + 12 + 8 * i])
+            fmt = struct.unpack(">H", data[cmap + off: cmap + off + 2])[0]
+            rank = {(3, 10): 0, (0, 4): 1, (3, 1): 2, (0, 3): 3}.get((pid, eid), 9)
+            if fmt in (4, 12) and (best is None or rank < best[0]):
+                best = (rank, cmap + off, fmt)
+        if best is None:
+            raise ValueError("no usable cmap subtable")
+        self.sub, self.fmt = best[1], best[2]
+        self._cache: dict = {}
+
+    def glyph(self, cp: int) -> int:
+        d, o = self.data, self.sub
+        if self.fmt == 12:
+            n = struct.unpack(">I", d[o + 12: o + 16])[0]
+            for i in range(n):
+                a, b, g = struct.unpack(">III", d[o + 16 + 12 * i: o + 28 + 12 * i])
+                if a <= cp <= b:
+                    return g + cp - a
+            return 0
+        if cp > 0xFFFF:
+            return 0
+        segs = struct.unpack(">H", d[o + 6: o + 8])[0] // 2
+        ends = o + 14
+        starts = ends + 2 * segs + 2
+        deltas = starts + 2 * segs
+        ranges = deltas + 2 * segs
+        for i in range(segs):
+            end = struct.unpack(">H", d[ends + 2 * i: ends + 2 * i + 2])[0]
+            if cp > end:
+                continue
+            start = struct.unpack(">H", d[starts + 2 * i: starts + 2 * i + 2])[0]
+            if cp < start:
+                return 0
+            delta = struct.unpack(">h", d[deltas + 2 * i: deltas + 2 * i + 2])[0]
+            ro = struct.unpack(">H", d[ranges + 2 * i: ranges + 2 * i + 2])[0]
+            if ro == 0:
+                return (cp + delta) & 0xFFFF
+            addr = ranges + 2 * i + ro + 2 * (cp - start)
+            g = struct.unpack(">H", d[addr: addr + 2])[0]
+            return (g + delta) & 0xFFFF if g else 0
+        return 0
+
+    def advance(self, ch: str) -> float:
+        """The advance of one character in em units."""
+        cp = ord(ch)
+        if cp not in self._cache:
+            g = self.glyph(cp)
+            idx = min(g, max(0, self.n_metrics - 1))
+            adv = struct.unpack(">H", self.data[self.hmtx + 4 * idx: self.hmtx + 4 * idx + 2])[0]
+            self._cache[cp] = adv / float(self.upem) if g else _guess_em(ch)
+        return self._cache[cp]
+
+
+_METRICS: dict = {}
+
+
+def _guess_em(ch: str) -> float:
+    """A generous width for a character of a bold sans font (when the font cannot be read): text
+    measured with it is never wider on screen than this says."""
+    if ch in " .,:;'!|il\u2019":
+        return 0.36
+    if ch in "ftrIj-()[]/":
+        return 0.48
+    if ch in "mwMW@%":
+        return 0.98
+    if ch.isupper() or ch.isdigit():
+        return 0.76
+    return 0.66
+
+
+def text_width(font_file: str | None, text: str, size: float) -> float:
+    """How wide `text` is at `size` px with `font_file` (a generous estimate without one)."""
+    fm = None
+    if font_file:
+        if font_file not in _METRICS:
+            try:
+                _METRICS[font_file] = FontMetrics(font_file)
+            except (OSError, ValueError, struct.error, IndexError):
+                _METRICS[font_file] = None
+        fm = _METRICS[font_file]
+    em = sum(fm.advance(ch) if fm is not None else _guess_em(ch) for ch in str(text))
+    return em * float(size)
+
+
+def fit_text(font_file: str | None, text: str, size: int, max_w: float, min_size: int, max_lines: int = 2) -> tuple:
+    """([lines], size): `text` at `size` if it fits in max_w px, else shrunk (down to min_size),
+    else broken into at most `max_lines` lines at spaces and sized so the widest fits."""
+    text = re.sub(r"\s+", " ", str(text)).strip()
+    w = text_width(font_file, text, size)
+    if w <= max_w or not text:
+        return [text], int(size)
+    shrunk = int(size * max_w / w)
+    words = text.split(" ")
+    if shrunk >= min_size or len(words) < 2 or max_lines < 2:
+        return [text], max(4, shrunk)
+    best = None
+    for cut in range(1, len(words)):
+        a, b = " ".join(words[:cut]), " ".join(words[cut:])
+        widest = max(text_width(font_file, a, size), text_width(font_file, b, size))
+        if best is None or widest < best[0]:
+            best = (widest, [a, b])
+    widest, lines = best
+    return lines, int(min(size, size * max_w / widest)) if widest > max_w else int(size)
+
+
+def _read_text(path: str) -> str | None:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read(4096)
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
 def install_font(src: str, fonts_dir: str, name: str) -> dict:
     """Copy a font into the ad's fonts directory under a filter-safe name; returns
     {"path" (relative to the work directory), "family", "bold"}."""
     os.makedirs(fonts_dir, exist_ok=True)
     ext = os.path.splitext(src)[1].lower() or ".ttf"
     dst = os.path.join(fonts_dir, f"{name}{ext}")
-    if not os.path.exists(dst):
-        shutil.copyfile(src, dst)
+    if not _same_file(src, dst):  # missing, or left half-copied by a killed run: copy it again, atomically
+        tmp = f"{dst}.tmp-{os.getpid()}"
+        try:
+            shutil.copyfile(src, tmp)
+            os.replace(tmp, dst)
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
     family, sub = font_names(dst)
     return {"file": dst, "family": family, "bold": "bold" in sub.lower() or "black" in sub.lower(), "source": src}
 
@@ -245,6 +419,15 @@ def gray_frames(ff: Ffmpeg, path: str, width: int, height: int, start: float = 0
     return [data[i: i + size] for i in range(0, len(data) - size + 1, size)]
 
 
+def gray_frame(ff: Ffmpeg, path: str, width: int, height: int, t: float) -> bytes | None:
+    """The frame at `t` seconds as width x height 8-bit grey, or None."""
+    res = ff.run(["-loglevel", "error", "-ss", f"{max(0.0, t):.3f}", "-i", path, "-frames:v", "1", "-vf",
+                  f"scale={width}:{height}:flags=area,format=gray", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+                 check=False)
+    data = res.stdout or b""
+    return data[:width * height] if res.returncode == 0 and len(data) >= width * height else None
+
+
 def frame_std(frame: bytes) -> float:
     n = len(frame)
     if not n:
@@ -289,19 +472,21 @@ def _ass_text(text: str) -> str:
     return re.sub(r"\s+", " ", str(text).replace("\\", "").replace("{", "(").replace("}", ")")).strip()
 
 
-def caption_chunks(words: list, max_words: int = 4, max_chars: int = 24) -> list:
+def caption_chunks(words: list, max_words: int = 4, max_chars: int = 24, measure=None, avail=None) -> list:
     """Words grouped into short on-screen phrases (never across script lines; a phrase ends after
-    punctuation): [[word, ...], ...]."""
+    punctuation): [[word, ...], ...]. A word too wide for the frame (a long web address) is a
+    phrase of its own, so only it is drawn smaller."""
     chunks, cur = [], []
     for w in words:
         if not _ass_text(w.get("text", "")):
             continue
-        if cur and (w.get("line") != cur[-1].get("line") or len(cur) >= max_words
+        wide = measure is not None and avail and measure(_ass_text(w["text"])) > avail
+        if cur and (wide or w.get("line") != cur[-1].get("line") or len(cur) >= max_words
                     or len(" ".join(x["text"] for x in cur + [w])) > max_chars):
             chunks.append(cur)
             cur = []
         cur.append(w)
-        if re.search(r"[.!?;:,]$", w["text"].strip()):
+        if wide or re.search(r"[.!?;:,]$", w["text"].strip()):
             chunks.append(cur)
             cur = []
     if cur:
@@ -309,9 +494,12 @@ def caption_chunks(words: list, max_words: int = 4, max_chars: int = 24) -> list
     return chunks
 
 
-def caption_events(words: list, end_limit: float | None = None, hold_s: float = 0.25, **kw) -> list:
-    """[(start, end, ASS text)]: one event per word, showing its phrase with that word highlighted."""
-    chunks = caption_chunks(words, **kw)
+def caption_events(words: list, end_limit: float | None = None, hold_s: float = 0.25, measure=None, avail=None,
+                   size: int | None = None, **kw) -> list:
+    """[(start, end, ASS text)]: one event per word, showing its phrase with that word highlighted.
+    No event starts or lasts past end_limit (the end card). A phrase whose widest word does not fit
+    in `avail` px at the caption size is drawn with a smaller font ({\\fs}) so nothing is clipped."""
+    chunks = caption_chunks(words, measure=measure, avail=avail, **kw)
     events = []
     for ci, chunk in enumerate(chunks):
         nxt = chunks[ci + 1][0]["start"] if ci + 1 < len(chunks) else None
@@ -320,16 +508,25 @@ def caption_events(words: list, end_limit: float | None = None, hold_s: float = 
             stop = min(stop, nxt)
         if end_limit is not None:
             stop = min(stop, end_limit)
+        prefix = ""
+        if measure is not None and avail and size:
+            widest = max(measure(_ass_text(x["text"])) for x in chunk)
+            if widest > avail:
+                prefix = f"{{\\fs{max(8, int(size * avail / widest))}}}"
         for wi, w in enumerate(chunk):
             a = w["start"] if wi else chunk[0]["start"]
             b = chunk[wi + 1]["start"] if wi + 1 < len(chunk) else stop
+            if end_limit is not None:
+                if a >= end_limit:
+                    break
+                b = min(b, end_limit)
             if b - a < 0.02:
                 continue
             parts = []
             for xi, x in enumerate(chunk):
                 t = _ass_text(x["text"])
                 parts.append(f"{{\\c{HIGHLIGHT}}}{t}{{\\c{WHITE}}}" if xi == wi else t)
-            events.append((a, b, " ".join(parts)))
+            events.append((a, b, prefix + " ".join(parts)))
     return events
 
 
@@ -341,10 +538,13 @@ def caption_style(width: int, height: int) -> dict:
 
 
 def write_ass(path: str, words: list, width: int, height: int, family: str, bold: bool = True,
-              end_limit: float | None = None) -> int:
-    """Write the captions file; returns the number of events."""
+              end_limit: float | None = None, font_file: str | None = None) -> int:
+    """Write the captions file; returns the number of events. Words are measured with `font_file`
+    (a generous estimate without it) so a phrase never runs past the side margins."""
     st = caption_style(width, height)
-    events = caption_events(words, end_limit=end_limit)
+    avail = width - 2 * st["margin_lr"]
+    events = caption_events(words, end_limit=end_limit, measure=lambda t: text_width(font_file, t, st["size"]),
+                            avail=avail, size=st["size"])
     lines = [
         "[Script Info]", "ScriptType: v4.00+", f"PlayResX: {width}", f"PlayResY: {height}", "WrapStyle: 0",
         "ScaledBorderAndShadow: yes", "", "[V4+ Styles]",
@@ -367,18 +567,25 @@ def write_ass(path: str, words: list, width: int, height: int, family: str, bold
 X264_SEG = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p", "-an"]
 
 
-def seg_take(ff: Ffmpeg, src: str, out: str, seconds: float, width: int, height: int, fps: int = 24) -> str:
-    """A generated take: cover-scaled, cropped, exactly `seconds` long (last frame held if short)."""
-    n = max(1, int(round(seconds * fps)))
+def _frames(seconds: float, fps: int, frames: int | None) -> int:
+    return max(1, int(frames)) if frames else max(1, int(round(seconds * fps)))
+
+
+def seg_take(ff: Ffmpeg, src: str, out: str, seconds: float, width: int, height: int, fps: int = 24,
+             frames: int | None = None) -> str:
+    """A generated take: cover-scaled, cropped, exactly `frames` frames (default: `seconds` at
+    `fps`; the last frame is held if the take is short)."""
+    n = _frames(seconds, fps, frames)
     ff.run(["-loglevel", "error", "-y", "-i", src, "-vf",
             f"scale={width}:{height}:force_original_aspect_ratio=increase:flags=lanczos,crop={width}:{height},"
-            f"setsar=1,fps={fps},tpad=stop_mode=clone:stop_duration={seconds + 1:.3f}",
+            f"setsar=1,fps={fps},tpad=stop_mode=clone:stop_duration={n / float(fps) + 1:.3f}",
             "-frames:v", str(n)] + X264_SEG + [out], heartbeat=30.0)
     return out
 
 
-def _pushin(ff: Ffmpeg, still: str, out: str, seconds: float, width: int, height: int, fps: int, push: float) -> str:
-    n = max(1, int(round(seconds * fps)))
+def _pushin(ff: Ffmpeg, still: str, out: str, seconds: float, width: int, height: int, fps: int, push: float,
+            frames: int | None = None) -> str:
+    n = _frames(seconds, fps, frames)
     zoom = f"1+{push:.4f}*on/{max(1, n - 1)}"
     ff.run(["-loglevel", "error", "-y", "-i", still, "-vf",
             f"scale={2 * width}:{2 * height}:force_original_aspect_ratio=increase:flags=lanczos,"
@@ -389,9 +596,9 @@ def _pushin(ff: Ffmpeg, still: str, out: str, seconds: float, width: int, height
 
 
 def seg_still(ff: Ffmpeg, src: str, out: str, seconds: float, width: int, height: int, fps: int = 24,
-              push: float = 0.06) -> str:
+              push: float = 0.06, frames: int | None = None) -> str:
     """A still with a slow push-in."""
-    return _pushin(ff, src, out, seconds, width, height, fps, push)
+    return _pushin(ff, src, out, seconds, width, height, fps, push, frames)
 
 
 def _fit_over_blur(width: int, height: int) -> str:
@@ -402,20 +609,21 @@ def _fit_over_blur(width: int, height: int) -> str:
 
 
 def seg_screen(ff: Ffmpeg, src: str, out: str, seconds: float, width: int, height: int, fps: int = 24,
-               is_video: bool = True, push: float = 0.05) -> str:
+               is_video: bool = True, push: float = 0.05, frames: int | None = None) -> str:
     """A real screen capture fitted over a blurred copy of itself; a still capture also gets the
     slow push-in."""
-    n = max(1, int(round(seconds * fps)))
+    n = _frames(seconds, fps, frames)
     if is_video:
         ff.run(["-loglevel", "error", "-y", "-i", src, "-filter_complex",
-                f"[0:v]{_fit_over_blur(width, height)},fps={fps},tpad=stop_mode=clone:stop_duration={seconds + 1:.3f}[v]",
+                f"[0:v]{_fit_over_blur(width, height)},fps={fps},"
+                f"tpad=stop_mode=clone:stop_duration={n / float(fps) + 1:.3f}[v]",
                 "-map", "[v]", "-frames:v", str(n)] + X264_SEG + [out], heartbeat=30.0)
         return out
     composed = os.path.splitext(out)[0] + "-composed.png"
     ff.run(["-loglevel", "error", "-y", "-i", src, "-filter_complex", f"[0:v]{_fit_over_blur(width, height)}[v]",
             "-map", "[v]", "-frames:v", "1", composed])
     try:
-        return _pushin(ff, composed, out, seconds, width, height, fps, push)
+        return _pushin(ff, composed, out, seconds, width, height, fps, push, n)
     finally:
         try:
             os.remove(ff.path(composed))
@@ -423,17 +631,47 @@ def seg_screen(ff: Ffmpeg, src: str, out: str, seconds: float, width: int, heigh
             pass
 
 
+def _drawtext(fontfile: str, textfile: str, fs: int, x: str, y: str, color: str, box: str, border: int) -> str:
+    # expansion=none: the text is drawn as written ('20%' and '%{pts}' are text, not expansions)
+    return (f"drawtext=fontfile={fontfile}:textfile={textfile}:expansion=none:fontsize={fs}:fontcolor={color}:"
+            f"x={x}:y={y}:box=1:boxcolor={box}:boxborderw={border}")
+
+
+def fitted_lines(ff: Ffmpeg, fontfile: str, textfile: str, fs: int, max_w: float, min_fs: int) -> list:
+    """[(text file, font size)]: the text file as one line if it fits in max_w px (shrunk down to
+    min_fs if need be), else its text broken into two lines written beside it. A file that cannot
+    be read is drawn as it is."""
+    text = _read_text(ff.path(textfile))
+    if text is None:
+        return [(textfile, fs)]
+    lines, size = fit_text(ff.path(fontfile), text, fs, max_w, min_fs)
+    if len(lines) == 1:
+        return [(textfile, size)]
+    out = []
+    stem = os.path.splitext(textfile)[0]
+    for i, line in enumerate(lines):
+        rel = f"{stem}-l{i}.txt"
+        with open(ff.path(rel), "w", encoding="utf-8") as f:
+            f.write(line)
+        out.append((rel, size))
+    return out
+
+
 def seg_endcard(ff: Ffmpeg, out: str, seconds: float, width: int, height: int, fontfile: str, lines: list,
-                background: str | None = None, color: str = "#1d3557", fps: int = 24) -> str:
+                background: str | None = None, color: str = "#1d3557", fps: int = 24, frames: int | None = None) -> str:
     """The end card: a still (darkened a little) or a plain colour, with `lines` drawn centred:
-    [(text file relative to the work directory, size as a fraction of the height, y as a fraction)]."""
-    n = max(1, int(round(seconds * fps)))
+    [(text file relative to the work directory, size as a fraction of the height, y as a fraction)].
+    Each line is measured with the font and shrunk (or broken in two) to stay inside the frame."""
+    n = _frames(seconds, fps, frames)
     draws = []
     for textfile, size, y in lines:
         fs = max(8, int(round(size * height)))
-        draws.append(f"drawtext=fontfile={fontfile}:textfile={textfile}:fontsize={fs}:fontcolor=white:"
-                     f"x=(w-text_w)/2:y={int(y * height)}-text_h/2:box=1:boxcolor=black@0.45:"
-                     f"boxborderw={max(4, fs // 3)}")
+        parts = fitted_lines(ff, fontfile, textfile, fs, 0.88 * width, max(8, int(round(0.6 * fs))))
+        step = 1.25 * parts[0][1]
+        top = y * height - step * (len(parts) - 1) / 2.0
+        for i, (tf, pfs) in enumerate(parts):
+            draws.append(_drawtext(fontfile, tf, pfs, "(w-text_w)/2", f"{int(top + i * step)}-text_h/2", "white",
+                                   "black@0.45", max(4, pfs // 3)))
     chain = ",".join(draws) if draws else "null"
     if background:
         args = ["-loglevel", "error", "-y", "-loop", "1", "-framerate", str(fps), "-i", background, "-vf",
@@ -443,7 +681,8 @@ def seg_endcard(ff: Ffmpeg, out: str, seconds: float, width: int, height: int, f
         if not re.match(r"^#[0-9a-fA-F]{6}$", color or ""):
             color = "#1d3557"
         args = ["-loglevel", "error", "-y", "-f", "lavfi", "-i",
-                f"color=c=0x{color[1:]}:s={width}x{height}:r={fps}:d={seconds + 1:.3f}", "-vf", f"setsar=1,{chain}"]
+                f"color=c=0x{color[1:]}:s={width}x{height}:r={fps}:d={n / float(fps) + 1:.3f}", "-vf",
+                f"setsar=1,{chain}"]
     ff.run(args + ["-frames:v", str(n)] + X264_SEG + [out], heartbeat=30.0)
     return out
 
@@ -520,9 +759,13 @@ def final_encode(ff: Ffmpeg, video: str, audio: str, out: str, seconds: float, m
     if captions:
         chain.append(f"ass={captions}" + (f":fontsdir={fonts_dir}" if fonts_dir else ""))
     if label_file and label_font:
-        fs = max(8, int(round(0.022 * height)))
-        chain.append(f"drawtext=fontfile={label_font}:textfile={label_file}:fontsize={fs}:fontcolor=white@0.92:"
-                     f"x={int(0.05 * width)}:y={int(0.13 * height)}:box=1:boxcolor=black@0.35:boxborderw={max(3, fs // 4)}")
+        fs = max(8, int(round(LABEL_SIZE * height)))
+        parts = fitted_lines(ff, label_font, label_file, fs, 0.90 * width, max(8, int(round(LABEL_MIN_SIZE * height))))
+        y = int(LABEL_Y * height)
+        for tf, pfs in parts:
+            chain.append(_drawtext(label_font, tf, pfs, str(int(0.05 * width)), str(y), "white@0.92", "black@0.35",
+                                   max(3, pfs // 4)))
+            y += int(round(1.3 * pfs))
     chain.append("format=yuv420p")
     kbps = video_kbps(seconds, max_bytes, audio_kbps)
     attempts = []
@@ -552,5 +795,48 @@ def final_encode(ff: Ffmpeg, video: str, audio: str, out: str, seconds: float, m
             last_err = (res.stderr or b"")[-800:].decode("utf-8", "replace")
             attempts.append({"encoder": enc, "kbps": kbps, "error": last_err[-300:]})
         else:
+            _remove(ff.path(out))
             raise AssemblyError(f"no H.264 encoder worked: {last_err}")
+    _remove(ff.path(out))  # an MP4 over the cap is not a finished ad: never leave one behind
     raise AssemblyError(f"could not get the ad under {max_bytes / 1e6:.0f} MB: {attempts}")
+
+
+def _remove(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def changed_share(a: bytes, b: bytes, width: int, rows: tuple, threshold: int = 40) -> float:
+    """The share of pixels in rows [r0, r1) of two grey frames that differ by more than threshold."""
+    r0, r1 = rows
+    lo, hi = r0 * width, min(len(a), len(b), r1 * width)
+    if hi <= lo:
+        return 0.0
+    return sum(1 for x, y in zip(a[lo:hi], b[lo:hi]) if abs(x - y) > threshold) / float(hi - lo)
+
+
+def burned_in(ff: Ffmpeg, plain: str, final: str, width: int, height: int, caption_times: list,
+              label: bool) -> dict:
+    """Did the captions and the label actually get drawn? Frames of the final cut are compared with
+    the same frames of the cut before captions and label (drawtext or libass can fail silently: a
+    font libass cannot match, text drawtext would not render). Returns {"captions": share or None,
+    "label": share or None, "ok_captions", "ok_label"}."""
+    w = min(width, 360) // 2 * 2
+    h = max(2, int(round(height * w / float(width)))) // 2 * 2
+    cap_rows = (int((1 - SAFE_BOTTOM - 0.36) * h), int((1 - SAFE_BOTTOM + 0.02) * h))
+    label_rows = (int((LABEL_Y - 0.01) * h), int((LABEL_Y + 2.8 * LABEL_SIZE + 0.01) * h))
+    caps, labs = [], []
+    for t in list(caption_times[:3]) or ([0.5] if label else []):
+        a, b = gray_frame(ff, plain, w, h, t), gray_frame(ff, final, w, h, t)
+        if not a or not b:
+            continue
+        if caption_times:
+            caps.append(changed_share(a, b, w, cap_rows))
+        labs.append(changed_share(a, b, w, label_rows))
+    cap = max(caps) if caps else None
+    lab = max(labs) if labs else None
+    return {"captions": None if cap is None else round(cap, 5), "label": None if lab is None else round(lab, 5),
+            "ok_captions": cap is not None and cap >= 0.002, "ok_label": (not label) or (lab is not None and lab >= 0.001),
+            "frames": len(caps), "size": [w, h]}

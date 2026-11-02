@@ -68,7 +68,12 @@ NUMERIC_PAYLOAD_KEYS = ("expected_s", "p90_s", "duration_s", "progress_interval_
 # (bounded separately by Policy.max_interruptions).
 INFRA_REASONS = ("engine_unreachable",)
 # Failure reasons an engine may give for a failed run (Poll.reason); anything else is a "crash".
+# The request itself (content):
 ENGINE_FAILURE_REASONS = ("rejected",)
+# The host, its configuration or the network (a font or ffmpeg missing, a model without the
+# capability its role needs, a site that rate-limits): infrastructure however often it repeats
+# (ledger.INFRA_REASONS), so it never uses a template's weekly cap or the review budget.
+ENGINE_INFRA_REASONS = ("engine_error", "engine_unconfigured")
 # The planner's brain job (foreman/planner.py). It runs only on a brain that is already resident
 # (payload.resident_only), is never retried and never pages on failure: its decision is a list of
 # proposals the planner validates, never requests gpud admits as they are. Only the planner's own
@@ -1840,7 +1845,7 @@ class Supervisor:
         if poll.status == "done":
             return self._complete(job, poll, now)
         if poll.status == "failed":
-            reason = poll.reason if poll.reason in ENGINE_FAILURE_REASONS else "crash"
+            reason = poll.reason if poll.reason in ENGINE_FAILURE_REASONS + ENGINE_INFRA_REASONS else "crash"
             return self._record_terminal(job, failed(reason, poll.error or "engine reported failure", poll.log_tail,
                                                      **self._artifact_fields(job, poll.artifact)), now)
         self._record_terminal(job, failed("engine_lost", f"engine reported '{poll.status}'", poll.log_tail), now)

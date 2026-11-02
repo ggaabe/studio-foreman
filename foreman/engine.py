@@ -38,7 +38,9 @@ class Poll:
     error: str | None = None
     log_tail: tuple[str, ...] = field(default_factory=tuple)
     # Why a failed run failed, when the engine knows: "rejected" means the server refused the
-    # request itself (an HTTP 4xx for its parameters), a content failure. None: gpud records "crash".
+    # request itself (an HTTP 4xx for its parameters), a content failure; "engine_error" and
+    # "engine_unconfigured" mean the host, its configuration or the network failed (an
+    # infrastructure failure, never charged to the work). None: gpud records "crash".
     reason: str | None = None
 
 
