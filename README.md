@@ -1674,7 +1674,9 @@ of the line and no other number inside it, within `gate_wer_max`; the word-timed
 start with the line (nothing said before it), not run on into another word within `h3_runon_s`
 (0.15 s), and hear most of it; a cut word (the end card's) must start on a real voiced onset after
 quiet (`h3_anchor_tol_s`, `h3_anchor_gap_s`: a forced aligner packs a spoken address short and
-slides the next words early); a scene with `hands_gate` must show no stray hands in its bottom band
+slides the next words early; when it does, the word moves to the last voiced run that starts on an
+onset at most 0.8 s later and has ended before the next word, never earlier than the aligner put it,
+and fails only when there is none); a scene with `hands_gate` must show no stray hands in its bottom band
 in the frames the cut shows of the take (from just before the line to its sound's end and hold, not under a
 card or still);
 the line must end before the take does; and what the take was heard saying may not add what the
@@ -1686,7 +1688,10 @@ than `h3_width` x `h3_height` stops the ad as the machine's failure (`engine_unc
 does not take its size from `{{width}}` and `{{height}}`), not the template's. A render ComfyUI fails
 on, or that leaves no file, is an infrastructure failure of the takes job, retried as it was (same
 seeds), never a failed take. A failed beat is taken again with seed + 1000 n and, once
-it was re-rolled `gate_rerolls` times for a term it did not say, that term's next spelling, up to
+it was re-rolled `gate_rerolls` times for a term it did not say, that term's next spelling; a take
+that said more than its line (words before or after it, or two more words than it has: H3 fills a take
+longer than its line with made-up words) is taken again 15% shorter, and one whose line ran to its
+end 12% longer, within 2.5 to 8 s (the take's `seconds` in gate.json); up to
 `h3_attempts` (3) takes and `h3_budget_s` (1200) render seconds per ad; then the ad fails as content,
 naming the beat and what was heard. The dispatcher refuses an ad whose worst case (every beat taken
 `h3_attempts` times) would not fit the continuation depth. A take's voice is told the line with the

@@ -1493,7 +1493,7 @@ class AdPipeline:
             op = {"op": "graph", "graph": picks["graphs"]["talk"], "out": take["mp4"],
                   "images": self.h3_images(bible, ad, beat),
                   "params": {"prompt": h3core.h3_prompt(ad, bible, beat, take["spoken"]), "seed": int(take["seed"]),
-                             "width": W, "height": H, "seconds": float(beat["seconds"])},
+                             "width": W, "height": H, "seconds": h3core.take_seconds(beat, take)},
                   "expected_s": self.cfg.exp("h3_take"), "unit": f"beat-{beat['k']}-t{take['n']}", "shot": beat["k"],
                   "seed": int(take["seed"]), "role": "talk"}
             units.append((op, op["expected_s"]))
@@ -1559,7 +1559,7 @@ class AdPipeline:
             if probe is None:
                 return self.gate_failed(wd, g, f"speech gate: beat {beat['k']}'s take {take['mp4']} was never "
                                                f"{'rendered' if meta is None else 'probed'}")
-            if h3core.take_problems(probe, beat.get("seconds")):
+            if h3core.take_problems(probe, h3core.take_seconds(beat, take)):
                 ready.append(key)  # judged on the probe alone: nothing an ASR could hear
                 continue
             unit = f"{key}-t{take['n']}"
@@ -1636,7 +1636,8 @@ class AdPipeline:
                     "extra_numbers": [], "hands": [], "anchor": None}
         probe = self.h3_probe_of(wd, take)
         hinted = unhinted = None
-        if not h3core.take_problems(probe, beat.get("seconds")):
+        beat = dict(beat, seconds=h3core.take_seconds(beat, take))  # a retake asked for its own length
+        if not h3core.take_problems(probe, beat["seconds"]):
             hinted = paths.read_json(os.path.join(wd, take["hinted"]))
             unhinted = paths.read_json(os.path.join(wd, take["transcript"]))
         return h3core.judge_take(beat, beat.get("words"), lex, hinted, unhinted, probe, self.cfg, ad)

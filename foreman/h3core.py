@@ -57,6 +57,10 @@ HIGHLIGHT, TEXT, MUTED = "#FFD700", "#FFFFFF", "#E5E7EB"
 MAX_BOX = 20000                   # px: a capture box coordinate at most
 MAX_CUTAWAYS = 2                  # per beat
 MIN_CARD_WORDS = 3                # a screen, price or still cutaway stays up for at least this many words
+BEAT_S = (2.5, 8.0)               # what H3 is asked to render for one beat, at least and at most (s)
+BABBLE_SHRINK = 0.85              # a take that said more than its line is taken again this much shorter
+CUT_OFF_GROW = 1.12               # a take whose line ran to its end is taken again this much longer
+ANCHOR_SLIDE_S = 0.8              # how far after the aligner's time a cut word's real onset is looked for
 SEED_MOD = 2147483647
 CAMERA = ("Static tripod shot: the camera does not move and the framing stays exactly the same from the first frame "
           "to the last.")
@@ -721,7 +725,7 @@ def beat_seconds(spoken: str) -> float:
     """How long H3 is asked to render a beat: 1.1 s plus a quarter second per syllable, in [2.5, 8.0].
     The graph rounds its frames up to 17k+5 itself, which already leaves room for the line's pauses
     (a pause term made v6's takes a 17-frame step longer than v6 needed)."""
-    s = min(8.0, max(2.5, 1.1 + syllables(spoken) / 4.0))
+    s = min(BEAT_S[1], max(BEAT_S[0], 1.1 + syllables(spoken) / 4.0))
     return round(s + 1e-9, 1)  # half up: 4.35 is 4.4 (round() alone reads the float 4.3499...)
 
 
@@ -1380,6 +1384,26 @@ def anchor_check(t: float, voiced_runs, tol: float, gap: float) -> tuple:
     return (near is not None and abs(near - t) <= tol + 1e-9), near
 
 
+def anchor_later(t: float, next_t, voiced_runs, tol: float, gap: float) -> tuple | None:
+    """(onset, end) of the voiced run a cut word really starts, when a forced aligner put it early: the
+    last run starting on an onset (after `gap` of quiet) later than `t` (less tol), at most ANCHOR_SLIDE_S
+    after it, that has ended by the time the next heard word starts (`next_t`, None: the take's end; a run
+    still going then is that word's own, put late by the aligner). Only ever later than the aligner's
+    time, so the cut can only land after the word before it (the address) began, and the gap it closes
+    is quiet by energy whatever word it falls before. None: no such run."""
+    runs = []
+    for r in voiced_runs or []:
+        if isinstance(r, (list, tuple)) and len(r) == 2 and number(r[0]) is not None and number(r[1]) is not None:
+            runs.append((float(r[0]), float(r[1])))
+    ons = set(onsets(runs, gap))
+    best = None
+    for a, b in runs:
+        if a in ons and t - tol - 1e-9 <= a <= t + ANCHOR_SLIDE_S + 1e-9 \
+                and (next_t is None or b <= float(next_t) + 1e-9):
+            best = (a, b)
+    return best
+
+
 def shown_hands(hits: list, beat: dict, words: list, span, duration: float, voiced_runs=None) -> list:
     """The hands hits (probe times) the beat's picture shows: from its line's start (less HANDS_LEAD)
     to its acoustic end plus tail (or the take's end) plus hold, and not under a graphic cutaway (a card
@@ -1593,10 +1617,21 @@ def judge_take(beat: dict, words, lex: list, hinted, unhinted, probe, cfg: ads.A
         v["anchor"] = {"word": w["text"], "i": int(c["at_i"]), "t": w["start"],
                        "nearest": round(near, 3) if near is not None else None, "ok": ok}
         if not ok:
+            i = int(c["at_i"])
+            # bounded by every later word, heard or not (an unheard word keeps a time near the aligner's): the
+            # moved word never starts after a word that follows it
+            starts = [float(x["start"]) for x in al["words"][i + 1:] if number(x.get("start")) is not None]
+            later = anchor_later(w["start"], min(starts) if starts else None, (probe or {}).get("voiced_runs"),
+                                 float(cfg.h3_anchor_tol_s), float(cfg.h3_anchor_gap_s))
+            if later is not None:  # the aligner slid the word early (after a spoken address): its real onset
+                v["words"][i] = dict(v["words"][i], start=round(later[0], 3), end=round(max(later[1], w["end"]), 3))
+                v["anchor"].update(t=round(later[0], 3), nearest=round(later[0], 3), aligned=w["start"], ok=True)
+                continue
+        if not ok:
             fails.append(f"misaligned: {word_key(w['text'])!r} at {w['start']:.2f}s is not at a word onset (nearest "
                          f"{round(near, 2) if near is not None else None})")
             break
-    v["hands"] = shown_hands(v["hands"], beat, al["words"], v["span"], duration, (probe or {}).get("voiced_runs"))
+    v["hands"] = shown_hands(v["hands"], beat, v["words"], v["span"], duration, (probe or {}).get("voiced_runs"))
     if beat.get("hands_gate") and v["hands"]:
         fails.append(f"hands visible at {v['hands'][:6]}s")
     if v["span"] is not None and v["span"][1] > duration - 0.05 + 1e-9:
@@ -1620,14 +1655,73 @@ def take_files(k: int, n: int) -> dict:
 
 
 def h3_attempt(beat: dict, n: int, lex: list, readings: dict | None = None, choice: dict | None = None,
-               why: str = "first take", ad: dict | None = None) -> dict:
-    """The record of take n of a beat (gate.json): its seed (beat.seed + 1000 n), files, and what the
-    voice is told. A spelling the speech gate would not take for the line is an AdError (content)."""
+               why: str = "first take", ad: dict | None = None, seconds: float | None = None) -> dict:
+    """The record of take n of a beat (gate.json): its seed (beat.seed + 1000 n), files, what the
+    voice is told and, when a retake asks for another length than the beat's, its seconds. A spelling
+    the speech gate would not take for the line is an AdError (content)."""
     spoken, forms, bad = h3_spoken(beat["line"], lex, choice, readings, ad)
     if bad:
         raise AdError(f"beat {beat.get('k')}: " + "; ".join(bad)[:600])
-    return dict({"n": int(n), "seed": (int(beat["seed"]) + 1000 * int(n)) % SEED_MOD}, **take_files(beat["k"], n),
-                spoken=spoken, forms=forms, choice=dict(choice or {}), why=why, status="pending")
+    out = dict({"n": int(n), "seed": (int(beat["seed"]) + 1000 * int(n)) % SEED_MOD}, **take_files(beat["k"], n),
+               spoken=spoken, forms=forms, choice=dict(choice or {}), why=why, status="pending")
+    if seconds is not None and number(beat.get("seconds")) is not None \
+            and abs(float(seconds) - float(beat["seconds"])) > 1e-9:
+        out["seconds"] = float(seconds)
+    return out
+
+
+def take_seconds(beat: dict, take: dict | None) -> float | None:
+    """How long a take was asked to be: its own seconds (a retake made shorter or longer), else the beat's
+    (None: neither says)."""
+    for s in (number((take or {}).get("seconds")), number((beat or {}).get("seconds"))):
+        if s is not None:
+            return float(s)
+    return None
+
+
+def babbled(verdict: dict, line: str, lex: list) -> bool:
+    """Whether a failed take said more than its line: words before it, a run-on, something the line does
+    not say, or at least two words heard on top of the line where none of its own was lost (judge_heard's
+    `added`, after the judge's own joins: a term or a word heard as several is not babble). H3 fills a take
+    longer than its line with made-up words."""
+    why = str(verdict.get("why") or "")
+    if why.startswith(("says ", "runs on into", "said what the line does not")):
+        return True
+    heard = verdict.get("heard")
+    if not heard or verdict.get("missing_terms") or verdict.get("missing_numbers"):
+        return False
+    res = ads.judge_heard(ads.gate_tokens(line, lex), ads.gate_tokens(str(heard)[:4000], lex),
+                          1.0, [e["display"] for e in lex])
+    return int(res.get("added") or 0) >= 2
+
+
+def cut_off(verdict: dict) -> bool:
+    """Whether a take failed because its line ran to the take's end (judge_take's own words)."""
+    why = str(verdict.get("why") or "")
+    return why.startswith("the line runs to ") and why.endswith(": cut off")
+
+
+def retake_seconds(beat: dict, take: dict, verdict: dict, lex: list) -> tuple:
+    """(seconds, note) for the next take of a beat: longer after a take whose line ran to its end, shorter
+    after one that said more than its line, else the last take's. A change is at least one step of the
+    graph's frames (h3_frames: a length that renders the same frames is no change), within BEAT_S, and
+    never shorter than the line said at a brisk 4.5 syllables a second after a 0.3 s lead."""
+    last = take_seconds(beat, take)
+    if last is None:
+        return None, ""
+    now = h3_frames(last)
+    if cut_off(verdict):
+        s = round(min(BEAT_S[1], last * CUT_OFF_GROW) + 1e-9, 1)
+        while h3_frames(s) <= now and s < BEAT_S[1] - 1e-9:
+            s = round(s + 0.1, 1)
+        return (s, f"a longer take ({s:g} s)") if h3_frames(s) > now else (last, "")
+    if babbled(verdict, beat.get("line") or "", lex):
+        floor = max(BEAT_S[0], round(0.3 + syllables((take or {}).get("spoken") or beat.get("line") or "") / 4.5, 1))
+        s = round(max(floor, last * BABBLE_SHRINK) + 1e-9, 1)
+        while h3_frames(s) >= now and s > floor + 1e-9:
+            s = round(s - 0.1, 1)
+        return (s, f"a shorter take ({s:g} s)") if h3_frames(s) < now else (last, "")
+    return last, ""
 
 
 def gate_reason(unit: dict, beat: dict, why: str, heard: str, cause: str = "") -> str:
@@ -1668,7 +1762,10 @@ def plan_h3_retake(unit: dict, beat: dict, verdict: dict, lex: list, cfg: ads.Ad
             reason = "a new seed (no spelling left)"
     else:
         rerolls += 1
-    take = h3_attempt(beat, n + 1, lex, readings, choice, f"{reason} (after: {why})"[:300], ad)
+    seconds, longer = retake_seconds(beat, attempts[-1] if attempts else {}, verdict, lex)
+    if longer:
+        reason += ", " + longer
+    take = h3_attempt(beat, n + 1, lex, readings, choice, f"{reason} (after: {why})"[:300], ad, seconds)
     u.update(n=n + 1, choice=choice, rerolls=rerolls, status="pending", attempts=attempts + [take])
     return u, None
 

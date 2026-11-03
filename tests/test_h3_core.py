@@ -806,6 +806,31 @@ class H6Judge(unittest.TestCase):
         self.assertEqual(v["why"], "misaligned: no word 'and' heard")
         self.assertEqual(h3core.onsets([[0.1, 0.2], [0.25, 0.4], [0.5, 0.6]], 0.1), [0.1, 0.5])
 
+    def test_an_anchor_slid_early_is_found_on_its_own_onset(self):
+        """Seen live (item 34, all three takes): the aligner gave 'example.com' no length and put 'and' at 2.32 s;
+        the voice says it at 2.87 s, the last voiced run starting after quiet before 'send'. The cut word moves
+        there (never earlier than the aligner put it), and the take passes."""
+        slid = [("Go", 0.4, 0.64), ("to", 0.64, 0.8), ("example.com", 1.52, 1.52), ("and", 2.32, 2.4),
+                ("send", 3.44, 3.6), ("your", 3.6, 3.76), ("form", 3.76, 4.08)]
+        runs = [[0.4, 1.22], [1.25, 1.36], [1.56, 1.78], [1.8, 1.96], [2.08, 2.42], [2.51, 2.7], [2.87, 3.22],
+                [3.34, 3.48], [3.49, 3.7], [3.77, 4.07]]
+        v = judge(cta_beat(), asr(*slid), pr=probe(runs=runs))
+        self.assertEqual((v["ok"], v["why"]), (True, "clean"))
+        self.assertEqual(v["anchor"], {"word": "and", "i": 3, "t": 2.87, "aligned": 2.32, "nearest": 2.87, "ok": True})
+        self.assertEqual(v["words"][3], {"text": "and", "start": 2.87, "end": 3.22}, "the edit cuts on the real onset")
+        self.assertEqual(h3core.anchor_later(2.32, 3.44, runs, 0.06, 0.10), (2.87, 3.22))
+        # never earlier than the aligner's time, never past the next word, never further than ANCHOR_SLIDE_S
+        self.assertIsNone(h3core.anchor_later(3.0, 3.44, runs, 0.06, 0.10))
+        self.assertIsNone(h3core.anchor_later(2.32, 3.1, runs, 0.06, 0.10))
+        self.assertIsNone(h3core.anchor_later(1.9, None, [[0.4, 1.0], [2.9, 3.2]], 0.06, 0.10))
+        # the second review: the hands gate covers what the edit covers (from the moved word), and a later word the
+        # aligner did not hear (its time stays near the aligner's) keeps the repair from moving the word past it
+        v = judge(cta_beat(hands_gate=True), asr(*slid), pr=probe(runs=runs, hands=[2.5]))
+        self.assertEqual(v["why"], "hands visible at [2.5]s")
+        dropped = [w for w in slid if w[0] != "send"]
+        v = judge(cta_beat(), asr(*dropped), {"text": CTA}, pr=probe(runs=runs))
+        self.assertEqual(v["why"], "misaligned: 'and' at 2.32s is not at a word onset (nearest 2.08)")
+
     def test_hands(self):
         pr = probe(runs=CTA_RUNS, hands=[0.5, 0.67])
         self.assertTrue(judge(cta_beat(), asr(*CTA_WORDS), pr=pr)["ok"], "no hands gate on this scene")
@@ -875,6 +900,58 @@ class H7Retakes(unittest.TestCase):
         u, why = h3core.plan_h3_retake(self.unit, self.beat, self.miss, self.lex, AdsConfig(), 0.0, depth_ok=False)
         self.assertIn("beat 1 (body)", why)
         self.assertIn("continuation depth", why)
+
+    def test_a_take_that_babbles_is_taken_again_shorter(self):
+        """Seen live (item 35): asked for 5.9 s (6.6 s after the graph's rounding), H3 said the 4.4 s call to action
+        and filled the rest with made-up words ('Go to get Vnami', 'and Luxyacht.com', 'and Gleebea Evavaro') in
+        all three takes: each had the same length. A take that said more than its line is taken again shorter;
+        one whose line ran to its end, longer; any other failure keeps the length."""
+        line = "Go to example.com and send your form today."
+        beat = {"k": 4, "role": "cta", "line": line, "seed": 9, "seconds": 5.9}
+        unit = {"n": 0, "choice": {}, "rerolls": 0, "status": "pending",
+                "attempts": [dict(h3core.h3_attempt(beat, 0, self.lex), status="failed")]}
+        self.assertNotIn("seconds", unit["attempts"][0], "a first take asks for the beat's own length")
+        cfg = AdsConfig(h3_attempts=6)
+        for heard in ("Go to example.com and Gleebea Evavaro and send your form today.",
+                      "Go to example.com and lux dot com and send your form today."):
+            v = {"ok": False, "why": "heard as ...", "heard": heard, "missing_terms": []}
+            u, _ = h3core.plan_h3_retake(unit, beat, v, self.lex, cfg, 0.0)
+            self.assertEqual((u["attempts"][-1]["seconds"], h3core.take_seconds(beat, u["attempts"][-1])), (5.0, 5.0))
+            self.assertIn("a shorter take (5 s)", u["attempts"][-1]["why"])
+        for why in ("says ['Go', 'to', 'get', 'Vnami'] before the line", "runs on into ['Yeah']",
+                    "said what the line does not: 'lux.com' is not the ad's own URL (example.com)"):
+            u, _ = h3core.plan_h3_retake(unit, beat, {"ok": False, "why": why, "heard": line}, self.lex, cfg, 0.0)
+            self.assertEqual(u["attempts"][-1]["seconds"], 5.0, why)
+        # shrinks again from the last take's own length, by whole steps of the graph's frames, never under what the
+        # line needs at 4.5 syllables a second after a 0.3 s lead (its 14 syllables: 3.4 s)
+        runon = {"ok": False, "why": "runs on into ['so']", "heard": line}
+        u2, _ = h3core.plan_h3_retake(u, beat, runon, self.lex, cfg, 0.0)
+        self.assertEqual((u2["attempts"][-1]["seconds"], "a shorter take (4.3 s)" in u2["attempts"][-1]["why"]),
+                         (4.3, True))
+        self.assertEqual(h3core.retake_seconds(beat, dict(u2["attempts"][-1], seconds=3.7), runon, self.lex), (3.7, ""),
+                         "3.1 s renders the same frames as 3.7 s and 3.0 s is under the line's 3.4 s")
+        s, note = h3core.retake_seconds(dict(beat, seconds=8.0), {}, runon, self.lex)
+        self.assertEqual((s, note, h3core.h3_frames(s) < h3core.h3_frames(8.0)), (6.8, "a shorter take (6.8 s)", True))
+        self.assertEqual(h3core.retake_seconds(dict(beat, line="Hi there.", seconds=2.6), {}, runon, self.lex),
+                         (2.6, ""), "2.5 s renders the same 73 frames as 2.6 s: no change")
+        # a word heard wrong, a term heard as several words or filler after the line is not babble
+        for heard in ("Go to example.com and spend your form today.", "Go to example dot calm and send your form today.",
+                      "Go to example.com and send your form today. Thank you for watching."):
+            u, _ = h3core.plan_h3_retake(unit, beat, {"ok": False, "why": "heard as ...", "heard": heard}, self.lex,
+                                         cfg, 0.0)
+            self.assertNotIn("seconds", u["attempts"][-1], heard)
+        # a line cut off at the take's end is taken again longer by at least one step of frames, at most 8 s, first
+        # whatever else was heard; 'cut off' inside what was heard is not the judge's cut-off
+        cut = {"ok": False, "why": "the line runs to 3.04s, the end of the take (3.04s): cut off",
+               "heard": "Go to example.com and Gleebea Evavaro and send your form today."}
+        self.assertEqual(h3core.retake_seconds(beat, {}, cut, self.lex), (6.7, "a longer take (6.7 s)"))
+        self.assertGreater(h3core.h3_frames(6.7), h3core.h3_frames(5.9))
+        self.assertEqual(h3core.retake_seconds(dict(beat, seconds=7.8), {}, cut, self.lex), (7.8, ""))
+        self.assertEqual(h3core.retake_seconds({"line": line}, {}, cut, self.lex), (None, ""))
+        quoted = {"ok": False, "why": "heard as 'your call never gets cut off by a dizzy line'",
+                  "heard": "Your call never gets cut off by a dizzy line."}
+        self.assertEqual(h3core.retake_seconds(dict(beat, line="Your call never gets cut off by a busy line."), {},
+                                               quoted, self.lex), (5.9, ""))
 
     def test_planned_jobs(self):
         cfg = AdsConfig()

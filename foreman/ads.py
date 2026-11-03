@@ -1717,7 +1717,8 @@ def judge_heard(ref: list, hyp: list, wer_max: float, names: list) -> dict:
     heard; the word error rate must be at most wer_max. `lost` counts only the script's words that
     were not heard (substituted or dropped), not extra words; `wer_inner` leaves out the extra
     words heard before the first and after the last script word (music or an end card around the
-    speech)."""
+    speech); `added` counts the extra words heard between two script words heard right, in runs where no
+    script word was lost (words said on top of the script, not a script word heard as several)."""
     hyp = _cap_heard(ref, hyp)
     hyp = _terms_in_addresses(ref, _join_groups(_spoken_prices(ref, hyp), ref), names)
     ref = _join_groups(ref, hyp)
@@ -1743,13 +1744,15 @@ def judge_heard(ref: list, hyp: list, wer_max: float, names: list) -> dict:
         for _, i, _ in run:
             if i is not None:
                 runs[i] = heard
-    for o in ops:
-        if o[0] == "eq":
+    added, seen_eq = 0, False
+    for o in ops + [("end", None, None)]:
+        if o[0] in ("eq", "end"):
             close(run)
-            run = []
+            if run and seen_eq and o[0] == "eq" and all(op == "ins" for op, _, _ in run):
+                added += len(run)  # inside the script only: words around it are the timed checks' to judge
+            seen_eq, run = seen_eq or o[0] == "eq", []
         else:
             run.append(o)
-    close(run)
 
     def heard_at(i):
         if i in runs:
@@ -1778,7 +1781,7 @@ def judge_heard(ref: list, hyp: list, wer_max: float, names: list) -> dict:
     lost = (count["sub"] + count["del"]) / float(total)
     return {"ok": not missing_terms and not missing_numbers and not extra_numbers and wer <= wer_max + 1e-9,
             "wer": round(wer, 4), "wer_inner": round(inner, 4), "lost": round(lost, 4), "words": len(ref2),
-            "errors": count, "missing_terms": missing_terms, "missing_numbers": missing_numbers,
+            "errors": count, "added": added, "missing_terms": missing_terms, "missing_numbers": missing_numbers,
             "extra_numbers": extra_numbers[:10],
             "expected": " ".join(show_token(t, names) for t in ref2)[:1200],
             "heard": " ".join(show_token(t, names) for t in hyp2)[:1200]}
