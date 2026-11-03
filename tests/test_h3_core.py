@@ -787,6 +787,14 @@ class H6Judge(unittest.TestCase):
         self.assertIn("no speech heard", v["why"])
         v = judge(cta_beat(), asr(*CTA_WORDS), pr=probe(duration=3.7, runs=CTA_RUNS))
         self.assertEqual(v["why"], "the line runs to 3.68s, the end of the take (3.70s): cut off")
+        # seen live (item 39): the aligner stretched the last word over the quiet after it to the take's end; the
+        # voice had stopped 0.28 s before. A line is cut off only when the voice is still sounding at the end
+        quiet = [list(r) for r in CTA_RUNS[:-1]] + [[2.71, 3.4]]
+        v = judge(cta_beat(), asr(*CTA_WORDS), pr=probe(duration=3.7, runs=quiet))
+        self.assertEqual((v["ok"], v["why"]), (True, "clean"))
+        self.assertTrue(h3core.sounding_at_end({"voiced_runs": CTA_RUNS}, 3.7))
+        self.assertFalse(h3core.sounding_at_end({"voiced_runs": quiet}, 3.7))
+        self.assertTrue(h3core.sounding_at_end({}, 3.7), "no voiced runs measured: the word time decides")
 
     def test_the_anchor(self):
         """The forced aligner packs a spoken address short and slides the next word early: the cut word must

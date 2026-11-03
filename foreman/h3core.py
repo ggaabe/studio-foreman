@@ -1434,6 +1434,19 @@ def shown_hands(hits: list, beat: dict, words: list, span, duration: float, voic
     return [t for t in hits if lo <= t <= hi and not any(a <= t < b for a, b in covered)]
 
 
+def sounding_at_end(probe, duration: float, last: float = 0.05) -> bool:
+    """Whether the take's voice is still sounding in its last `last` s (a voiced run reaching into them). A
+    forced aligner stretches a line's last word over the quiet after it to the end of the audio, so the
+    word's time alone cannot tell a line cut off from one that ended in time (item 39: the voice stopped at
+    6.30 s of 6.58, the aligner ended 'file.' at 6.56). A probe without voiced runs: sounding (the word
+    time decides, as before)."""
+    runs = (probe or {}).get("voiced_runs") if isinstance(probe, dict) else None
+    if not isinstance(runs, list):
+        return True
+    return any(isinstance(r, (list, tuple)) and len(r) == 2 and number(r[1]) is not None
+               and float(r[1]) > float(duration) - last - 1e-9 for r in runs)
+
+
 def take_problems(probe, seconds) -> list:
     """What makes a take unusable before anyone listens: the probe's own problems (no audio, the
     wrong size, silent), no duration, or far shorter than asked."""
@@ -1557,7 +1570,7 @@ def judge_take(beat: dict, words, lex: list, hinted, unhinted, probe, cfg: ads.A
     transcript: nothing said before the line, nothing starting within h3_runon_s after it, most of
     the line heard (MATCHED_SHARE); 4 each cutaway with check_anchor starts on a voiced onset; 5 no
     hands in the frames the beat shows (shown_hands) when its scene gates them; 6 the line ends at least
-    0.05 s before the take does.
+    0.05 s before the take does, or the voice is quiet by then (sounding_at_end).
 
     Returns {ok, why, span: [start, end, next start or None] | None, words: [{text, start, end}] (take
     times, for the edit), heard (unhinted text), heard_hinted, wer, wer_inner, missing_terms,
@@ -1634,7 +1647,7 @@ def judge_take(beat: dict, words, lex: list, hinted, unhinted, probe, cfg: ads.A
     v["hands"] = shown_hands(v["hands"], beat, v["words"], v["span"], duration, (probe or {}).get("voiced_runs"))
     if beat.get("hands_gate") and v["hands"]:
         fails.append(f"hands visible at {v['hands'][:6]}s")
-    if v["span"] is not None and v["span"][1] > duration - 0.05 + 1e-9:
+    if v["span"] is not None and v["span"][1] > duration - 0.05 + 1e-9 and sounding_at_end(probe, duration):
         fails.append(f"the line runs to {v['span'][1]:.2f}s, the end of the take ({duration:.2f}s): cut off")
     v["ok"] = not fails
     if fails:
