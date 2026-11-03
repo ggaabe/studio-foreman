@@ -1730,10 +1730,13 @@ holds, `voice_style`), `face` (the approved still tag of the face close-up), `sc
 `note`, `crop`, `paint` boxes, the `tap` button and its colour), `price_card` (`big`, `lines`, a
 capture `crop`, `underline` boxes, `pulse_line`, a `lead` of card-coloured pixels stacked between the
 crop's text lines so an underline clears the next one, `paint` boxes), `endcard` (`lead`, `big`,
-`lines`, `footnote`),
+`lines`, `footnote`; `big` is the card's largest line: a price, a phone number or a short call, and
+like every drawn text its numbers must be in the facts),
 `brand` (`name`, colours, an optional `logo` PNG under assets), `headline` (true: the brain writes
 one; a string; null), `readings`, `caption` (`size`, `margin_v`, `margins`), `punch_scale`,
-`hold_cta_s`, `tail_hook_s`, `example` (a finished plan shown to the brain) and `notes`. See
+`hold_cta_s`, `tail_hook_s`, `picture_style` and `soundscape` (the H3 prompt's look and sound; by
+default the recipe's realistic photographic style and quiet room tone, so a cartoon mascot outdoors
+says its own), `example` (a finished plan shown to the brain) and `notes`. See
 `examples/ads/templates/ads.example-h3.v1.json` (generic: ExampleCo, example.com, $9.50), its
 facts `examples/ads/assets/facts-h3.json` and presenter `examples/ads/characters/presenter-example/`.
 The character's voice names its reference recording (`voice.ref_wav`, allowed with any engine).

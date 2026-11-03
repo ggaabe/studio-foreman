@@ -843,6 +843,7 @@ class W6Regressions(unittest.TestCase):
     def f(self, rel):
         return os.path.join(self.tmp, rel)
 
+    @needs_media
     @needs_font
     def test_the_punch_in_shows_no_rows_the_beats_crop_and_the_probe_leave_out(self):
         """A scene crop that keeps hands out of frame (anchor_y 0) and a punch-in on its beat: the probe scans what
@@ -881,6 +882,7 @@ class W6Regressions(unittest.TestCase):
         talk = next(s for s in tl["segments"] if s["kind"] == "talk")
         self.assertEqual(max(_skin(fr) for fr in _frames(self.f(talk["path"]))), 0)
 
+    @needs_media
     def test_the_last_word_never_outlasts_its_beat(self):
         """A take cut before the next heard word: the line's last word ends by the line's acoustic end (not at the
         next word), and no word time leaves its beat (its caption would show over the next beat's picture)."""
@@ -896,6 +898,7 @@ class W6Regressions(unittest.TestCase):
         self.assertTrue(all(w["e"] <= p["n"] / 24 + 1e-9 and w["s"] <= w["e"] for w in p["shifted"]), (p["shifted"],
                                                                                                          p["n"]))
 
+    @needs_media
     def test_the_captions_burn_in_the_face_they_were_measured_with(self):
         """libass loads every face in its fonts directory and matches family + regular weight: the caption font is
         given alone, so Arial Bold.ttf is not drawn as the Arial.ttf beside it."""
@@ -920,6 +923,7 @@ class W6Regressions(unittest.TestCase):
         alone = ink(edit._caption_fonts(bold, self.f("fonts-bold")))
         self.assertGreater(alone, 1.2 * ink(os.path.dirname(bold)), "the bold face was drawn")
 
+    @needs_media
     def test_the_worker_stops_when_its_parent_dies(self):
         """A media worker leads a process group of its own (a cancel stops its ffmpeg), so launchd ending gpud's
         group does not reach it: it watches its parent, and stops (its ffmpeg too) when the parent is gone."""

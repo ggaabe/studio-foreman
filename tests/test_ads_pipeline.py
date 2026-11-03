@@ -210,6 +210,17 @@ class P2Script(unittest.TestCase):
                                         for s in SCRIPT["shots"]])
         self.assertIn("product's screens", " | ".join(self.check(generated)[1]))
 
+    def test_a_phone_held_with_its_back_to_the_camera_shows_no_screen(self):
+        # Seen live (item 33): "with the back facing the camera" was read as a phone showing the product,
+        # and the brain repeated it through both repairs. A back turned to the camera shows no screen; a
+        # phone still showing a page is refused whatever way it is held.
+        for visual, shows in (("She holds her phone in both hands with the back facing the camera, taps the screen "
+                               "once, then looks up and smiles warmly.", False),
+                              ("Holding her phone with its back toward the camera, she taps it once.", False),
+                              ("Her phone with the back to the camera, showing the checkout page.", True)):
+            problems = ads.visual_problems(visual, {}, "beat 1 action")
+            self.assertEqual(any("product's screens" in p for p in problems), shows, visual)
+
     def test_the_templates_banned_words_are_never_said(self):
         # Seen live: a scaffolding pitch whose concept ruled out safety claims still said "We are set up
         # and safe on site." The template's banned words are now checked in code, whole words only.

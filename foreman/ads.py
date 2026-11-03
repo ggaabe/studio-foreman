@@ -152,7 +152,9 @@ SCREEN_AWAY = re.compile(
     r"\b(with )?(the |its |her |his |their )?(screens?|displays?) (is |are )?(facing|turned|tilted|pointed|angled)"
     r" away( from (the )?(camera|lens|viewer))?"
     r"|\b(with )?(the )?backs? of (the |her |his |their )?(phones?|tablets?|laptops?|screens?|devices?)"
-    r" (is |are )?(facing |turned |pointed )?(toward|towards|to|at) (the )?(camera|lens|viewer)")
+    r" (is |are )?(facing |turned |pointed )?(toward|towards|to|at) (the )?(camera|lens|viewer)"
+    r"|\b(with )?(the |its )?backs? (is |are )?(facing|turned|pointed|angled|toward|towards|to|at)"
+    r"( (toward|towards|to|at))? (the )?(camera|lens|viewer)")
 # The presenter speaking about the price is a direction for the voice, not a price in the picture.
 SAYS_PRICE = re.compile(r"\b(states?|stating|says?|saying|mentions?|mentioning|explains?|explaining|announces?"
                         r"|announcing|reads? out|tells?|telling|names?|naming|gives?|giving|quotes?|quoting)"

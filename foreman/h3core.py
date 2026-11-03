@@ -29,7 +29,7 @@ from .policy import number
 from .text import CONTROL_RE, fold, has_bidi
 
 H3_KEYS = ("presenter", "face", "scenes", "stills", "captures", "price_card", "endcard", "brand", "headline", "readings",
-           "caption", "punch_scale", "hold_cta_s", "tail_hook_s", "example", "notes")
+           "caption", "punch_scale", "hold_cta_s", "tail_hook_s", "picture_style", "soundscape", "example", "notes")
 PRESENTER_KEYS = ("noun", "subject", "object", "voice", "voice_style")
 SCENE_KEYS = ("still", "framing", "setting", "roles", "hands_gate", "crop", "caption_pos", "punch_anchor_y")
 CAPTURE_KEYS = ("id", "note", "crop", "paint", "tap", "tap_color")
@@ -48,6 +48,9 @@ ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")         # scene, still and cap
 PRONOUN_RE = re.compile(r"^[A-Za-z][A-Za-z' -]{0,39}$")
 COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 DEFAULT_VOICE_STYLE = "in a warm, natural, conversational voice,"
+# The H3 prompt's look and sound (the v6 recipe's, for a real presenter indoors); a cartoon mascot on a site says its own.
+PICTURE_STYLE = "realistic photographic style, bright natural light, shallow depth of field"
+SOUNDSCAPE = "Quiet, warm room tone"
 CAPTION = {"size": 92, "margin_v": 710, "margins": [100, 180]}
 PUNCH_SCALE, HOLD_CTA_S, TAIL_HOOK_S, STILL_PUSH = 1.2, 1.0, 0.05, 0.06
 HIGHLIGHT, TEXT, MUTED = "#FFD700", "#FFFFFF", "#E5E7EB"
@@ -359,11 +362,12 @@ def parse_h3_block(value, problems: list, ad: dict) -> dict | None:
     if not isinstance(end, dict) or set(end) - set(ENDCARD_KEYS):
         problems.append(f"ad.h3.endcard is required: an object with {', '.join(ENDCARD_KEYS)}")
     else:
+        # big: the card's largest line, a price ("$9.50"), a phone number or a short call ("Book today"); its
+        # numbers are held to the facts at the facts step like every drawn text (h3_facts_problems)
         out["endcard"] = {"lead": text(end.get("lead"), "ad.h3.endcard.lead", 60, required=False) or "",
                           "big": text(end.get("big"), "ad.h3.endcard.big", 40),
                           "lines": texts(end.get("lines"), "ad.h3.endcard.lines", 4, 80),
                           "footnote": texts(end.get("footnote"), "ad.h3.endcard.footnote", 3, 80)}
-        money(out["endcard"]["big"], "ad.h3.endcard.big")
     brand = value.get("brand")
     out["brand"] = None
     if not isinstance(brand, dict) or set(brand) - set(BRAND_KEYS):
@@ -447,6 +451,9 @@ def parse_h3_block(value, problems: list, ad: dict) -> dict | None:
                 bad += [f"{where}: {p}" for p in ads.claim_problems(s) + ads.mark_problems(s, view["banned_marks"])]
             problems.extend(bad[:6])
             out["example"] = copy.deepcopy(example) if not bad else None
+    out["picture_style"] = text(value.get("picture_style"), "ad.h3.picture_style", 200, required=False,
+                                kind="visual") or None
+    out["soundscape"] = text(value.get("soundscape"), "ad.h3.soundscape", 200, required=False, kind="visual") or None
     out["notes"] = text(value.get("notes"), "ad.h3.notes", 1500, required=False)
     for where, t in h3_texts(out):
         problems.extend(drawn_problems(t, where))
@@ -1152,7 +1159,10 @@ def h3_prompt(ad: dict, bible, beat: dict, spoken: str) -> str:
 
     def plain(v) -> str:
         return re.sub(r"\s+", " ", PROMPT_MARKUP.sub(" ", str(v or ""))).strip()
-    pres = (ad.get("h3") or {}).get("presenter") or {}
+    h3 = ad.get("h3") or {}
+    pres = h3.get("presenter") or {}
+    picture = re.sub(r"[\s,.;:]+$", "", plain(h3.get("picture_style"))) or PICTURE_STYLE
+    sound = re.sub(r"[\s,.;:]+$", "", plain(h3.get("soundscape"))) or SOUNDSCAPE
     noun, subj, obj = (plain(pres.get("noun")) or "person", plain(pres.get("subject")) or "they",
                        plain(pres.get("object")) or "their")
     voice = plain(pres.get("voice")) or "a natural voice"
@@ -1167,10 +1177,9 @@ def h3_prompt(ad: dict, bible, beat: dict, spoken: str) -> str:
             f"speaks one line directly to the camera.\n\nretention_analysis:\n<Subject 1>: fully_preserved - {obj} "
             f"face, hair and outfit stay exactly as in the pictures.\n<Audio 1>: reference - the target audio "
             f"references the voice timbre of <Audio 1> for <Subject 1>'s dialogue.\n\ndetailed_description:\nThe "
-            f"target video is in realistic photographic style, bright natural light, shallow depth of field, no text "
-            f"on screen.\n[Shot 1] {framing} {direction}, <Subject 1> (S1) says {style} "
-            f"<d>[{lang}] {spoken}</d> Exactly as {obj} voice stops, {subj} smiles and {obj} jaw stops moving. "
-            f"{CAMERA}\n\noverall_soundscape:\nQuiet, warm room tone with {obj} clear dialogue, voice timbre from "
+            f"target video is in {picture}, no text on screen.\n[Shot 1] {framing} {direction}, <Subject 1> (S1) "
+            f"says {style} <d>[{lang}] {spoken}</d> Exactly as {obj} voice stops, {subj} smiles and {obj} jaw stops moving. "
+            f"{CAMERA}\n\noverall_soundscape:\n{sound} with {obj} clear dialogue, voice timbre from "
             f"<Audio 1>.\n\nnon_diegetic_music:\nN/A")
 
 
